@@ -1,4 +1,7 @@
 //! Multi-selection over the message list: pure, so it tests without a UI.
+//!
+//! Ids are row keys (`<account>/<id>`), never bare email ids, which repeat
+//! across accounts.
 
 /// Which rows are selected, plus the range anchor and the focused row.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -262,5 +265,24 @@ mod tests {
 
         s.retain(&without("c"));
         assert_eq!((ids(&s).as_str(), &s.focus), ("bd", &at("d")));
+    }
+
+    #[test]
+    fn colliding_ids_across_accounts() {
+        // The same email id in two accounts: two distinct rows.
+        let order: Vec<String> = vec!["a/e1".into(), "b/e1".into()];
+        let mut s = Selection::default();
+
+        s.click(&order, "b/e1", Click::Plain);
+        assert_eq!(s.ids, ["b/e1"]);
+        assert!(s.is_selected("b/e1"));
+        assert!(!s.is_selected("a/e1"));
+        assert_eq!(s.focus, at("b/e1"));
+
+        s.click(&order, "a/e1", Click::Plain);
+        assert_eq!(s.ids, ["a/e1"]);
+
+        s.click(&order, "b/e1", Click::Range);
+        assert_eq!(s.ids, ["a/e1", "b/e1"]);
     }
 }

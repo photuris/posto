@@ -20,7 +20,7 @@ pub use settings::Settings;
 pub use sidebar::Sidebar;
 pub use toolbar::Toolbar;
 
-use crate::app::{MAILBOXES, SHOW_MOVE_PICKER, TYPING, focus_root, move_selected};
+use crate::app::{MAILBOXES, SHOW_MOVE_PICKER, TYPING, focus_root, move_selected, selected_refs};
 
 /// `onfocusin` for inputs: shortcuts are suspended while typing.
 pub fn focus_in(_: FocusEvent) {
@@ -65,14 +65,17 @@ pub fn reader_frame_doc(inner: &str) -> String {
     )
 }
 
-/// Small filterable list of mailboxes to move the selected email to.
+/// Small filterable list of mailboxes to move the selected emails to; only
+/// the mailboxes of their account (a move never crosses accounts).
 #[component]
 pub fn MovePicker() -> Element {
     let mut query = use_signal(String::new);
     let mut index = use_signal(|| 0usize);
     let needle = query().to_lowercase();
+    let account = selected_refs().first().map(|r| r.account_id.clone());
     let shown: Vec<_> = MAILBOXES()
         .into_iter()
+        .filter(|m| Some(&m.account_id) == account.as_ref())
         .filter(|m| m.name.to_lowercase().contains(&needle))
         .collect();
     let last = shown.len().saturating_sub(1);

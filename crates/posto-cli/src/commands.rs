@@ -1,14 +1,16 @@
 //! One async function per command. Each returns the JSON value to print.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use posto_core::actions::{self, Action};
 use posto_core::body::{fetch_body, save_attachment};
 use posto_core::compose::{self, Draft};
-use posto_core::config::{Config, Secrets};
+use posto_core::config::{Account, Config, Secrets};
 use posto_core::jmap::Client;
 use posto_core::shortcuts::{self, Keymap};
-use posto_core::store::{ListQuery, Mailbox, Store};
+use posto_core::store::{EmailBody, EmailSummary, ListQuery, Mailbox, Store};
 use posto_core::{Error, Result, fixtures, html, sync, theme};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -21,63 +23,183 @@ fn open_store() -> Result<Store> {
     Store::open(&Config::db_path())
 }
 
-/// Connects with the stored token; no token is `NotConfigured`.
-async fn client() -> Result<Client> {
-    let cfg = Config::load()?;
-    let token = Secrets::token()?.ok_or_else(|| Error::NotConfigured("token".into()))?;
-
-    Client::connect(&cfg.account.session_url, &token).await
+/// The account a command acts on: `--account`, else the first enabled one.
+fn pick_account<'a>(cfg: &'a Config, flag: Option<&str>) -> Result<&'a Account> {
+    match flag {
+        Some(id) => cfg
+            .account(id)
+            .ok_or_else(|| Error::NotFound(format!("account {id}"))),
+        None => cfg
+            .default_account()
+            .ok_or_else(|| Error::NotConfigured("no enabled account".into())),
+    }
 }
 
-/// `None` when no token exists, so local-only commands keep working offline.
-async fn optional_client() -> Result<Option<Client>> {
-    match Secrets::token()? {
+/// The ids of the accounts a read covers: `--account`, else every account.
+fn scope(cfg: &Config, flag: Option<&str>) -> Result<Vec<String>> {
+    match flag {
+        Some(_) => Ok(vec![pick_account(cfg, flag)?.id.clone()]),
+        None => Ok(cfg.accounts.iter().map(|a| a.id.clone()).collect()),
+    }
+}
+
+/// Connects with the account's stored token; no token is `NotConfigured`.
+async fn client_for(cfg: &Config, account: &Account) -> Result<Client> {
+    let token = Secrets::token_for(cfg, &account.id)?
+        .ok_or_else(|| Error::NotConfigured(format!("token for account {}", account.id)))?;
+
+    Client::connect(&account.session_url, &token).await
+}
+
+/// `None` when the account has no token, so local-only commands keep working offline.
+async fn optional_client(cfg: &Config, account: &Account) -> Result<Option<Client>> {
+    match Secrets::token_for(cfg, &account.id)? {
         None => Ok(None),
-        Some(_) => client().await.map(Some),
+        Some(_) => client_for(cfg, account).await.map(Some),
     }
 }
 
-/// Finds a mailbox by id, then by case-insensitive name.
-fn resolve_mailbox(store: &Store, s: &str) -> Result<Mailbox> {
-    if let Some(m) = store.mailboxes()?.into_iter().find(|m| m.id == s) {
-        return Ok(m);
+/// The configured account with this id.
+fn configured<'a>(cfg: &'a Config, id: &str) -> Result<&'a Account> {
+    pick_account(cfg, Some(id))
+}
+
+/// Finds a mailbox of `account` by id, then by case-insensitive name.
+fn find_mailbox(store: &Store, account: &str, s: &str) -> Result<Option<Mailbox>> {
+    if let Some(m) = store.mailboxes(account)?.into_iter().find(|m| m.id == s) {
+        return Ok(Some(m));
     }
 
-    store
-        .mailbox_by_name(s)?
-        .ok_or_else(|| Error::NotFound(format!("mailbox {s}")))
+    store.mailbox_by_name(account, s)
 }
 
-fn find_email(store: &Store, id: &str) -> Result<posto_core::store::EmailSummary> {
-    store
-        .email(id)?
-        .ok_or_else(|| Error::NotFound(format!("email {id}")))
+fn resolve_mailbox(store: &Store, account: &str, s: &str) -> Result<Mailbox> {
+    find_mailbox(store, account, s)?.ok_or_else(|| Error::NotFound(format!("mailbox {s}")))
 }
 
-/// Cached body, else fetched from the server (which needs a token).
-async fn body_for(store: &Store, id: &str) -> Result<posto_core::store::EmailBody> {
-    match store.body(id)? {
+/// Finds an email by bare id: in `--account`, else across all accounts.
+///
+/// # Errors
+///
+/// `NotFound` when no account has it; `Other` when several do.
+fn find_email(store: &Store, cfg: &Config, flag: Option<&str>, id: &str) -> Result<EmailSummary> {
+    let mut found = Vec::new();
+
+    for account in scope(cfg, flag)? {
+        found.extend(store.email(&account, id)?);
+    }
+
+    match found.len() {
+        0 => Err(Error::NotFound(format!("email {id}"))),
+        1 => Ok(found.remove(0)),
+        _ => Err(Error::Other("ambiguous id; pass --account".into())),
+    }
+}
+
+/// Resolves every id and groups them by account, in first-seen order.
+fn group_by_account(
+    store: &Store,
+    cfg: &Config,
+    flag: Option<&str>,
+    ids: &[String],
+) -> Result<Vec<(String, Vec<String>)>> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+
+    for id in ids {
+        let account = find_email(store, cfg, flag, id)?.account_id;
+
+        match groups.iter_mut().find(|(a, _)| *a == account) {
+            Some((_, list)) => list.push(id.clone()),
+            None => groups.push((account, vec![id.clone()])),
+        }
+    }
+
+    Ok(groups)
+}
+
+/// Cached body, else fetched from the account's server (which needs a token).
+async fn body_for(store: &Store, cfg: &Config, email: &EmailSummary) -> Result<EmailBody> {
+    match store.body(&email.account_id, &email.id)? {
         Some(body) => Ok(body),
-        None => fetch_body(store, Some(&client().await?), id).await,
+        None => {
+            let client = client_for(cfg, configured(cfg, &email.account_id)?).await?;
+
+            fetch_body(store, Some(&client), &email.account_id, &email.id).await
+        }
     }
 }
 
-pub fn account_show() -> Result<Value> {
-    let cfg = Config::load()?;
-
+/// An account as the CLI prints it.
+fn account_json(cfg: &Config, a: &Account) -> Result<Value> {
     Ok(json!({
-        "email": cfg.account.email,
-        "session_url": cfg.account.session_url,
-        "has_token": Secrets::token()?.is_some(),
-        "refresh_minutes": cfg.sync.refresh_minutes,
+        "id": a.id,
+        "name": a.name,
+        "email": a.email,
+        "session_url": a.session_url,
+        "enabled": a.enabled,
+        "has_token": Secrets::token_for(cfg, &a.id)?.is_some(),
     }))
 }
 
-pub fn account_identities() -> Result<Value> {
-    to_json(&open_store()?.identities()?)
+pub fn account_list() -> Result<Value> {
+    let cfg = Config::load()?;
+
+    Ok(Value::Array(
+        cfg.accounts
+            .iter()
+            .map(|a| account_json(&cfg, a))
+            .collect::<Result<_>>()?,
+    ))
 }
 
-pub fn account_set_token() -> Result<Value> {
+pub fn account_show(account: Option<&str>) -> Result<Value> {
+    let cfg = Config::load()?;
+    let mut shown = account_json(&cfg, pick_account(&cfg, account)?)?;
+
+    shown["refresh_minutes"] = json!(cfg.sync.refresh_minutes);
+
+    Ok(shown)
+}
+
+pub fn account_add(
+    id: String,
+    email: String,
+    name: Option<String>,
+    session_url: Option<String>,
+) -> Result<Value> {
+    let mut cfg = Config::load()?;
+    let mut account = Account::new(&id, &email);
+
+    account.name = name.unwrap_or_default();
+
+    if let Some(url) = session_url {
+        account.session_url = url;
+    }
+
+    cfg.add_account(account)?;
+    cfg.save()?;
+    account_show(Some(&id))
+}
+
+pub fn account_remove(id: &str) -> Result<Value> {
+    let mut cfg = Config::load()?;
+
+    cfg.remove_account(id)?;
+    cfg.save()?;
+    open_store()?.delete_account(id)?;
+    Secrets::clear_token(id)?;
+
+    Ok(json!({ "removed": id }))
+}
+
+pub fn account_identities(account: Option<&str>) -> Result<Value> {
+    let cfg = Config::load()?;
+
+    to_json(&open_store()?.identities(&pick_account(&cfg, account)?.id)?)
+}
+
+pub fn account_set_token(account: Option<&str>) -> Result<Value> {
+    let id = pick_account(&Config::load()?, account)?.id.clone();
     let mut token = String::new();
 
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut token)?;
@@ -88,55 +210,176 @@ pub fn account_set_token() -> Result<Value> {
         return Err(Error::Config("empty token on stdin".into()));
     }
 
-    Secrets::set_token(token)?;
-    account_show()
+    Secrets::set_token(&id, token)?;
+    account_show(Some(&id))
 }
 
-pub fn account_set(email: Option<String>, session_url: Option<String>) -> Result<Value> {
+pub fn account_set(
+    account: Option<&str>,
+    email: Option<String>,
+    session_url: Option<String>,
+    name: Option<String>,
+    enabled: Option<bool>,
+) -> Result<Value> {
     let mut cfg = Config::load()?;
+    let id = pick_account(&cfg, account)?.id.clone();
 
-    if let Some(email) = email {
-        cfg.account.email = email;
-    }
+    if let Some(a) = cfg.accounts.iter_mut().find(|a| a.id == id) {
+        if let Some(email) = email {
+            a.email = email;
+        }
 
-    if let Some(url) = session_url {
-        cfg.account.session_url = url;
+        if let Some(url) = session_url {
+            a.session_url = url;
+        }
+
+        if let Some(name) = name {
+            a.name = name;
+        }
+
+        if let Some(enabled) = enabled {
+            a.enabled = enabled;
+        }
     }
 
     cfg.save()?;
-    account_show()
+    account_show(Some(&id))
 }
 
-pub async fn sync_run() -> Result<Value> {
+/// Syncs the accounts `--account` selects (default: every enabled one).
+///
+/// One target keeps typed errors (and exit codes); several report each
+/// failure in its own entry.
+pub async fn sync_run(account: Option<&str>) -> Result<Value> {
     let cfg = Config::load()?;
     let store = open_store()?;
-
-    to_json(&sync::sync(&cfg, &store, &client().await?).await?)
-}
-
-pub fn mailbox_list() -> Result<Value> {
-    to_json(&open_store()?.mailboxes()?)
-}
-
-pub fn email_list(mailbox: Option<String>, limit: u32, offset: u32, unread: bool) -> Result<Value> {
-    let store = open_store()?;
-    let mailbox_id = match mailbox {
-        Some(m) => Some(resolve_mailbox(&store, &m)?.id),
-        None => None,
+    let targets: Vec<Account> = match account {
+        Some(_) => vec![pick_account(&cfg, account)?.clone()],
+        None => cfg.accounts_enabled().cloned().collect(),
     };
 
-    to_json(&store.list_emails(&ListQuery {
+    if let [only] = targets.as_slice() {
+        let client = client_for(&cfg, only).await?;
+
+        return to_json(&[
+            sync::sync_account(&sync::lock_path(), &cfg, &only.id, &store, &client).await?,
+        ]);
+    }
+
+    let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
+    let mut unreachable: HashMap<String, String> = HashMap::new();
+
+    for a in &targets {
+        if Secrets::token_for(&cfg, &a.id)?.is_none() {
+            continue;
+        }
+
+        match client_for(&cfg, a).await {
+            Ok(client) => {
+                clients.insert(a.id.clone(), Arc::new(client));
+            }
+            Err(e) => {
+                unreachable.insert(a.id.clone(), e.to_string());
+            }
+        }
+    }
+
+    if clients.is_empty() && unreachable.is_empty() {
+        return Err(Error::NotConfigured("token".into()));
+    }
+
+    let scoped = Config {
+        accounts: targets
+            .iter()
+            .map(|a| Account {
+                enabled: true,
+                ..a.clone()
+            })
+            .collect(),
+        ..cfg.clone()
+    };
+    let mut reports = sync::sync_all(&scoped, &store, &clients).await?;
+
+    for r in &mut reports {
+        if let Some(e) = unreachable.remove(&r.account_id) {
+            r.error = Some(e);
+        }
+    }
+
+    to_json(&reports)
+}
+
+pub fn mailbox_list(account: Option<&str>) -> Result<Value> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let mut all = Vec::new();
+
+    for id in scope(&cfg, account)? {
+        all.extend(store.mailboxes(&id)?);
+    }
+
+    to_json(&all)
+}
+
+pub fn email_list(
+    account: Option<&str>,
+    mailbox: Option<String>,
+    limit: u32,
+    offset: u32,
+    unread: bool,
+) -> Result<Value> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let accounts = scope(&cfg, account)?;
+    let query = |mailbox_id: Option<String>, limit: u32, offset: u32| ListQuery {
         mailbox_id,
         limit,
         offset,
         unread_only: unread,
-    })?)
+        ..ListQuery::default()
+    };
+
+    let Some(name) = mailbox else {
+        return to_json(&store.list_emails(
+            account.map(|_| accounts[0].as_str()),
+            &query(None, limit, offset),
+        )?);
+    };
+
+    // A name such as "Inbox" matches in several accounts: merge their rows.
+    let mut rows: Vec<EmailSummary> = Vec::new();
+    let mut matched = false;
+
+    for id in &accounts {
+        if let Some(m) = find_mailbox(&store, id, &name)? {
+            matched = true;
+            rows.extend(store.list_emails(
+                Some(id),
+                &query(Some(m.id), limit.saturating_add(offset), 0),
+            )?);
+        }
+    }
+
+    if !matched {
+        return Err(Error::NotFound(format!("mailbox {name}")));
+    }
+
+    rows.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+
+    to_json(
+        &rows
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect::<Vec<_>>(),
+    )
 }
 
-pub async fn email_show(id: &str, text: bool) -> Result<Value> {
+pub async fn email_show(account: Option<&str>, id: &str, text: bool) -> Result<Value> {
+    let cfg = Config::load()?;
     let store = open_store()?;
-    let summary = find_email(&store, id)?;
-    let mut body = body_for(&store, id).await?;
+    let summary = find_email(&store, &cfg, account, id)?;
+    let mut body = body_for(&store, &cfg, &summary).await?;
 
     if text {
         if body.text.as_deref().is_none_or(str::is_empty) && body.html.is_some() {
@@ -152,23 +395,47 @@ pub async fn email_show(id: &str, text: bool) -> Result<Value> {
     }))
 }
 
-pub fn email_search(query: &str, limit: u32) -> Result<Value> {
-    to_json(&open_store()?.search(query, limit)?)
+pub fn email_search(account: Option<&str>, query: &str, limit: u32) -> Result<Value> {
+    let cfg = Config::load()?;
+    let accounts = scope(&cfg, account)?;
+
+    to_json(&open_store()?.search(account.map(|_| accounts[0].as_str()), query, limit)?)
 }
 
-/// Applies `action` online when a token exists, else to the local store only.
-pub async fn email_act(ids: Vec<String>, action: Action, name: &str) -> Result<Value> {
+/// Applies the action `make` builds for each account's ids: online when that
+/// account has a token, else to the local store only.
+pub async fn email_act(
+    account: Option<&str>,
+    ids: Vec<String>,
+    make: impl Fn(&Store, &str) -> Result<Action>,
+    name: &str,
+) -> Result<Value> {
+    let cfg = Config::load()?;
     let store = open_store()?;
-    let client = optional_client().await?;
-    let applied = actions::apply(&store, client.as_ref(), &ids, action).await?;
+    let (mut applied, mut offline) = (0, false);
 
-    Ok(json!({ "applied": applied, "action": name, "offline": client.is_none() }))
+    for (id, ids) in group_by_account(&store, &cfg, account, &ids)? {
+        let client = optional_client(&cfg, configured(&cfg, &id)?).await?;
+
+        offline |= client.is_none();
+        applied += actions::apply(&store, client.as_ref(), &id, &ids, make(&store, &id)?).await?;
+    }
+
+    Ok(json!({ "applied": applied, "action": name, "offline": offline }))
 }
 
-pub async fn email_move(mailbox: &str, ids: Vec<String>) -> Result<Value> {
-    let mailbox_id = resolve_mailbox(&open_store()?, mailbox)?.id;
-
-    email_act(ids, Action::Move { mailbox_id }, "move").await
+pub async fn email_move(account: Option<&str>, mailbox: &str, ids: Vec<String>) -> Result<Value> {
+    email_act(
+        account,
+        ids,
+        |store, id| {
+            Ok(Action::Move {
+                mailbox_id: resolve_mailbox(store, id, mailbox)?.id,
+            })
+        },
+        "move",
+    )
+    .await
 }
 
 /// Parses a `--from` value; an invalid address is an error, never ignored.
@@ -185,6 +452,7 @@ fn parse_from(from: Option<String>) -> Result<Option<posto_core::store::Address>
 }
 
 pub async fn email_reply(
+    account: Option<&str>,
     id: &str,
     body_file: &Path,
     markdown: bool,
@@ -194,12 +462,13 @@ pub async fn email_reply(
     let from = parse_from(from)?;
     let cfg = Config::load()?;
     let store = open_store()?;
-    let summary = find_email(&store, id)?;
+    let summary = find_email(&store, &cfg, account, id)?;
     let text = std::fs::read_to_string(body_file)?;
-    let client = client().await?;
-    let body = fetch_body(&store, Some(&client), id).await?;
-    let identities = store.identities()?;
-    let mut draft = compose::reply(&summary, &body, &cfg.account.email, all, &identities);
+    let owner = configured(&cfg, &summary.account_id)?;
+    let client = client_for(&cfg, owner).await?;
+    let body = fetch_body(&store, Some(&client), &owner.id, id).await?;
+    let identities = store.identities(&owner.id)?;
+    let mut draft = compose::reply(&summary, &body, &owner.email, all, &identities);
 
     draft.body = text + &draft.body;
     draft.markdown = markdown;
@@ -208,10 +477,12 @@ pub async fn email_reply(
         draft.from = from;
     }
 
-    Ok(json!({ "id": compose::send(&cfg, &store, &client, &draft).await? }))
+    Ok(json!({ "id": compose::send(&cfg, &store, &client, &owner.id, &draft).await? }))
 }
 
+#[expect(clippy::too_many_arguments, reason = "one parameter per CLI flag")]
 pub async fn email_send(
+    account: Option<&str>,
     to: Vec<String>,
     cc: Vec<String>,
     bcc: Vec<String>,
@@ -220,7 +491,10 @@ pub async fn email_send(
     markdown: bool,
     from: Option<String>,
 ) -> Result<Value> {
+    let cfg = Config::load()?;
+    let owner = pick_account(&cfg, account)?;
     let draft = Draft {
+        account_id: owner.id.clone(),
         from: parse_from(from)?,
         to: compose::parse_addresses(&to.join(",")),
         cc: compose::parse_addresses(&cc.join(",")),
@@ -235,17 +509,23 @@ pub async fn email_send(
         return Err(Error::Other("no valid --to address".into()));
     }
 
-    let cfg = Config::load()?;
     let store = open_store()?;
-    let client = client().await?;
+    let client = client_for(&cfg, owner).await?;
 
-    Ok(json!({ "id": compose::send(&cfg, &store, &client, &draft).await? }))
+    Ok(json!({ "id": compose::send(&cfg, &store, &client, &owner.id, &draft).await? }))
 }
 
-pub async fn attachment_save(email_id: &str, blob_id: &str, dir: PathBuf) -> Result<Value> {
+pub async fn attachment_save(
+    account: Option<&str>,
+    email_id: &str,
+    blob_id: &str,
+    dir: PathBuf,
+) -> Result<Value> {
+    let cfg = Config::load()?;
     let store = open_store()?;
-    let client = client().await?;
-    let body = fetch_body(&store, Some(&client), email_id).await?;
+    let email = find_email(&store, &cfg, account, email_id)?;
+    let client = client_for(&cfg, configured(&cfg, &email.account_id)?).await?;
+    let body = fetch_body(&store, Some(&client), &email.account_id, email_id).await?;
     let att = body
         .attachments
         .iter()

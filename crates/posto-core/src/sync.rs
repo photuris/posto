@@ -1,6 +1,8 @@
 //! Mirrors the server's mailboxes and email summaries into the local store.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -32,9 +34,11 @@ const PAGE: usize = 100;
 /// Times a paged query restarts after the server's query state moved.
 const MAX_RESTARTS: usize = 3;
 
-/// What one sync run changed.
+/// What one sync run of one account changed.
 #[derive(Debug, Default, Serialize)]
 pub struct SyncReport {
+    /// Local slug of the account this report is about.
+    pub account_id: String,
     /// Mailboxes in the store afterwards.
     pub mailboxes: usize,
     /// Emails that were new to the store.
@@ -47,72 +51,157 @@ pub struct SyncReport {
     pub initial: bool,
     /// Sending identities cached afterwards.
     pub identities: usize,
+    /// Ids newly added to the inbox-role mailbox by this run's delta; empty
+    /// on an initial sync. They are also queued for classification.
+    pub inbox_added: Vec<String>,
+    /// Why this account failed; everything else in the report is then partial.
+    pub error: Option<String>,
 }
 
-/// Syncs under `data_dir()/sync.lock`.
-///
-/// # Errors
-///
-/// See [`sync_with_lock`].
-pub async fn sync(cfg: &Config, store: &Store, client: &Client) -> Result<SyncReport> {
-    sync_with_lock(&data_dir().join("sync.lock"), cfg, store, client).await
+/// Path of the lock shared by every sync in the data directory.
+pub fn lock_path() -> PathBuf {
+    data_dir().join("sync.lock")
 }
 
-/// Syncs while holding an exclusive, non-blocking lock on `lock_path`.
-///
-/// # Errors
-///
-/// Returns [`Error::Locked`] when another process holds the lock, and any
-/// network, server or database error otherwise.
-pub async fn sync_with_lock(
-    lock_path: &Path,
-    cfg: &Config,
-    store: &Store,
-    client: &Client,
-) -> Result<SyncReport> {
+/// Takes an exclusive, non-blocking lock on `lock_path`; see [`try_lock`].
+fn open_lock(lock_path: &Path) -> Result<fd_lock::RwLock<std::fs::File>> {
     if let Some(dir) = lock_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
 
-    let mut lock = fd_lock::RwLock::new(std::fs::File::create(lock_path)?);
-    let _guard = lock.try_write().map_err(|e| match e.kind() {
+    Ok(fd_lock::RwLock::new(std::fs::File::create(lock_path)?))
+}
+
+/// Locks `lock`; held elsewhere is [`Error::Locked`].
+fn try_lock(
+    lock: &mut fd_lock::RwLock<std::fs::File>,
+) -> Result<fd_lock::RwLockWriteGuard<'_, std::fs::File>> {
+    lock.try_write().map_err(|e| match e.kind() {
         std::io::ErrorKind::WouldBlock => Error::Locked("sync already running".into()),
         _ => Error::Io(e),
-    })?;
-    let account = &client.session().account_id;
+    })
+}
 
-    // A different account must not inherit the previous one's cursors.
-    if get_state(store, "account_id")?.is_some_and(|a| a != *account) {
-        store.clear_emails()?;
-        store.set_state("mailbox_state", "")?;
-        store.set_state("email_state", "")?;
+/// Syncs one account while holding the lock on `lock_path`.
+///
+/// `client` must be the connection of `account`.
+///
+/// # Errors
+///
+/// Returns [`Error::Locked`] when another process holds the lock,
+/// [`Error::NotFound`] for an account that is not configured, and any
+/// network, server or database error otherwise.
+pub async fn sync_account(
+    lock_path: &Path,
+    cfg: &Config,
+    account: &str,
+    store: &Store,
+    client: &Client,
+) -> Result<SyncReport> {
+    if cfg.account(account).is_none() {
+        return Err(Error::NotFound(format!("account {account}")));
     }
 
-    store.set_state("account_id", account)?;
-    sync_mailboxes(store, client).await?;
+    let mut lock = open_lock(lock_path)?;
+    let _guard = try_lock(&mut lock)?;
+
+    sync_one(cfg, account, store, client).await
+}
+
+/// Syncs every enabled account, under `data_dir()/sync.lock`.
+///
+/// # Errors
+///
+/// See [`sync_all_with_lock`].
+pub async fn sync_all(
+    cfg: &Config,
+    store: &Store,
+    clients: &HashMap<String, Arc<Client>>,
+) -> Result<Vec<SyncReport>> {
+    sync_all_with_lock(&lock_path(), cfg, store, clients).await
+}
+
+/// Syncs every enabled account in config order under one lock.
+///
+/// An account without a client is reported as `error = "no token"` and
+/// nothing else is done for it. One account failing never fails the pass:
+/// its error goes into its report and the next account runs.
+///
+/// # Errors
+///
+/// Returns [`Error::Locked`] when another process holds the lock, and
+/// [`Error::Io`] when the lock file cannot be opened.
+pub async fn sync_all_with_lock(
+    lock_path: &Path,
+    cfg: &Config,
+    store: &Store,
+    clients: &HashMap<String, Arc<Client>>,
+) -> Result<Vec<SyncReport>> {
+    let mut lock = open_lock(lock_path)?;
+    let _guard = try_lock(&mut lock)?;
+    let mut reports = Vec::new();
+
+    for account in cfg.accounts_enabled() {
+        let failed = |error: String| SyncReport {
+            account_id: account.id.clone(),
+            error: Some(error),
+            ..SyncReport::default()
+        };
+        let Some(client) = clients.get(&account.id) else {
+            reports.push(failed("no token".into()));
+
+            continue;
+        };
+
+        reports.push(match sync_one(cfg, &account.id, store, client).await {
+            Ok(report) => report,
+            Err(e) => failed(e.to_string()),
+        });
+    }
+
+    Ok(reports)
+}
+
+/// One account's sync, under a lock the caller holds.
+async fn sync_one(
+    cfg: &Config,
+    account: &str,
+    store: &Store,
+    client: &Client,
+) -> Result<SyncReport> {
+    let server_id = &client.session().account_id;
+
+    // A different server account must not inherit the previous one's cache.
+    if get_state(store, account, "account_id")?.is_some_and(|a| a != *server_id) {
+        store.delete_account(account)?;
+    }
+
+    store.set_account_state(account, "account_id", server_id)?;
+    sync_mailboxes(store, account, client).await?;
 
     let mut report = SyncReport::default();
 
-    if get_state(store, "email_state")?.is_some() {
-        match sync_emails_delta(store, client, &mut report).await {
+    if get_state(store, account, "email_state")?.is_some() {
+        match sync_emails_delta(store, account, client, &mut report).await {
             Err(Error::Jmap(m)) if m.starts_with("cannotCalculateChanges") => {
                 tracing::debug!("email state expired; full resync");
-                store.clear_emails()?;
-                store.set_state("email_state", "")?;
+                store.clear_emails(account)?;
+                store.set_account_state(account, "email_state", "")?;
                 report = SyncReport::default();
-                sync_emails_initial(cfg, store, client, &mut report).await?;
+                sync_emails_initial(cfg, store, account, client, &mut report).await?;
             }
             other => other?,
         }
     } else {
-        sync_emails_initial(cfg, store, client, &mut report).await?;
+        sync_emails_initial(cfg, store, account, client, &mut report).await?;
     }
 
-    report.mailboxes = store.mailboxes()?.len();
+    report.account_id = account.to_string();
+    report.mailboxes = store.mailboxes(account)?.len();
 
     match client.identities().await {
         Ok(identities) => {
-            store.set_identities(&identities)?;
+            store.set_identities(account, &identities)?;
             report.identities = identities.len();
         }
         Err(e) => tracing::warn!("identity sync failed: {e}"),
@@ -122,8 +211,8 @@ pub async fn sync_with_lock(
 }
 
 /// Reads a state value, treating the empty string as unset.
-fn get_state(store: &Store, key: &str) -> Result<Option<String>> {
-    Ok(store.state(key)?.filter(|s| !s.is_empty()))
+fn get_state(store: &Store, account: &str, key: &str) -> Result<Option<String>> {
+    Ok(store.account_state(account, key)?.filter(|s| !s.is_empty()))
 }
 
 /// Ids from a JSON string array; anything else yields an empty list.
@@ -172,8 +261,9 @@ fn addresses(v: &Value) -> Vec<Address> {
         .unwrap_or_default()
 }
 
-fn mailbox_from(v: &Value) -> Result<Mailbox> {
+fn mailbox_from(account: &str, v: &Value) -> Result<Mailbox> {
     Ok(Mailbox {
+        account_id: account.to_string(),
         id: str_of(v, "id")?,
         name: v["name"].as_str().unwrap_or_default().to_string(),
         role: v["role"].as_str().map(String::from),
@@ -200,8 +290,9 @@ fn squash_ws(s: &str) -> String {
         .join(" ")
 }
 
-fn email_from(v: &Value) -> Result<EmailSummary> {
+fn email_from(account: &str, v: &Value) -> Result<EmailSummary> {
     Ok(EmailSummary {
+        account_id: account.to_string(),
         id: str_of(v, "id")?,
         thread_id: v["threadId"].as_str().unwrap_or_default().to_string(),
         received_at: v["receivedAt"].as_str().unwrap_or_default().to_string(),
@@ -218,7 +309,11 @@ fn email_from(v: &Value) -> Result<EmailSummary> {
 }
 
 /// Fetches mailboxes by id; `None` fetches all of them.
-async fn get_mailboxes(client: &Client, ids: Option<&[String]>) -> Result<(Vec<Mailbox>, String)> {
+async fn get_mailboxes(
+    client: &Client,
+    account: &str,
+    ids: Option<&[String]>,
+) -> Result<(Vec<Mailbox>, String)> {
     let r = client
         .call_one(
             "Mailbox/get",
@@ -228,29 +323,31 @@ async fn get_mailboxes(client: &Client, ids: Option<&[String]>) -> Result<(Vec<M
     let list = r["list"].as_array().map(Vec::as_slice).unwrap_or_default();
 
     Ok((
-        list.iter().map(mailbox_from).collect::<Result<_>>()?,
+        list.iter()
+            .map(|v| mailbox_from(account, v))
+            .collect::<Result<_>>()?,
         str_of(&r, "state")?,
     ))
 }
 
-/// Replaces the mailbox table with the server's full list.
-async fn replace_mailboxes(store: &Store, client: &Client) -> Result<()> {
-    let (boxes, state) = get_mailboxes(client, None).await?;
+/// Replaces the mailbox table of `account` with the server's full list.
+async fn replace_mailboxes(store: &Store, account: &str, client: &Client) -> Result<()> {
+    let (boxes, state) = get_mailboxes(client, account, None).await?;
     let stale: Vec<String> = store
-        .mailboxes()?
+        .mailboxes(account)?
         .into_iter()
         .map(|m| m.id)
         .filter(|id| !boxes.iter().any(|m| m.id == *id))
         .collect();
 
-    store.delete_mailboxes(&stale)?;
+    store.delete_mailboxes(account, &stale)?;
     store.upsert_mailboxes(&boxes)?;
-    store.set_state("mailbox_state", &state)
+    store.set_account_state(account, "mailbox_state", &state)
 }
 
-async fn sync_mailboxes(store: &Store, client: &Client) -> Result<()> {
-    let Some(mut since) = get_state(store, "mailbox_state")? else {
-        return replace_mailboxes(store, client).await;
+async fn sync_mailboxes(store: &Store, account: &str, client: &Client) -> Result<()> {
+    let Some(mut since) = get_state(store, account, "mailbox_state")? else {
+        return replace_mailboxes(store, account, client).await;
     };
 
     loop {
@@ -262,7 +359,7 @@ async fn sync_mailboxes(store: &Store, client: &Client) -> Result<()> {
             .await
         {
             Err(Error::Jmap(m)) if m.starts_with("cannotCalculateChanges") => {
-                return replace_mailboxes(store, client).await;
+                return replace_mailboxes(store, account, client).await;
             }
             other => other?,
         };
@@ -272,13 +369,13 @@ async fn sync_mailboxes(store: &Store, client: &Client) -> Result<()> {
             .collect();
 
         if !changed.is_empty() {
-            store.upsert_mailboxes(&get_mailboxes(client, Some(&changed)).await?.0)?;
+            store.upsert_mailboxes(&get_mailboxes(client, account, Some(&changed)).await?.0)?;
         }
 
-        store.delete_mailboxes(&strings(&r["destroyed"]))?;
+        store.delete_mailboxes(account, &strings(&r["destroyed"]))?;
 
         since = str_of(&r, "newState")?;
-        store.set_state("mailbox_state", &since)?;
+        store.set_account_state(account, "mailbox_state", &since)?;
 
         if r["hasMoreChanges"].as_bool() != Some(true) {
             return Ok(());
@@ -286,11 +383,13 @@ async fn sync_mailboxes(store: &Store, client: &Client) -> Result<()> {
     }
 }
 
-/// Fetches summaries for `ids` in chunks and upserts them.
-///
-/// Returns `(added, updated)` counts, by whether the store knew the id.
-async fn fetch_and_store(store: &Store, client: &Client, ids: &[String]) -> Result<(usize, usize)> {
-    let (mut added, mut updated) = (0, 0);
+/// Fetches summaries for `ids` in chunks, in request order.
+async fn fetch_summaries(
+    client: &Client,
+    account: &str,
+    ids: &[String],
+) -> Result<Vec<EmailSummary>> {
+    let mut emails = Vec::with_capacity(ids.len());
 
     for chunk in ids.chunks(PAGE) {
         let r = client
@@ -304,24 +403,57 @@ async fn fetch_and_store(store: &Store, client: &Client, ids: &[String]) -> Resu
             )
             .await?;
         let list = r["list"].as_array().map(Vec::as_slice).unwrap_or_default();
-        let emails: Vec<EmailSummary> = list.iter().map(email_from).collect::<Result<_>>()?;
 
-        for e in &emails {
-            if store.email(&e.id)?.is_some() {
-                updated += 1;
-            } else {
-                added += 1;
-            }
+        for v in list {
+            emails.push(email_from(account, v)?);
         }
+    }
 
-        store.upsert_emails(&emails)?;
+    Ok(emails)
+}
+
+/// Counts how many of `emails` the store already knows: `(added, updated)`.
+fn count_known(store: &Store, emails: &[EmailSummary]) -> Result<(usize, usize)> {
+    let (mut added, mut updated) = (0, 0);
+
+    for e in emails {
+        if store.email(&e.account_id, &e.id)?.is_some() {
+            updated += 1;
+        } else {
+            added += 1;
+        }
     }
 
     Ok((added, updated))
 }
 
-async fn sync_emails_delta(store: &Store, client: &Client, report: &mut SyncReport) -> Result<()> {
-    let Some(mut since) = get_state(store, "email_state")? else {
+/// Ids among `emails` that are in the inbox now and were not before.
+fn newly_in_inbox(store: &Store, account: &str, emails: &[EmailSummary]) -> Result<Vec<String>> {
+    let Some(inbox) = store.mailbox_by_role(account, "inbox")? else {
+        return Ok(Vec::new());
+    };
+    let mut added = Vec::new();
+
+    for e in emails.iter().filter(|e| e.mailbox_ids.contains(&inbox.id)) {
+        let was = store
+            .email(account, &e.id)?
+            .is_some_and(|old| old.mailbox_ids.contains(&inbox.id));
+
+        if !was {
+            added.push(e.id.clone());
+        }
+    }
+
+    Ok(added)
+}
+
+async fn sync_emails_delta(
+    store: &Store,
+    account: &str,
+    client: &Client,
+    report: &mut SyncReport,
+) -> Result<()> {
+    let Some(mut since) = get_state(store, account, "email_state")? else {
         return Ok(());
     };
 
@@ -341,16 +473,19 @@ async fn sync_emails_delta(store: &Store, client: &Client, report: &mut SyncRepo
             .flat_map(strings)
             .collect();
         let destroyed = strings(&r["destroyed"]);
-        let (added, updated) = fetch_and_store(store, client, &changed).await?;
+        let emails = fetch_summaries(client, account, &changed).await?;
+        let (added, updated) = count_known(store, &emails)?;
+        let inbox_added = newly_in_inbox(store, account, &emails)?;
 
-        store.delete_emails(&destroyed)?;
+        since = str_of(&r, "newState")?;
+
+        // One transaction per page: a crash never leaves a cursor ahead of its rows.
+        store.apply_delta_page(account, &emails, &destroyed, &inbox_added, &since)?;
 
         report.emails_added += added;
         report.emails_updated += updated;
         report.emails_removed += destroyed.len();
-
-        since = str_of(&r, "newState")?;
-        store.set_state("email_state", &since)?;
+        report.inbox_added.extend(inbox_added);
 
         if r["hasMoreChanges"].as_bool() != Some(true) {
             return Ok(());
@@ -411,6 +546,7 @@ async fn query_ids(client: &Client, limit: usize) -> Result<Vec<String>> {
 async fn sync_emails_initial(
     cfg: &Config,
     store: &Store,
+    account: &str,
     client: &Client,
     report: &mut SyncReport,
 ) -> Result<()> {
@@ -425,12 +561,15 @@ async fn sync_emails_initial(
         .await?;
     let s0 = str_of(&s0, "state")?;
     let ids = query_ids(client, cfg.sync.initial_limit as usize).await?;
-    let (added, updated) = fetch_and_store(store, client, &ids).await?;
+    let emails = fetch_summaries(client, account, &ids).await?;
+    let (added, updated) = count_known(store, &emails)?;
+
+    store.upsert_emails(&emails)?;
 
     report.emails_added += added;
     report.emails_updated += updated;
 
-    store.set_state("email_state", &s0)
+    store.set_account_state(account, "email_state", &s0)
 }
 
 #[cfg(test)]
@@ -440,8 +579,11 @@ mod tests {
     #[test]
     fn preview_whitespace_is_squashed() {
         let v = json!({"id": "e1", "preview": "COMING UP      \n\t soon   "});
-        assert_eq!(email_from(&v).unwrap().preview, "COMING UP soon");
+        assert_eq!(email_from("a", &v).unwrap().preview, "COMING UP soon");
         let v = json!({"id": "e2", "preview": "\u{034f}   \u{200b}\u{feff}🚨 Joshua, polls\u{00ad} close"});
-        assert_eq!(email_from(&v).unwrap().preview, "🚨 Joshua, polls close");
+        assert_eq!(
+            email_from("a", &v).unwrap().preview,
+            "🚨 Joshua, polls close"
+        );
     }
 }

@@ -9,10 +9,13 @@ mod reading;
 mod shortcuts;
 
 use dioxus::prelude::*;
-use posto_core::config::{Account, Config};
+use posto_core::config::{Account, Config, Secrets};
 use posto_core::shortcuts::Keymap;
 
-use crate::app::{KEYMAP, SHOW_SETTINGS, backend, focus_root, reload_list, run, sync_soon};
+use crate::app::{
+    KEYMAP, SHOW_SETTINGS, backend, focus_root, reload_identities, reload_list, reload_mailboxes,
+    run, sync_soon,
+};
 use crate::components::Icon;
 use crate::keys;
 use appearance::AppearancePage;
@@ -80,14 +83,24 @@ pub fn Settings() -> Element {
 
     let save = move |_| {
         let mut cfg: Config = draft();
-        let url = cfg.account.session_url.trim().to_string();
 
-        cfg.account.email = cfg.account.email.trim().to_string();
-        cfg.account.session_url = if url.is_empty() {
-            Account::default().session_url
-        } else {
-            url
-        };
+        for a in &mut cfg.accounts {
+            let url = a.session_url.trim().to_string();
+
+            a.id = a.id.trim().to_string();
+            a.name = a.name.trim().to_string();
+            a.email = a.email.trim().to_string();
+            a.session_url = if url.is_empty() {
+                Account::default().session_url
+            } else {
+                url
+            };
+        }
+
+        if let Err(e) = cfg.validate() {
+            return save_error.set(Some(e.to_string()));
+        }
+
         cfg.shortcuts.clear();
 
         let defaults = Keymap::defaults();
@@ -116,6 +129,25 @@ pub fn Settings() -> Element {
         }
 
         let mut shared = backend();
+        let removed: Vec<String> = shared
+            .peek()
+            .cfg
+            .accounts
+            .iter()
+            .filter(|a| cfg.account(&a.id).is_none())
+            .map(|a| a.id.clone())
+            .collect();
+
+        // A removed account takes its cached mail and token with it.
+        for id in &removed {
+            if let Err(e) = shared.peek().store.delete_account(id) {
+                return save_error.set(Some(e.to_string()));
+            }
+
+            if !ui_test && let Err(e) = Secrets::clear_token(id) {
+                return save_error.set(Some(e.to_string()));
+            }
+        }
 
         {
             let mut b = shared.write();
@@ -124,6 +156,8 @@ pub fn Settings() -> Element {
             b.reset_client();
         }
 
+        reload_mailboxes();
+        reload_identities();
         *KEYMAP.write() = keymap;
         sync_soon();
         run(reload_list());

@@ -40,14 +40,15 @@ enum Change {
     Keyword(&'static str, bool),
 }
 
-fn role_mailbox(store: &Store, role: &str) -> Result<Change> {
+fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
     store
-        .mailbox_by_role(role)?
+        .mailbox_by_role(account, role)?
         .map(|m| Change::Mailbox(m.id))
         .ok_or_else(|| Error::NotFound(format!("{role} mailbox")))
 }
 
-/// Applies `action` to `ids` on the server (when `client` is given) and in the store.
+/// Applies `action` to `ids` of `account` on the server (when `client` is given)
+/// and in the store. `client` must be the connection of `account`.
 ///
 /// Ids the server refuses (`notUpdated`) are neither mirrored nor counted.
 /// Without a client, only emails the store knows are counted.
@@ -59,13 +60,14 @@ fn role_mailbox(store: &Store, role: &str) -> Result<Change> {
 pub async fn apply(
     store: &Store,
     client: Option<&Client>,
+    account: &str,
     ids: &[String],
     action: Action,
 ) -> Result<usize> {
     let change = match action {
-        Action::Archive => role_mailbox(store, "archive")?,
-        Action::Delete => role_mailbox(store, "trash")?,
-        Action::Junk => role_mailbox(store, "junk")?,
+        Action::Archive => role_mailbox(store, account, "archive")?,
+        Action::Delete => role_mailbox(store, account, "trash")?,
+        Action::Junk => role_mailbox(store, account, "junk")?,
         Action::Move { mailbox_id } => Change::Mailbox(mailbox_id),
         Action::MarkRead => Change::Keyword("$seen", true),
         Action::MarkUnread => Change::Keyword("$seen", false),
@@ -96,7 +98,7 @@ pub async fn apply(
     let mut applied = 0;
 
     for id in ids.iter().filter(|id| !refused.contains(id)) {
-        let Some(mut email) = store.email(id)? else {
+        let Some(mut email) = store.email(account, id)? else {
             // Unknown locally: only a server that accepted it makes it applied.
             applied += usize::from(client.is_some());
 
@@ -104,7 +106,9 @@ pub async fn apply(
         };
 
         match &change {
-            Change::Mailbox(target) => store.set_mailbox_ids(id, std::slice::from_ref(target))?,
+            Change::Mailbox(target) => {
+                store.set_mailbox_ids(account, id, std::slice::from_ref(target))?
+            }
             Change::Keyword(k, on) => {
                 email.keywords.retain(|x| x != k);
 
@@ -112,7 +116,7 @@ pub async fn apply(
                     email.keywords.push((*k).to_string());
                 }
 
-                store.set_keywords(id, &email.keywords)?;
+                store.set_keywords(account, id, &email.keywords)?;
             }
         }
 

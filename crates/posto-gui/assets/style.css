@@ -101,6 +101,10 @@ input.invalid { border-color: #d33; }
 .row:hover .icon, .row.selected .icon { color: var(--fg); }
 .flag, .flag .icon { color: var(--posto-accent); }
 .flag, .clip { display: inline-flex; }
+.sidebar-group {
+  padding: 12px 8px 4px; font-size: 11px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--posto-muted);
+}
 .mailbox .name { flex: 1; }
 .badge { font-size: 12px; color: var(--posto-muted); }
 
@@ -247,6 +251,12 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 .setting-row input[type="text"], .setting-row input[type="password"] { flex: 1; min-width: 0; }
 .setting-row .spacer { flex: 1; }
 .setting-row .muted { margin-left: auto; color: var(--posto-muted); }
+.accounts { display: flex; gap: 12px; align-items: flex-start; }
+.account-list { flex: none; width: 160px; display: flex; flex-direction: column; gap: 2px; }
+.account-item { text-align: left; padding: 6px 10px; border: none; border-radius: 6px; background: transparent; }
+.account-item:hover { background: var(--hover); }
+.account-item.active { background: var(--sel); color: var(--posto-accent); font-weight: 600; }
+.account-form { flex: 1; min-width: 0; }
 .setting-row.shortcut label { width: 120px; }
 .setting-row.shortcut input { flex: none; width: 140px; }
 .setting-row.blocked span { flex: 1; }

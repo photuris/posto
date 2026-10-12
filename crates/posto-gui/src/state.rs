@@ -1,23 +1,39 @@
 //! Everything the UI needs from `posto_core`, built once at startup.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use dioxus::prelude::*;
 use posto_core::config::{Config, Secrets};
 use posto_core::jmap::Client;
-use posto_core::store::{EmailSummary, Store};
+use posto_core::store::{EmailSummary, MsgRef, Store};
 use posto_core::{Error, Result, fixtures};
 
-/// Store, server connection and settings, shared through a `Signal<Backend>` context.
+/// What the message list shows when no search is active.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Folder {
+    /// The inbox of every enabled account, merged (only offered with several accounts).
+    AllInboxes,
+    /// One mailbox of one account.
+    Mailbox {
+        /// Local account slug.
+        account_id: String,
+        /// Server mailbox id.
+        id: String,
+    },
+}
+
+/// Store, server connections and settings, shared through a `Signal<Backend>` context.
 #[derive(Clone)]
 pub struct Backend {
     pub store: Arc<Store>,
-    /// Connected lazily on first sync; `None` offline, in UI test mode, or without a token.
-    pub client: Option<Arc<Client>>,
+    /// One connection per account, made lazily on first use; empty offline, in
+    /// UI test mode, or without tokens.
+    pub clients: HashMap<String, Arc<Client>>,
     pub cfg: Config,
     /// `POSTO_UI_TEST=1`: in-memory fixtures, no network, nothing written to disk.
     pub ui_test: bool,
-    /// Bumped whenever the endpoint or token may have changed, so a connection
+    /// Bumped whenever an endpoint or token may have changed, so a connection
     /// that was already in flight is not cached under the new settings.
     pub conn_rev: u64,
 }
@@ -34,11 +50,11 @@ impl Backend {
 
             let mut cfg = Config::default();
 
-            cfg.account.email = "me@example.com".into();
+            cfg.accounts[0].email = "me@example.com".into();
 
             return Ok(Backend {
                 store: Arc::new(store),
-                client: None,
+                clients: HashMap::new(),
                 cfg,
                 ui_test,
                 conn_rev: 0,
@@ -47,7 +63,7 @@ impl Backend {
 
         Ok(Backend {
             store: Arc::new(Store::open(&Config::db_path())?),
-            client: None,
+            clients: HashMap::new(),
             // A broken config.toml must not lock the user out of Settings.
             cfg: Config::load().unwrap_or_default(),
             ui_test,
@@ -55,9 +71,9 @@ impl Backend {
         })
     }
 
-    /// Drops the connection and invalidates any connection still being made.
+    /// Drops every connection and invalidates any connection still being made.
     pub fn reset_client(&mut self) {
-        self.client = None;
+        self.clients.clear();
         self.conn_rev += 1;
     }
 
@@ -68,6 +84,31 @@ impl Backend {
             .iter()
             .any(|a| sender_blocked(&self.cfg.blocked_senders, &a.email))
     }
+}
+
+/// The key of a list row and the id of its selection entry: `<account>/<id>`.
+pub fn row_key(email: &EmailSummary) -> String {
+    email.msg_ref().to_string()
+}
+
+/// The rows of a message list with their keys. Email ids repeat across
+/// accounts, so every row key, DOM id and selection id comes from here.
+pub fn rows_for_display(emails: &[EmailSummary]) -> Vec<(String, EmailSummary)> {
+    emails.iter().map(|e| (row_key(e), e.clone())).collect()
+}
+
+/// Groups references by account, in first-seen order, keeping each account's ids in order.
+pub fn group_by_account(refs: &[MsgRef]) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+
+    for r in refs {
+        match groups.iter_mut().find(|(a, _)| *a == r.account_id) {
+            Some((_, ids)) => ids.push(r.id.clone()),
+            None => groups.push((r.account_id.clone(), vec![r.id.clone()])),
+        }
+    }
+
+    groups
 }
 
 /// True when `address` or its domain is listed (case-insensitive; `@domain` also works).
@@ -91,34 +132,47 @@ pub fn remote_allowed(cfg: &Config, from: &str) -> bool {
         || (!from.trim().is_empty() && sender_blocked(&cfg.trusted_senders, from))
 }
 
-/// The connected client, connecting with the stored token when needed.
+/// The connected client of `account_id`, connecting with its stored token when needed.
 ///
 /// `Ok(None)` in UI test mode. `Error::NotConfigured` when there is no token.
-pub async fn client(backend: Signal<Backend>) -> Result<Option<Arc<Client>>> {
-    {
+pub async fn client(backend: Signal<Backend>, account_id: &str) -> Result<Option<Arc<Client>>> {
+    let token = {
         let b = backend.read();
 
-        if b.ui_test || b.client.is_some() {
-            return Ok(b.client.clone());
+        if b.ui_test {
+            return Ok(None);
         }
+
+        if let Some(client) = b.clients.get(account_id) {
+            return Ok(Some(client.clone()));
+        }
+
+        Secrets::token_for(&b.cfg, account_id)?
     }
+    .ok_or_else(|| Error::NotConfigured("token".into()))?;
 
-    let token = Secrets::token()?.ok_or_else(|| Error::NotConfigured("token".into()))?;
-
-    connect(backend, &token).await.map(Some)
+    connect(backend, account_id, &token).await.map(Some)
 }
 
-/// Connects with the current session URL and caches the client.
+/// Connects `account_id` with its current session URL and caches the client.
 ///
 /// # Errors
 ///
 /// Besides connection errors, fails when the settings or token were saved
 /// while connecting: the client would belong to the old endpoint.
-async fn connect(mut backend: Signal<Backend>, token: &str) -> Result<Arc<Client>> {
+async fn connect(
+    mut backend: Signal<Backend>,
+    account_id: &str,
+    token: &str,
+) -> Result<Arc<Client>> {
     let (session_url, rev) = {
         let b = backend.read();
+        let account = b
+            .cfg
+            .account(account_id)
+            .ok_or_else(|| Error::NotFound(format!("account {account_id}")))?;
 
-        (b.cfg.account.session_url.clone(), b.conn_rev)
+        (account.session_url.clone(), b.conn_rev)
     };
     let client = Arc::new(Client::connect(&session_url, token).await?);
     let mut b = backend.write();
@@ -129,7 +183,7 @@ async fn connect(mut backend: Signal<Backend>, token: &str) -> Result<Arc<Client
         ));
     }
 
-    b.client = Some(client.clone());
+    b.clients.insert(account_id.to_string(), client.clone());
 
     Ok(client)
 }
@@ -181,14 +235,14 @@ mod tests {
         );
         let mut cfg = Config::default();
 
-        cfg.account.session_url = session_server(requested.clone(), release.clone());
+        cfg.accounts[0].session_url = session_server(requested.clone(), release.clone());
 
         let dom = VirtualDom::new(VNode::empty);
         let _guard = RuntimeGuard::new(dom.runtime());
         let backend = Signal::new_in_scope(
             Backend {
                 store: Arc::new(Store::open_memory().unwrap()),
-                client: None,
+                clients: HashMap::new(),
                 cfg,
                 ui_test: false,
                 conn_rev: 0,
@@ -203,14 +257,14 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
 
-            saver.write().cfg.account.session_url = "http://new.invalid/session".into();
+            saver.write().cfg.accounts[0].session_url = "http://new.invalid/session".into();
             saver.write().reset_client();
             release.store(true, Ordering::SeqCst);
         };
-        let (connected, ()) = tokio::join!(connect(backend, "fake-token"), save);
+        let (connected, ()) = tokio::join!(connect(backend, "default", "fake-token"), save);
 
         assert!(connected.is_err(), "stale client was returned");
-        assert!(backend.peek().client.is_none(), "stale client was cached");
+        assert!(backend.peek().clients.is_empty(), "stale client was cached");
     }
 
     #[test]
@@ -240,5 +294,53 @@ mod tests {
 
         assert!(remote_allowed(&cfg, "b@other.org"));
         assert!(remote_allowed(&cfg, ""));
+    }
+
+    /// A bare-bones email of `account` for key tests.
+    fn email_of(account: &str, id: &str) -> EmailSummary {
+        EmailSummary {
+            account_id: account.into(),
+            id: id.into(),
+            thread_id: String::new(),
+            received_at: "2026-10-12T10:00:00Z".into(),
+            from: vec![],
+            to: vec![],
+            cc: vec![],
+            subject: String::new(),
+            preview: String::new(),
+            size: 0,
+            has_attachment: false,
+            mailbox_ids: vec![],
+            keywords: vec![],
+        }
+    }
+
+    #[test]
+    fn row_keys_are_account_scoped() {
+        let rows = rows_for_display(&[email_of("a", "e1"), email_of("b", "e1")]);
+
+        assert_eq!(rows[0].0, "a/e1");
+        assert_eq!(rows[1].0, "b/e1");
+        assert_ne!(rows[0].0, rows[1].0);
+        assert_eq!(MsgRef::parse(&rows[0].0), Some(MsgRef::new("a", "e1")));
+        assert_eq!(MsgRef::parse(&rows[1].0), Some(MsgRef::new("b", "e1")));
+        assert_eq!(rows[1].1.account_id, "b");
+    }
+
+    #[test]
+    fn refs_group_by_account_in_order() {
+        let refs = [
+            MsgRef::new("b", "e1"),
+            MsgRef::new("a", "e1"),
+            MsgRef::new("b", "e2"),
+        ];
+
+        assert_eq!(
+            group_by_account(&refs),
+            vec![
+                ("b".to_string(), vec!["e1".to_string(), "e2".to_string()]),
+                ("a".to_string(), vec!["e1".to_string()]),
+            ]
+        );
     }
 }

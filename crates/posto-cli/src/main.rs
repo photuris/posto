@@ -42,37 +42,68 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> Result<serde_json::Value> {
+    let account = cli.account.as_deref();
+
     match cli.cmd {
-        Noun::Account(AccountCmd::SetToken { .. }) => c::account_set_token(),
-        Noun::Account(AccountCmd::Set { email, session_url }) => c::account_set(email, session_url),
-        Noun::Account(AccountCmd::Show) => c::account_show(),
-        Noun::Account(AccountCmd::Identities) => c::account_identities(),
-        Noun::Sync(SyncCmd::Run) => c::sync_run().await,
-        Noun::Mailbox(MailboxCmd::List) => c::mailbox_list(),
+        Noun::Account(cmd) => match cmd {
+            AccountCmd::List => c::account_list(),
+            AccountCmd::Add {
+                id,
+                email,
+                name,
+                session_url,
+            } => c::account_add(id, email, name, session_url),
+            AccountCmd::Remove { id } => c::account_remove(&id),
+            AccountCmd::SetToken { .. } => c::account_set_token(account),
+            AccountCmd::Set {
+                email,
+                session_url,
+                name,
+                enabled,
+            } => c::account_set(account, email, session_url, name, enabled),
+            AccountCmd::Show => c::account_show(account),
+            AccountCmd::Identities => c::account_identities(account),
+        },
+        Noun::Sync(SyncCmd::Run) => c::sync_run(account).await,
+        Noun::Mailbox(MailboxCmd::List) => c::mailbox_list(account),
         Noun::Email(cmd) => match cmd {
             EmailCmd::List {
                 mailbox,
                 limit,
                 offset,
                 unread,
-            } => c::email_list(mailbox, limit, offset, unread),
-            EmailCmd::Show { id, text } => c::email_show(&id, text).await,
-            EmailCmd::Search { query, limit } => c::email_search(&query, limit),
-            EmailCmd::Archive(a) => c::email_act(a.ids, Action::Archive, "archive").await,
-            EmailCmd::Delete(a) => c::email_act(a.ids, Action::Delete, "delete").await,
-            EmailCmd::Junk(a) => c::email_act(a.ids, Action::Junk, "junk").await,
-            EmailCmd::Read(a) => c::email_act(a.ids, Action::MarkRead, "read").await,
-            EmailCmd::Unread(a) => c::email_act(a.ids, Action::MarkUnread, "unread").await,
-            EmailCmd::Flag(a) => c::email_act(a.ids, Action::Flag, "flag").await,
-            EmailCmd::Unflag(a) => c::email_act(a.ids, Action::Unflag, "unflag").await,
-            EmailCmd::Move { mailbox, ids } => c::email_move(&mailbox, ids).await,
+            } => c::email_list(account, mailbox, limit, offset, unread),
+            EmailCmd::Show { id, text } => c::email_show(account, &id, text).await,
+            EmailCmd::Search { query, limit } => c::email_search(account, &query, limit),
+            EmailCmd::Archive(a) => {
+                c::email_act(account, a.ids, |_, _| Ok(Action::Archive), "archive").await
+            }
+            EmailCmd::Delete(a) => {
+                c::email_act(account, a.ids, |_, _| Ok(Action::Delete), "delete").await
+            }
+            EmailCmd::Junk(a) => {
+                c::email_act(account, a.ids, |_, _| Ok(Action::Junk), "junk").await
+            }
+            EmailCmd::Read(a) => {
+                c::email_act(account, a.ids, |_, _| Ok(Action::MarkRead), "read").await
+            }
+            EmailCmd::Unread(a) => {
+                c::email_act(account, a.ids, |_, _| Ok(Action::MarkUnread), "unread").await
+            }
+            EmailCmd::Flag(a) => {
+                c::email_act(account, a.ids, |_, _| Ok(Action::Flag), "flag").await
+            }
+            EmailCmd::Unflag(a) => {
+                c::email_act(account, a.ids, |_, _| Ok(Action::Unflag), "unflag").await
+            }
+            EmailCmd::Move { mailbox, ids } => c::email_move(account, &mailbox, ids).await,
             EmailCmd::Reply {
                 id,
                 body_file,
                 markdown,
                 all,
                 from,
-            } => c::email_reply(&id, &body_file, markdown, all, from).await,
+            } => c::email_reply(account, &id, &body_file, markdown, all, from).await,
             EmailCmd::Send {
                 to,
                 cc,
@@ -81,13 +112,13 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
                 body_file,
                 markdown,
                 from,
-            } => c::email_send(to, cc, bcc, subject, &body_file, markdown, from).await,
+            } => c::email_send(account, to, cc, bcc, subject, &body_file, markdown, from).await,
         },
         Noun::Attachment(AttachmentCmd::Save {
             email_id,
             blob_id,
             dir,
-        }) => c::attachment_save(&email_id, &blob_id, dir).await,
+        }) => c::attachment_save(account, &email_id, &blob_id, dir).await,
         Noun::Theme(ThemeCmd::Show) => c::theme_show(),
         Noun::Shortcuts(ShortcutsCmd::List) => c::shortcuts_list(),
         Noun::Dev(DevCmd::Seed) => c::dev_seed(),

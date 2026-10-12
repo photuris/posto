@@ -13,6 +13,9 @@ use crate::store::{Address, EmailBody, EmailSummary, Store};
 /// A message being composed.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Draft {
+    /// Local slug of the account the message is sent from.
+    #[serde(default)]
+    pub account_id: String,
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
     pub bcc: Vec<Address>,
@@ -94,8 +97,9 @@ pub fn pick_identity(identities: &[Identity], summary: &EmailSummary, me: &str) 
         })
 }
 
-/// Builds a reply to `summary`. `me` is the sender's own address;
-/// `identities` are the account's sending identities.
+/// Builds a reply to `summary`, sent from the account the original arrived in.
+/// `me` is the sender's own address; `identities` are that account's sending
+/// identities.
 pub fn reply(
     summary: &EmailSummary,
     body: &EmailBody,
@@ -137,6 +141,7 @@ pub fn reply(
     references.extend(body.message_id.iter().cloned());
 
     Draft {
+        account_id: summary.account_id.clone(),
         to,
         cc,
         bcc: Vec::new(),
@@ -216,16 +221,28 @@ fn find<'a>(rs: &'a [Response], name: &str, id: &str) -> Option<(usize, &'a Valu
 /// Creates the email in Drafts, submits it, and moves it to Sent, in one
 /// request. Marks the replied-to email `$answered`. Returns the new email id.
 ///
-/// The sent email is not inserted into the store; the next sync picks it up.
+/// `client` must be the connection of `account`. The sent email is not
+/// inserted into the store; the next sync picks it up.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotConfigured`] without a sending identity,
+/// Returns [`Error::NotConfigured`] for an unknown account or without a sending identity,
 /// [`Error::NotFound`] when the Drafts or Sent mailbox is unknown, and
 /// [`Error::Jmap`] when the server refuses to create or submit the email.
 /// Once the mail is submitted, a failed move to Sent is reported as
 /// [`Error::Other`]; callers must not resend then.
-pub async fn send(cfg: &Config, store: &Store, client: &Client, draft: &Draft) -> Result<String> {
+pub async fn send(
+    cfg: &Config,
+    store: &Store,
+    client: &Client,
+    account: &str,
+    draft: &Draft,
+) -> Result<String> {
+    let me = cfg
+        .account(account)
+        .ok_or_else(|| Error::NotConfigured(format!("account {account}")))?
+        .email
+        .as_str();
     let identities = client.identities().await?;
     let identity = match &draft.from {
         Some(from) => identities
@@ -234,18 +251,18 @@ pub async fn send(cfg: &Config, store: &Store, client: &Client, draft: &Draft) -
             .ok_or_else(|| Error::NotConfigured(format!("no identity for {}", from.email)))?,
         None => identities
             .iter()
-            .find(|i| i.email.eq_ignore_ascii_case(&cfg.account.email))
+            .find(|i| i.email.eq_ignore_ascii_case(me))
             .or(identities.first())
             .ok_or_else(|| Error::NotConfigured("no sending identity".into()))?,
     };
     let drafts = store
-        .mailbox_by_role("drafts")?
+        .mailbox_by_role(account, "drafts")?
         .ok_or_else(|| Error::NotFound("drafts mailbox".into()))?;
     let sent = store
-        .mailbox_by_role("sent")?
+        .mailbox_by_role(account, "sent")?
         .ok_or_else(|| Error::NotFound("sent mailbox".into()))?;
     let (text, html) = render(draft);
-    let account_id = &client.session().account_id;
+    let server_account = &client.session().account_id;
 
     let mut email = json!({
         "mailboxIds": { &drafts.id: true },
@@ -283,13 +300,13 @@ pub async fn send(cfg: &Config, store: &Store, client: &Client, draft: &Draft) -
         .call(vec![
             (
                 "Email/set".into(),
-                json!({ "accountId": account_id, "create": { "d": email } }),
+                json!({ "accountId": server_account, "create": { "d": email } }),
                 "0".into(),
             ),
             (
                 "EmailSubmission/set".into(),
                 json!({
-                    "accountId": account_id,
+                    "accountId": server_account,
                     "create": { "s": { "identityId": identity.id, "emailId": "#d" } },
                     "onSuccessUpdateEmail": { "#s": {
                         format!("mailboxIds/{}", drafts.id): null,
@@ -310,6 +327,7 @@ pub async fn send(cfg: &Config, store: &Store, client: &Client, draft: &Draft) -
         && let Err(e) = actions::apply(
             store,
             Some(client),
+            account,
             std::slice::from_ref(reply_to),
             Action::MarkAnswered,
         )
@@ -397,6 +415,7 @@ mod tests {
 
     fn summary(from: Address, to: Vec<Address>, cc: Vec<Address>) -> EmailSummary {
         EmailSummary {
+            account_id: "a".into(),
             id: "e1".into(),
             thread_id: "t1".into(),
             received_at: "2026-10-02T09:30:00Z".into(),
@@ -481,6 +500,7 @@ mod tests {
         assert_eq!(d.in_reply_to.as_deref(), Some("m1@x"));
         assert_eq!(d.references, vec!["r0@x", "m1@x"]);
         assert_eq!(d.reply_to_email_id.as_deref(), Some("e1"));
+        assert_eq!(d.account_id, "a");
         assert!(!d.markdown);
 
         let mut again = s.clone();

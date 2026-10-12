@@ -8,7 +8,7 @@ use posto_core::store::{Address, EmailSummary};
 
 use crate::app::{
     ALLOW_REMOTE, BODY, BODY_ERROR, EMAILS, MAILBOXES, READER_MODE, SELECTION, backend, dispatch,
-    mark_selected, save_attachment, selected_email, trust_domain,
+    mark_selected, save_attachment, selected_ref, trust_domain,
 };
 use crate::components::{Icon, frame_doc, reader_frame_doc};
 use crate::format;
@@ -23,7 +23,7 @@ pub fn Reader() -> Element {
     // Sanitised on each change of body or the allow-remote switch, not per render.
     let sanitised = use_memo(|| {
         BODY()
-            .and_then(|b| b.html)
+            .and_then(|(_, b)| b.html)
             .map(|h| html::sanitize(&h, ALLOW_REMOTE()))
             .map(|s| (s.html, s.had_remote))
     });
@@ -87,20 +87,26 @@ pub fn Reader() -> Element {
         };
     }
 
-    let Some(id) = selected_email() else {
+    let Some(r) = selected_ref() else {
         return rsx! {
             div { class: "reader empty", "Select a message" }
         };
     };
-    let listed = EMAILS().into_iter().find(|e| e.id == id);
-    let email: Option<EmailSummary> =
-        listed.or_else(|| backend().peek().store.email(&id).ok().flatten());
+    let listed = EMAILS().into_iter().find(|e| e.msg_ref() == r);
+    let email: Option<EmailSummary> = listed.or_else(|| {
+        backend()
+            .peek()
+            .store
+            .email(&r.account_id, &r.id)
+            .ok()
+            .flatten()
+    });
     let Some(email) = email else {
         return rsx! {
             div { class: "reader empty", "Select a message" }
         };
     };
-    let body = BODY();
+    let body = BODY().map(|(_, body)| body);
     let reader_mode = READER_MODE();
     let allow_remote = ALLOW_REMOTE();
     let sender = email.from.first().cloned();
@@ -116,7 +122,7 @@ pub fn Reader() -> Element {
         .to_lowercase();
     let chips: Vec<String> = MAILBOXES()
         .into_iter()
-        .filter(|m| email.mailbox_ids.contains(&m.id))
+        .filter(|m| m.account_id == email.account_id && email.mailbox_ids.contains(&m.id))
         .map(|m| m.name)
         .collect();
     let (html_doc, had_remote) = match sanitised() {
@@ -236,8 +242,9 @@ pub fn Reader() -> Element {
                                 onmousedown: |evt| evt.prevent_default(),
                                 onclick: {
                                     let att = att.clone();
+                                    let account_id = email.account_id.clone();
 
-                                    move |_| save_attachment(att.clone())
+                                    move |_| save_attachment(account_id.clone(), att.clone())
                                 },
                                 span { class: "att-name", {format::clip(&att.name, 34)} }
                                 span { class: "att-size", {format::size(att.size)} }

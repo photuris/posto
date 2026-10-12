@@ -8,7 +8,8 @@ use crate::error::{Error, Result};
 use crate::jmap::Client;
 use crate::store::{Attachment, EmailBody, Store};
 
-/// Returns the cached body, or fetches it with `Email/get` and caches it.
+/// Returns the cached body of `email_id` in `account`, or fetches it with
+/// `Email/get` (through that account's `client`) and caches it.
 ///
 /// # Errors
 ///
@@ -17,9 +18,10 @@ use crate::store::{Attachment, EmailBody, Store};
 pub async fn fetch_body(
     store: &Store,
     client: Option<&Client>,
+    account: &str,
     email_id: &str,
 ) -> Result<EmailBody> {
-    if let Some(body) = store.body(email_id)? {
+    if let Some(body) = store.body(account, email_id)? {
         return Ok(body);
     }
 
@@ -56,7 +58,7 @@ pub async fn fetch_body(
         message_id: strings(&email["messageId"]),
     };
 
-    store.put_body(&body)?;
+    store.put_body(account, &body)?;
 
     Ok(body)
 }

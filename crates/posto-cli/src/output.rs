@@ -45,7 +45,20 @@ fn plain_text(value: &Value) -> String {
     match value {
         Value::Array(items) => match items.first() {
             None => String::new(),
-            Some(first) if first.get("subject").is_some() => table(items.iter().map(email_row)),
+            Some(first) if first.get("subject").is_some() => {
+                // Ids repeat across accounts, so name the account when it matters.
+                let multi = items.iter().any(|e| e["account_id"] != first["account_id"]);
+
+                table(items.iter().map(|e| {
+                    let mut row = email_row(e);
+
+                    if multi {
+                        row.insert(0, cell(&e["account_id"]));
+                    }
+
+                    row
+                }))
+            }
             Some(first) if first.get("unread").is_some() => table(items.iter().map(mailbox_row)),
             Some(_) => items
                 .iter()
@@ -94,7 +107,7 @@ fn email_row(e: &Value) -> Vec<String> {
 }
 
 fn mailbox_row(m: &Value) -> Vec<String> {
-    ["id", "name", "role", "unread", "total"]
+    ["account_id", "id", "name", "role", "unread", "total"]
         .iter()
         .map(|k| cell(&m[k]))
         .collect()

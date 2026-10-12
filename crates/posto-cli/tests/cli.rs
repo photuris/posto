@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use posto_core::store::{EmailBody, EmailSummary, Store};
 use serde_json::{Value, json};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -28,6 +29,7 @@ impl Sandbox {
             .env("POSTO_DATA_DIR", &self.0)
             .env("XDG_STATE_HOME", &self.0)
             .env_remove("POSTO_TOKEN")
+            .env_remove("TYPESAFE_API_KEY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -108,6 +110,223 @@ fn mailbox_list_after_seed() {
 
     assert_eq!(list.len(), 9);
     assert_eq!(list[0]["role"], "inbox");
+    assert_eq!(list[0]["account_id"], "default");
+}
+
+#[test]
+fn account_add_list_remove_and_scoped_token() {
+    let sb = Sandbox::seeded();
+    let added = sb.json(&["account", "add", "--id", "work", "--email", "w@x.io"]);
+
+    assert_eq!(added["id"], "work");
+    assert_eq!(sb.json(&["account", "list"]).as_array().unwrap().len(), 2);
+
+    let set = sb.run_with(
+        &["account", "set-token", "--account", "work", "--token-stdin"],
+        Some("work-secret"),
+    );
+
+    assert_eq!(set.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&set.stdout).contains("work-secret"));
+    assert_eq!(
+        sb.json(&["account", "show", "--account", "work"])["has_token"],
+        true
+    );
+    assert_eq!(sb.json(&["account", "show"])["has_token"], false);
+
+    let secrets = std::fs::read_to_string(sb.0.join("secrets.toml")).unwrap();
+
+    assert!(secrets.contains("[tokens]"), "{secrets}");
+
+    sb.json(&["account", "remove", "work"]);
+
+    let left = sb.json(&["account", "list"]);
+
+    assert_eq!(left.as_array().unwrap().len(), 1);
+    assert_eq!(left[0]["id"], "default");
+    assert!(
+        !std::fs::read_to_string(sb.0.join("secrets.toml"))
+            .unwrap()
+            .contains("work-secret")
+    );
+
+    // The last account stays; an invalid or duplicate id is a config error.
+    assert_eq!(
+        sb.run_with(&["account", "remove", "default"], None)
+            .status
+            .code(),
+        Some(3)
+    );
+    assert_eq!(
+        sb.run_with(
+            &["account", "add", "--id", "Bad Id", "--email", "x@y.z"],
+            None
+        )
+        .status
+        .code(),
+        Some(3)
+    );
+    assert_eq!(
+        sb.run_with(
+            &["account", "add", "--id", "default", "--email", "x@y.z"],
+            None
+        )
+        .status
+        .code(),
+        Some(3)
+    );
+}
+
+#[test]
+fn account_remove_deletes_its_cached_mail() {
+    let sb = Sandbox::seeded();
+
+    sb.json(&["account", "add", "--id", "work", "--email", "w@x.io"]);
+
+    let store = Store::open(&sb.0.join("posto.db")).unwrap();
+
+    store.upsert_emails(&[work_email("w1")]).unwrap();
+    drop(store);
+
+    assert_eq!(
+        sb.json(&["email", "list", "--account", "work"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    sb.json(&["account", "remove", "work"]);
+
+    assert_eq!(sb.json(&["email", "list"]).as_array().unwrap().len(), 14);
+}
+
+/// A message of the account `work`, for tests that need a second account.
+fn work_email(id: &str) -> EmailSummary {
+    EmailSummary {
+        account_id: "work".into(),
+        id: id.into(),
+        thread_id: format!("t-{id}"),
+        received_at: "2026-10-10T10:00:00Z".into(),
+        from: vec![],
+        to: vec![],
+        cc: vec![],
+        subject: "work mail".into(),
+        preview: String::new(),
+        size: 1,
+        has_attachment: false,
+        mailbox_ids: vec![],
+        keywords: vec![],
+    }
+}
+
+#[test]
+fn email_ids_resolve_across_accounts() {
+    let sb = Sandbox::seeded();
+
+    sb.json(&["account", "add", "--id", "work", "--email", "w@x.io"]);
+
+    let store = Store::open(&sb.0.join("posto.db")).unwrap();
+
+    store
+        .upsert_emails(&[work_email("fx-01"), work_email("w2")])
+        .unwrap();
+
+    for id in ["fx-01", "w2"] {
+        store
+            .put_body(
+                "work",
+                &EmailBody {
+                    email_id: id.into(),
+                    html: None,
+                    text: Some("hi".into()),
+                    attachments: vec![],
+                    in_reply_to: vec![],
+                    references: vec![],
+                    message_id: vec![],
+                },
+            )
+            .unwrap();
+    }
+
+    drop(store);
+
+    // `fx-01` exists in both accounts: a bare id is ambiguous.
+    let out = sb.run_with(&["email", "show", "fx-01"], None);
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        err["error"].as_str().unwrap().contains("ambiguous"),
+        "{err}"
+    );
+    assert_eq!(
+        sb.json(&["email", "show", "fx-01", "--account", "work"])["summary"]["account_id"],
+        "work"
+    );
+    assert_eq!(
+        sb.json(&["email", "show", "fx-01", "--account", "default"])["summary"]["account_id"],
+        "default"
+    );
+
+    // A unique bare id needs no flag.
+    assert_eq!(
+        sb.json(&["email", "show", "w2"])["summary"]["account_id"],
+        "work"
+    );
+
+    let all = sb.json(&["email", "list", "--limit", "100"]);
+
+    assert_eq!(all.as_array().unwrap().len(), 16);
+    assert!(
+        all.as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["account_id"].is_string())
+    );
+    assert_eq!(
+        sb.json(&["email", "list", "--account", "work"])
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        sb.json(&["email", "search", "work"])
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        sb.json(&["email", "search", "work", "--account", "default"])
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let out = sb.run_with(&["email", "show", "fx-01", "--account", "nope"], None);
+
+    assert_eq!(out.status.code(), Some(6));
+}
+
+#[test]
+fn legacy_files_load_through_the_cli() {
+    let sb = Sandbox::new();
+
+    std::fs::write(
+        sb.0.join("config.toml"),
+        "[account]\nemail = \"old@x.io\"\n",
+    )
+    .unwrap();
+    std::fs::write(sb.0.join("secrets.toml"), "token = \"legacy\"\n").unwrap();
+
+    let list = sb.json(&["account", "list"]);
+
+    assert_eq!(list[0]["id"], "default");
+    assert_eq!(list[0]["email"], "old@x.io");
+    assert_eq!(list[0]["has_token"], true);
 }
 
 #[test]

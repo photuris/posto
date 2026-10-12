@@ -2,6 +2,7 @@
 
 use dioxus::prelude::*;
 use posto_core::compose::{self, Draft};
+use posto_core::jmap::Identity;
 use posto_core::store::Address;
 
 use crate::app::{
@@ -16,25 +17,76 @@ fn edit(f: impl FnOnce(&mut Draft)) {
     }
 }
 
+/// A sending identity of one account, as a From option.
+#[derive(Clone, PartialEq)]
+struct FromOption {
+    account_id: String,
+    identity: Identity,
+    /// What the option shows.
+    label: String,
+}
+
+impl FromOption {
+    /// The `<select>` value: `<account>/<email>` (account ids hold no slash).
+    fn value(&self) -> String {
+        format!("{}/{}", self.account_id, self.identity.email)
+    }
+}
+
+/// The From choices: the identities of every enabled account, or only the
+/// draft's own account when it replies (a reply never changes account).
+fn from_options(draft: &Draft) -> Vec<FromOption> {
+    let cfg = backend().read().cfg.clone();
+    let identities = IDENTITIES();
+    let several = cfg.accounts_enabled().count() > 1;
+
+    cfg.accounts_enabled()
+        .filter(|a| draft.reply_to_email_id.is_none() || a.id == draft.account_id)
+        .flat_map(|a| {
+            identities
+                .get(&a.id)
+                .into_iter()
+                .flatten()
+                .map(|i| FromOption {
+                    account_id: a.id.clone(),
+                    identity: i.clone(),
+                    label: if several {
+                        format!("{} <{}> — {}", i.name, i.email, a.display_name())
+                    } else {
+                        format!("{} <{}>", i.name, i.email)
+                    },
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Modal over the reader: headers, body, Markdown toggle with preview, Close / Send.
 #[component]
 pub fn Composer() -> Element {
     let draft = COMPOSER().unwrap_or_default();
-    let account = backend().read().cfg.account.email.clone();
-    let identities = IDENTITIES();
+    let account = backend()
+        .read()
+        .cfg
+        .account(&draft.account_id)
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    let options = from_options(&draft);
     // The same default `compose::send` applies when `from` is unset.
-    let selected = draft
+    let selected_email = draft
         .from
         .as_ref()
         .map(|a| a.email.clone())
         .or_else(|| {
-            identities
-                .iter()
-                .find(|i| i.email.eq_ignore_ascii_case(&account))
-                .or(identities.first())
-                .map(|i| i.email.clone())
+            let own = || options.iter().filter(|o| o.account_id == draft.account_id);
+
+            own()
+                .find(|o| o.identity.email.eq_ignore_ascii_case(&account))
+                .or(own().next())
+                .map(|o| o.identity.email.clone())
         })
         .unwrap_or_default();
+    let selected = format!("{}/{}", draft.account_id, selected_email.to_lowercase());
     let from = if account.is_empty() {
         "Default Fastmail address".to_string()
     } else {
@@ -44,6 +96,7 @@ pub fn Composer() -> Element {
         .markdown
         .then(|| frame_doc(&compose::render_markdown(&draft.body)));
     let focus_body = !draft.to.is_empty();
+    let picker = options.clone();
 
     rsx! {
         div { class: "overlay",
@@ -51,28 +104,31 @@ pub fn Composer() -> Element {
                 div { class: "composer-title", "{draft.subject}" }
                 div { class: "field",
                     label { "From:" }
-                    if identities.is_empty() {
+                    if options.is_empty() {
                         span { class: "static", "{from}" }
                     } else {
                         select {
                             onchange: move |evt| {
-                                let email = evt.value();
-                                let picked = IDENTITIES
-                                    .peek()
-                                    .iter()
-                                    .find(|i| i.email == email)
-                                    .map(|i| Address {
-                                        name: (!i.name.is_empty()).then(|| i.name.clone()),
-                                        email: i.email.clone(),
-                                    });
+                                let value = evt.value();
+                                let picked = picker.iter().find(|o| o.value() == value).cloned();
 
-                                edit(|d| d.from = picked);
+                                if let Some(o) = picked {
+                                    edit(|d| {
+                                        d.account_id = o.account_id.clone();
+                                        d.from = Some(Address {
+                                            name: (!o.identity.name.is_empty())
+                                                .then(|| o.identity.name.clone()),
+                                            email: o.identity.email.clone(),
+                                        });
+                                    });
+                                }
                             },
-                            for i in identities.iter() {
+                            for o in options.iter() {
                                 option {
-                                    value: "{i.email}",
-                                    selected: i.email.eq_ignore_ascii_case(&selected),
-                                    {format!("{} <{}>", i.name, i.email)}
+                                    key: "{o.value()}",
+                                    value: "{o.value()}",
+                                    selected: o.value().to_lowercase() == selected,
+                                    "{o.label}"
                                 }
                             }
                         }

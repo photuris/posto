@@ -66,10 +66,7 @@ fn two_identities() -> Value {
 
 fn cfg() -> Config {
     Config {
-        account: Account {
-            email: "me@example.com".into(),
-            ..Account::default()
-        },
+        accounts: vec![Account::new("a", "me@example.com")],
         ..Config::default()
     }
 }
@@ -77,6 +74,7 @@ fn cfg() -> Config {
 fn store() -> Store {
     let store = Store::open_memory().unwrap();
     let mailbox = |id: &str, role: &str| Mailbox {
+        account_id: "a".into(),
         id: id.into(),
         name: role.into(),
         role: Some(role.into()),
@@ -95,6 +93,7 @@ fn store() -> Store {
 
 fn draft() -> Draft {
     Draft {
+        account_id: "a".into(),
         to: vec![Address {
             name: None,
             email: "bob@example.com".into(),
@@ -125,7 +124,7 @@ async fn send_creates_and_submits() {
     )
     .await;
 
-    let id = send(&cfg(), &store(), &client(&server).await, &draft())
+    let id = send(&cfg(), &store(), &client(&server).await, "a", &draft())
         .await
         .unwrap();
 
@@ -186,7 +185,7 @@ async fn send_uses_draft_from_identity() {
         email: "shop@example.com".into(),
     });
 
-    send(&cfg(), &store(), &client(&server).await, &d)
+    send(&cfg(), &store(), &client(&server).await, "a", &d)
         .await
         .unwrap();
 
@@ -217,7 +216,7 @@ async fn send_rejects_unknown_from() {
         email: "nobody@x.io".into(),
     });
 
-    let err = send(&cfg(), &store(), &client(&server).await, &d)
+    let err = send(&cfg(), &store(), &client(&server).await, "a", &d)
         .await
         .unwrap_err();
 
@@ -268,7 +267,7 @@ async fn send_rejects_responses_with_wrong_call_ids() {
         identities(&server, two_identities()).await;
         mount(&server, "EmailSubmission/set", responses, 1).await;
 
-        let result = send(&cfg(), &store(), &client(&server).await, &draft()).await;
+        let result = send(&cfg(), &store(), &client(&server).await, "a", &draft()).await;
 
         assert!(result.is_err(), "{name}: accepted as {result:?}");
 
@@ -303,7 +302,7 @@ async fn send_reports_not_created() {
     )
     .await;
 
-    let err = send(&cfg(), &store(), &client(&server).await, &draft())
+    let err = send(&cfg(), &store(), &client(&server).await, "a", &draft())
         .await
         .unwrap_err();
 
@@ -319,6 +318,7 @@ async fn send_marks_replied_answered() {
     let store = store();
     store
         .upsert_emails(&[EmailSummary {
+            account_id: "a".into(),
             id: "e1".into(),
             thread_id: "t1".into(),
             received_at: "2026-10-01T10:00:00Z".into(),
@@ -353,11 +353,11 @@ async fn send_marks_replied_answered() {
         reply_to_email_id: Some("e1".into()),
         ..draft()
     };
-    send(&cfg(), &store, &client(&server).await, &draft)
+    send(&cfg(), &store, &client(&server).await, "a", &draft)
         .await
         .unwrap();
 
-    let keywords = store.email("e1").unwrap().unwrap().keywords;
+    let keywords = store.email("a", "e1").unwrap().unwrap().keywords;
     assert!(keywords.contains(&"$answered".to_string()), "{keywords:?}");
 }
 
@@ -366,7 +366,7 @@ async fn send_without_identity_fails() {
     let server = server().await;
     identities(&server, json!([])).await;
 
-    let err = send(&cfg(), &store(), &client(&server).await, &draft())
+    let err = send(&cfg(), &store(), &client(&server).await, "a", &draft())
         .await
         .unwrap_err();
 
@@ -390,7 +390,7 @@ async fn send_reports_move_to_sent_failure() {
         identities(&server, two_identities()).await;
         mount(&server, "EmailSubmission/set", responses, 1).await;
 
-        let err = send(&cfg(), &store(), &client(&server).await, &draft())
+        let err = send(&cfg(), &store(), &client(&server).await, "a", &draft())
             .await
             .unwrap_err();
 

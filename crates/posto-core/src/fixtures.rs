@@ -4,6 +4,9 @@ use crate::error::Result;
 use crate::jmap::Identity;
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 
+/// Account the fixtures belong to: the id of a fresh config's only account.
+pub const ACCOUNT: &str = "default";
+
 /// Address of the fixture account owner.
 const ME: &str = "me@example.com";
 
@@ -239,6 +242,7 @@ pub fn seed(store: &Store) -> Result<()> {
     let mut mailboxes: Vec<Mailbox> = MAILBOXES
         .iter()
         .map(|&(id, name, role, sort_order)| Mailbox {
+            account_id: ACCOUNT.into(),
             id: id.into(),
             name: name.into(),
             role: role.map(String::from),
@@ -259,18 +263,21 @@ pub fn seed(store: &Store) -> Result<()> {
         name: None,
         email: SHOP.into(),
     };
-    store.set_identities(&[
-        Identity {
-            id: "id-1".into(),
-            name: "Mikkel Malmberg".into(),
-            email: ME.into(),
-        },
-        Identity {
-            id: "id-2".into(),
-            name: "Mikkel (shop)".into(),
-            email: SHOP.into(),
-        },
-    ])?;
+    store.set_identities(
+        ACCOUNT,
+        &[
+            Identity {
+                id: "id-1".into(),
+                name: "Mikkel Malmberg".into(),
+                email: ME.into(),
+            },
+            Identity {
+                id: "id-2".into(),
+                name: "Mikkel (shop)".into(),
+                email: SHOP.into(),
+            },
+        ],
+    )?;
     let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
 
     for fx in &EMAILS {
@@ -298,6 +305,7 @@ pub fn seed(store: &Store) -> Result<()> {
         };
 
         store.upsert_emails(&[EmailSummary {
+            account_id: ACCOUNT.into(),
             id: fx.id.into(),
             thread_id: format!("th-{num}"),
             received_at: fx.at.into(),
@@ -315,18 +323,21 @@ pub fn seed(store: &Store) -> Result<()> {
             mailbox_ids: strings(fx.mailboxes),
             keywords: strings(fx.keywords),
         }])?;
-        store.put_body(&EmailBody {
-            email_id: fx.id.into(),
-            html: fx.html.map(String::from),
-            text: fx.text.map(String::from),
-            attachments,
-            in_reply_to: vec![],
-            references: vec![],
-            message_id: vec![message_id],
-        })?;
+        store.put_body(
+            ACCOUNT,
+            &EmailBody {
+                email_id: fx.id.into(),
+                html: fx.html.map(String::from),
+                text: fx.text.map(String::from),
+                attachments,
+                in_reply_to: vec![],
+                references: vec![],
+                message_id: vec![message_id],
+            },
+        )?;
     }
 
-    for (id, total, unread) in store.counts()? {
+    for (id, total, unread) in store.counts(ACCOUNT)? {
         if let Some(mb) = mailboxes.iter_mut().find(|m| m.id == id) {
             mb.total = total;
             mb.unread = unread;
@@ -347,17 +358,29 @@ mod tests {
 
         seed(&store).unwrap();
 
-        assert_eq!(store.mailboxes().unwrap().len(), 9);
-        assert_eq!(store.identities().unwrap().len(), 2);
-        assert_eq!(store.list_emails(&ListQuery::default()).unwrap().len(), 14);
+        assert_eq!(store.mailboxes(ACCOUNT).unwrap().len(), 9);
+        assert_eq!(store.identities(ACCOUNT).unwrap().len(), 2);
         assert_eq!(
-            store.mailbox_by_role("inbox").unwrap().unwrap().id,
+            store
+                .list_emails(None, &ListQuery::default())
+                .unwrap()
+                .len(),
+            14
+        );
+        assert_eq!(
+            store.mailbox_by_role(ACCOUNT, "inbox").unwrap().unwrap().id,
             "mb-inbox"
         );
-        assert!(store.email("fx-03").unwrap().unwrap().has_attachment);
         assert!(
             store
-                .body("fx-01")
+                .email(ACCOUNT, "fx-03")
+                .unwrap()
+                .unwrap()
+                .has_attachment
+        );
+        assert!(
+            store
+                .body(ACCOUNT, "fx-01")
                 .unwrap()
                 .unwrap()
                 .html
@@ -365,12 +388,12 @@ mod tests {
                 .contains("https://linear.example")
         );
         assert_eq!(
-            store.body("fx-11").unwrap().unwrap().message_id,
+            store.body(ACCOUNT, "fx-11").unwrap().unwrap().message_id,
             ["q3vat@holmrevision.example"]
         );
 
         let inbox_unread = store
-            .counts()
+            .counts(ACCOUNT)
             .unwrap()
             .into_iter()
             .find(|(id, ..)| id == "mb-inbox")
@@ -380,11 +403,16 @@ mod tests {
         assert!(inbox_unread >= 5, "inbox unread = {inbox_unread}");
 
         let news = store
-            .list_emails(&ListQuery {
-                mailbox_id: Some("mb-newsletters".into()),
-                ..Default::default()
-            })
+            .list_emails(
+                Some(ACCOUNT),
+                &ListQuery {
+                    mailbox_id: Some("mb-newsletters".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
+
+        assert!(news.iter().all(|e| e.account_id == "default"));
 
         assert_eq!(news.len(), 3);
         assert_eq!(

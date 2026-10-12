@@ -3,12 +3,13 @@
 use dioxus::prelude::*;
 
 use crate::app::{
-    EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION, SIDEBAR_OPEN,
+    EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION, SIDEBAR_OPEN, backend,
     click_email, load_more,
 };
 use crate::components::Icon;
 use crate::format;
 use crate::selection::Click;
+use crate::state::{Folder, rows_for_display};
 
 /// Avatar, sender, date, subject, preview and mailbox chips for every email in view.
 #[component]
@@ -20,16 +21,41 @@ pub fn MessageList() -> Element {
     let picked = selection.len();
     let searching = !SEARCH_QUERY.read().trim().is_empty();
     let now = chrono::Utc::now();
-    let mailbox = mailboxes
-        .iter()
-        .find(|m| Some(&m.id) == current.as_ref())
-        .cloned();
+    let mailbox = match &current {
+        Some(Folder::Mailbox { account_id, id }) => mailboxes
+            .iter()
+            .find(|m| m.account_id == *account_id && m.id == *id)
+            .cloned(),
+        _ => None,
+    };
+    let unified = current == Some(Folder::AllInboxes);
+    let accounts: Vec<(String, String)> = backend()
+        .read()
+        .cfg
+        .accounts_enabled()
+        .map(|a| (a.id.clone(), a.display_name().to_string()))
+        .collect();
+    // Rows of several accounts say which account they belong to.
+    let tag_accounts = accounts.len() > 1 && (unified || searching);
+    let inboxes = || {
+        mailboxes
+            .iter()
+            .filter(|m| m.role.as_deref() == Some("inbox"))
+    };
     // Sent and drafts are about who the mail went to.
     let show_recipient = mailbox
         .as_ref()
         .is_some_and(|m| matches!(m.role.as_deref(), Some("sent" | "drafts")));
     let (title, counts) = match (&mailbox, searching) {
         (_, true) => ("Search".to_string(), format!("{} results", emails.len())),
+        (None, _) if unified => (
+            "All inboxes".to_string(),
+            format!(
+                "{} messages, {} unread",
+                inboxes().map(|m| m.total).sum::<i64>(),
+                inboxes().map(|m| m.unread).sum::<i64>()
+            ),
+        ),
         (Some(m), _) => (
             m.name.clone(),
             format!("{} messages, {} unread", m.total, m.unread),
@@ -66,23 +92,42 @@ pub fn MessageList() -> Element {
                 if emails.is_empty() {
                     div { class: "empty", "No messages" }
                 }
-                for e in emails {
+                for (key, e) in rows_for_display(&emails) {
                     {
                         let people = if show_recipient { &e.to } else { &e.from };
                         let person = people.first();
                         let name = person.map(format::who).unwrap_or("(unknown)").to_string();
                         let seed = person.map_or(name.clone(), |a| a.email.clone());
                         let hue = format::avatar_hue(&seed);
-                        let chips: Vec<(String, u16)> = e
-                            .mailbox_ids
-                            .iter()
-                            .filter(|id| Some(*id) != current.as_ref())
-                            .filter_map(|id| mailboxes.iter().find(|m| &m.id == id))
-                            .map(|m| (m.name.clone(), format::avatar_hue(&m.name)))
+                        let account_chip = tag_accounts
+                            .then(|| accounts.iter().find(|(id, _)| *id == e.account_id))
+                            .flatten()
+                            .map(|(_, name)| (name.clone(), format::avatar_hue(name)));
+                        let chips: Vec<(String, u16)> = account_chip
+                            .into_iter()
+                            .chain(
+                                e.mailbox_ids
+                                    .iter()
+                                    .filter_map(|id| {
+                                        mailboxes
+                                            .iter()
+                                            .find(|m| m.account_id == e.account_id && &m.id == id)
+                                    })
+                                    .filter(|m| match &current {
+                                        Some(Folder::Mailbox { account_id, id }) => {
+                                            !(m.account_id == *account_id && m.id == *id)
+                                        }
+                                        Some(Folder::AllInboxes) => {
+                                            m.role.as_deref() != Some("inbox")
+                                        }
+                                        None => true,
+                                    })
+                                    .map(|m| (m.name.clone(), format::avatar_hue(&m.name))),
+                            )
                             .collect();
                         let class = match (
-                            selection.is_selected(&e.id),
-                            selection.focus.as_ref() == Some(&e.id),
+                            selection.is_selected(&key),
+                            selection.focus.as_deref() == Some(key.as_str()),
                             e.is_unread(),
                         ) {
                             (true, true, _) => "row selected focused",
@@ -90,12 +135,12 @@ pub fn MessageList() -> Element {
                             (false, _, true) => "row unread",
                             (false, _, false) => "row",
                         };
-                        let id = e.id.clone();
+                        let row_id = key.clone();
 
                         rsx! {
                             div {
-                                key: "{e.id}",
-                                id: "row-{e.id}",
+                                key: "{key}",
+                                id: "row-{key}",
                                 class,
                                 onmousedown: |evt| evt.prevent_default(),
                                 onclick: move |evt| {
@@ -110,7 +155,7 @@ pub fn MessageList() -> Element {
                                         Click::Plain
                                     };
 
-                                    click_email(&id, kind);
+                                    click_email(&row_id, kind);
                                 },
                                 div {
                                     class: "avatar",
@@ -139,9 +184,9 @@ pub fn MessageList() -> Element {
                                     div { class: "preview", "{e.preview}" }
                                     if !chips.is_empty() {
                                         div { class: "chips",
-                                            for (chip, chip_hue) in chips {
+                                            for (i, (chip, chip_hue)) in chips.into_iter().enumerate() {
                                                 span {
-                                                    key: "{chip}",
+                                                    key: "{i}",
                                                     class: "chip",
                                                     style: "--hue: {chip_hue}",
                                                     "{chip}"

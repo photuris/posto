@@ -3,12 +3,14 @@
 use posto_core::actions::{Action, apply};
 use posto_core::body::{fetch_body, save_attachment};
 use posto_core::compose::{Draft, send};
-use posto_core::config::Config;
+use posto_core::config::{Account, Config};
 use posto_core::jmap::Client;
 use posto_core::store::{EmailSummary, Mailbox, Store};
-use posto_core::sync::sync_with_lock;
+use posto_core::sync::{sync_account, sync_all_with_lock};
 use posto_core::{Error, Result};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
@@ -106,8 +108,17 @@ fn email_json(id: &str) -> Value {
     })
 }
 
+/// A config whose only account is `a`.
+fn cfg_a() -> Config {
+    Config {
+        accounts: vec![Account::new("a", "me@example.com")],
+        ..Config::default()
+    }
+}
+
 fn email(id: &str, mailbox: &str) -> EmailSummary {
     EmailSummary {
+        account_id: "a".into(),
         id: id.into(),
         thread_id: format!("t-{id}"),
         received_at: "2026-10-01T10:00:00Z".into(),
@@ -125,6 +136,7 @@ fn email(id: &str, mailbox: &str) -> EmailSummary {
 
 fn mailbox(id: &str, role: &str) -> Mailbox {
     Mailbox {
+        account_id: "a".into(),
         id: id.into(),
         name: role.into(),
         role: Some(role.into()),
@@ -232,22 +244,22 @@ async fn initial_sync_fills_store() -> Result<()> {
     )
     .await;
 
-    let report = sync_with_lock(
-        &dir.path().join("sync.lock"),
-        &Config::default(),
-        &store,
-        &c,
-    )
-    .await?;
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
 
     assert!(report.initial);
     assert_eq!(report.emails_added, 3);
     assert_eq!(report.mailboxes, 3);
-    assert_eq!(store.list_emails(&Default::default())?.len(), 3);
-    assert_eq!(store.state("email_state")?.as_deref(), Some("s0"));
-    assert_eq!(store.state("mailbox_state")?.as_deref(), Some("m1"));
+    assert_eq!(store.list_emails(Some("a"), &Default::default())?.len(), 3);
+    assert_eq!(
+        store.account_state("a", "email_state")?.as_deref(),
+        Some("s0")
+    );
+    assert_eq!(
+        store.account_state("a", "mailbox_state")?.as_deref(),
+        Some("m1")
+    );
 
-    let e1 = store.email("e1")?.unwrap();
+    let e1 = store.email("a", "e1")?.unwrap();
 
     assert_eq!(e1.mailbox_ids, ["mb-inbox"]);
     assert_eq!(e1.keywords, ["$seen"]);
@@ -305,14 +317,8 @@ async fn initial_sync_stores_identities() -> Result<()> {
     )
     .await;
 
-    let report = sync_with_lock(
-        &dir.path().join("sync.lock"),
-        &Config::default(),
-        &store,
-        &c,
-    )
-    .await?;
-    let stored = store.identities()?;
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
+    let stored = store.identities("a")?;
 
     assert_eq!(report.identities, 2);
     assert_eq!(stored.len(), 2);
@@ -326,16 +332,10 @@ async fn initial_sync_stores_identities() -> Result<()> {
     mount_empty_account(&server).await;
     reply_error(&server, "Identity/get", json!({ "ids": null }), "forbidden").await;
 
-    let report = sync_with_lock(
-        &dir.path().join("sync.lock"),
-        &Config::default(),
-        &store,
-        &c,
-    )
-    .await?;
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
 
     assert_eq!(report.identities, 0);
-    assert!(store.identities()?.is_empty());
+    assert!(store.identities("a")?.is_empty());
 
     Ok(())
 }
@@ -347,9 +347,9 @@ async fn delta_sync_applies_changes() -> Result<()> {
     let store = Store::open_memory()?;
     let dir = tempfile::tempdir()?;
 
-    store.set_state("account_id", "acc1")?;
-    store.set_state("mailbox_state", "m1")?;
-    store.set_state("email_state", "s0")?;
+    store.set_account_state("a", "account_id", "acc1")?;
+    store.set_account_state("a", "mailbox_state", "m1")?;
+    store.set_account_state("a", "email_state", "s0")?;
     store.upsert_emails(&[email("e1", "mb-inbox"), email("e3", "mb-inbox")])?;
 
     reply(
@@ -396,21 +396,18 @@ async fn delta_sync_applies_changes() -> Result<()> {
     )
     .await;
 
-    let report = sync_with_lock(
-        &dir.path().join("sync.lock"),
-        &Config::default(),
-        &store,
-        &c,
-    )
-    .await?;
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
 
     assert!(!report.initial);
     assert_eq!(report.emails_added, 1);
     assert_eq!(report.emails_updated, 1);
     assert_eq!(report.emails_removed, 1);
-    assert!(store.email("e3")?.is_none());
-    assert!(store.email("e4")?.is_some());
-    assert_eq!(store.state("email_state")?.as_deref(), Some("s2"));
+    assert!(store.email("a", "e3")?.is_none());
+    assert!(store.email("a", "e4")?.is_some());
+    assert_eq!(
+        store.account_state("a", "email_state")?.as_deref(),
+        Some("s2")
+    );
 
     Ok(())
 }
@@ -422,18 +419,21 @@ async fn delta_sync_recovers_from_cannot_calculate() -> Result<()> {
     let store = Store::open_memory()?;
     let dir = tempfile::tempdir()?;
 
-    store.set_state("mailbox_state", "m1")?;
-    store.set_state("email_state", "expired")?;
+    store.set_account_state("a", "mailbox_state", "m1")?;
+    store.set_account_state("a", "email_state", "expired")?;
     store.upsert_emails(&[email("e-stale", "mb-inbox")])?;
-    store.put_body(&posto_core::store::EmailBody {
-        email_id: "e-stale".into(),
-        html: None,
-        text: Some("old".into()),
-        attachments: vec![],
-        in_reply_to: vec![],
-        references: vec![],
-        message_id: vec![],
-    })?;
+    store.put_body(
+        "a",
+        &posto_core::store::EmailBody {
+            email_id: "e-stale".into(),
+            html: None,
+            text: Some("old".into()),
+            attachments: vec![],
+            in_reply_to: vec![],
+            references: vec![],
+            message_id: vec![],
+        },
+    )?;
 
     reply(
         &server,
@@ -484,19 +484,208 @@ async fn delta_sync_recovers_from_cannot_calculate() -> Result<()> {
     )
     .await;
 
-    let report = sync_with_lock(
-        &dir.path().join("sync.lock"),
-        &Config::default(),
-        &store,
-        &c,
-    )
-    .await?;
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
 
     assert!(report.initial);
-    assert!(store.email("e-stale")?.is_none());
-    assert!(store.body("e-stale")?.is_none());
-    assert!(store.email("e1")?.is_some());
-    assert_eq!(store.state("email_state")?.as_deref(), Some("s9"));
+    assert!(store.email("a", "e-stale")?.is_none());
+    assert!(store.body("a", "e-stale")?.is_none());
+    assert!(store.email("a", "e1")?.is_some());
+    assert_eq!(
+        store.account_state("a", "email_state")?.as_deref(),
+        Some("s9")
+    );
+
+    Ok(())
+}
+
+/// Mounts an account whose full sync finds `ids`, all in the inbox.
+async fn mount_initial_sync(server: &MockServer, ids: &[&str]) {
+    reply(
+        server,
+        "Mailbox/get",
+        json!({ "ids": null }),
+        json!({ "state": "m1", "list": [mailbox_json("mb-inbox", "Inbox", Some("inbox"))] }),
+        1,
+    )
+    .await;
+    reply(
+        server,
+        "Email/get",
+        json!({ "ids": [] }),
+        json!({ "state": "s0", "list": [] }),
+        1,
+    )
+    .await;
+    reply(
+        server,
+        "Email/query",
+        json!({ "position": 0, "limit": 100 }),
+        json!({ "queryState": "q1", "ids": ids }),
+        1,
+    )
+    .await;
+    reply(
+        server,
+        "Email/query",
+        json!({ "position": ids.len(), "limit": 100 }),
+        json!({ "queryState": "q1", "ids": [] }),
+        1,
+    )
+    .await;
+    reply(
+        server,
+        "Email/get",
+        json!({ "ids": ids }),
+        json!({ "state": "s1", "list": ids.iter().map(|id| email_json(id)).collect::<Vec<_>>() }),
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sync_all_isolates_failures() -> Result<()> {
+    let (server_a, server_b) = (server().await, server().await);
+    let store = Store::open_memory()?;
+    let dir = tempfile::tempdir()?;
+    let mut cfg = cfg_a();
+
+    cfg.accounts.push(Account::new("b", "b@example.com"));
+    cfg.accounts.push(Account::new("c", "c@example.com"));
+
+    // Account b connects fine, then its first API call is refused.
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server_b)
+        .await;
+    mount_initial_sync(&server_a, &["e1", "e2"]).await;
+
+    let clients: HashMap<String, Arc<Client>> = HashMap::from([
+        ("a".to_string(), Arc::new(client(&server_a).await)),
+        ("b".to_string(), Arc::new(client(&server_b).await)),
+    ]);
+    let reports = sync_all_with_lock(&dir.path().join("sync.lock"), &cfg, &store, &clients).await?;
+    let ids: Vec<&str> = reports.iter().map(|r| r.account_id.as_str()).collect();
+
+    assert_eq!(ids, ["a", "b", "c"], "config order");
+    assert_eq!(reports[0].error, None);
+    assert_eq!(reports[0].emails_added, 2);
+    assert!(
+        reports[1]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("auth")),
+        "{:?}",
+        reports[1].error
+    );
+    assert_eq!(reports[2].error.as_deref(), Some("no token"));
+    assert_eq!(reports[2].emails_added, 0);
+    assert_eq!(store.list_emails(Some("a"), &Default::default())?.len(), 2);
+    assert!(
+        store
+            .list_emails(Some("b"), &Default::default())?
+            .is_empty()
+    );
+    assert!(store.mailboxes("b")?.is_empty());
+    assert_eq!(store.list_emails(None, &Default::default())?.len(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_reports_inbox_added() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+    let dir = tempfile::tempdir()?;
+    let mut in_archive = email_json("e5");
+
+    in_archive["mailboxIds"] = json!({ "mb-archive": true });
+
+    store.set_account_state("a", "account_id", "acc1")?;
+    store.set_account_state("a", "mailbox_state", "m1")?;
+    store.set_account_state("a", "email_state", "s0")?;
+    store.upsert_mailboxes(&[
+        mailbox("mb-inbox", "inbox"),
+        mailbox("mb-archive", "archive"),
+    ])?;
+    // e1 is already in the inbox: refreshing it is not an arrival.
+    store.upsert_emails(&[email("e1", "mb-inbox")])?;
+
+    reply(
+        &server,
+        "Mailbox/changes",
+        json!({ "sinceState": "m1" }),
+        json!({ "oldState": "m1", "newState": "m1", "hasMoreChanges": false,
+                "created": [], "updated": [], "destroyed": [] }),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "Email/changes",
+        json!({ "sinceState": "s0" }),
+        json!({ "oldState": "s0", "newState": "s1", "hasMoreChanges": false,
+                "created": ["e4", "e5"], "updated": ["e1"], "destroyed": [] }),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "Email/get",
+        json!({ "ids": ["e4", "e5", "e1"] }),
+        json!({ "state": "s1", "list": [email_json("e4"), in_archive, email_json("e1")] }),
+        1,
+    )
+    .await;
+
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
+
+    assert!(!report.initial);
+    assert_eq!(report.inbox_added, ["e4"]);
+    assert_eq!(store.classify_queue_len("a")?, 1);
+    assert_eq!(store.classify_queue_len("b")?, 0);
+
+    // An initial sync reports nothing and queues nothing.
+    let server = self::server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    mount_initial_sync(&server, &["e1", "e2"]).await;
+
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
+
+    assert!(report.initial);
+    assert_eq!(report.emails_added, 2);
+    assert!(report.inbox_added.is_empty());
+    assert_eq!(store.classify_queue_len("a")?, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_clears_account_whose_server_id_changed() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+    let dir = tempfile::tempdir()?;
+
+    // The stored cursors belong to another server account (`other`, not acc1).
+    store.set_account_state("a", "account_id", "other")?;
+    store.set_account_state("a", "mailbox_state", "m-old")?;
+    store.set_account_state("a", "email_state", "s-old")?;
+    store.upsert_emails(&[email("e-foreign", "mb-inbox")])?;
+    mount_initial_sync(&server, &["e1"]).await;
+
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
+
+    assert!(report.initial);
+    assert!(store.email("a", "e-foreign")?.is_none());
+    assert!(store.email("a", "e1")?.is_some());
+    assert_eq!(
+        store.account_state("a", "account_id")?.as_deref(),
+        Some("acc1")
+    );
 
     Ok(())
 }
@@ -511,7 +700,7 @@ async fn sync_lock_is_exclusive() -> Result<()> {
     let mut held = fd_lock::RwLock::new(std::fs::File::create(&lock_path)?);
     let _guard = held.try_write()?;
 
-    let err = sync_with_lock(&lock_path, &Config::default(), &store, &c)
+    let err = sync_account(&lock_path, &cfg_a(), "a", &store, &c)
         .await
         .unwrap_err();
 
@@ -548,10 +737,10 @@ async fn archive_action_patches_and_mirrors() -> Result<()> {
         .mount(&server)
         .await;
 
-    let n = apply(&store, Some(&c), &ids(&["e1"]), Action::Archive).await?;
+    let n = apply(&store, Some(&c), "a", &ids(&["e1"]), Action::Archive).await?;
 
     assert_eq!(n, 1);
-    assert_eq!(store.email("e1")?.unwrap().mailbox_ids, ["mb-archive"]);
+    assert_eq!(store.email("a", "e1")?.unwrap().mailbox_ids, ["mb-archive"]);
 
     Ok(())
 }
@@ -562,12 +751,12 @@ async fn mark_read_offline_mirrors_only() -> Result<()> {
 
     store.upsert_emails(&[email("e1", "mb-inbox")])?;
 
-    let n = apply(&store, None, &ids(&["e1"]), Action::MarkRead).await?;
+    let n = apply(&store, None, "a", &ids(&["e1"]), Action::MarkRead).await?;
 
     assert_eq!(n, 1);
     assert!(
         store
-            .email("e1")?
+            .email("a", "e1")?
             .unwrap()
             .keywords
             .contains(&"$seen".to_string())
@@ -593,10 +782,10 @@ async fn not_updated_ids_are_skipped() -> Result<()> {
     )
     .await;
 
-    let n = apply(&store, Some(&c), &ids(&["e1"]), Action::MarkRead).await?;
+    let n = apply(&store, Some(&c), "a", &ids(&["e1"]), Action::MarkRead).await?;
 
     assert_eq!(n, 0);
-    assert!(store.email("e1")?.unwrap().keywords.is_empty());
+    assert!(store.email("a", "e1")?.unwrap().keywords.is_empty());
 
     Ok(())
 }
@@ -623,8 +812,8 @@ async fn fetch_body_caches() -> Result<()> {
     )
     .await;
 
-    let first = fetch_body(&store, Some(&c), "e1").await?;
-    let second = fetch_body(&store, Some(&c), "e1").await?;
+    let first = fetch_body(&store, Some(&c), "a", "e1").await?;
+    let second = fetch_body(&store, Some(&c), "a", "e1").await?;
 
     assert_eq!(first, second);
     assert!(first.html.unwrap().contains("<p>Hi</p>"));
@@ -751,16 +940,10 @@ async fn sync_preserves_attachment_flag() -> Result<()> {
         .mount(&server)
         .await;
 
-    sync_with_lock(
-        &dir.path().join("sync.lock"),
-        &Config::default(),
-        &store,
-        &c,
-    )
-    .await?;
+    sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
 
     assert!(
-        store.email("e1")?.unwrap().has_attachment,
+        store.email("a", "e1")?.unwrap().has_attachment,
         "a server email with an attachment lost its attachment flag"
     );
 
@@ -847,16 +1030,16 @@ async fn query_continues_after_restart_budget() -> Result<()> {
         .mount(&server)
         .await;
 
-    let mut cfg = Config::default();
+    let mut cfg = cfg_a();
     cfg.sync.initial_limit = 2;
 
-    let report = sync_with_lock(&dir.path().join("sync.lock"), &cfg, &store, &c).await?;
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg, "a", &store, &c).await?;
 
     assert_eq!(
         report.emails_added, 2,
         "restart budget stopped paging before the limit or an empty page"
     );
-    assert!(store.email("e2")?.is_some());
+    assert!(store.email("a", "e2")?.is_some());
 
     Ok(())
 }
@@ -958,7 +1141,7 @@ async fn send_error_description_redacts_token() {
     )
     .await;
 
-    let err = send(&Config::default(), &store, &c, &Draft::default())
+    let err = send(&cfg_a(), &store, &c, "a", &Draft::default())
         .await
         .unwrap_err();
     let text = format!("{err} {err:?}");
@@ -973,15 +1156,22 @@ async fn offline_action_counts_only_mirrored_emails() -> Result<()> {
 
     store.upsert_emails(&[email("e1", "mb-inbox")])?;
 
-    let count = apply(&store, None, &ids(&["missing"]), Action::MarkRead).await?;
+    let count = apply(&store, None, "a", &ids(&["missing"]), Action::MarkRead).await?;
     assert_eq!(count, 0, "nothing was mirrored for a nonexistent email");
 
-    let count = apply(&store, None, &ids(&["e1", "missing"]), Action::MarkRead).await?;
+    let count = apply(
+        &store,
+        None,
+        "a",
+        &ids(&["e1", "missing"]),
+        Action::MarkRead,
+    )
+    .await?;
     assert_eq!(count, 1);
 
     store.upsert_mailboxes(&[mailbox("mb-archive", "archive")])?;
 
-    let count = apply(&store, None, &ids(&["missing"]), Action::Archive).await?;
+    let count = apply(&store, None, "a", &ids(&["missing"]), Action::Archive).await?;
     assert_eq!(count, 0, "a mailbox move of an unknown email was counted");
 
     Ok(())
@@ -1002,7 +1192,7 @@ async fn online_action_counts_server_accepted_unknown_email() -> Result<()> {
     )
     .await;
 
-    let count = apply(&store, Some(&c), &ids(&["missing"]), Action::MarkRead).await?;
+    let count = apply(&store, Some(&c), "a", &ids(&["missing"]), Action::MarkRead).await?;
 
     assert_eq!(count, 1, "the server applied it, so it is counted");
 

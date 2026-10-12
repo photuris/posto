@@ -1,8 +1,8 @@
 # Posto
 
-A bespoke personal email client. Proof of concept: one Fastmail account
-over JMAP, with a Dioxus desktop GUI and a scriptable CLI over the same
-Rust core.
+A bespoke personal email client. Proof of concept: one or more Fastmail
+accounts over JMAP, with a Dioxus desktop GUI and a scriptable CLI over
+the same Rust core.
 
 ## Layout
 
@@ -36,14 +36,58 @@ Wayland or X11 session.
    posto sync run
    ```
 
-   The GUI Settings window does the same thing.
+   The GUI Settings window does the same thing. A fresh install has one
+   account, `default`.
 3. Start `posto-gui`. It syncs every 5 minutes (configurable, 0 = off)
    and on `g`.
 
 Data lives in `$POSTO_DATA_DIR`, default `~/.local/share/posto`:
 `config.toml`, `secrets.toml` (mode 0600; `POSTO_TOKEN` in the
-environment overrides it), `posto.db`, `sync.lock`. The CLI and GUI share
-the database; sync is single-writer through the lock file.
+environment overrides the token of the default account, the first
+enabled one), `posto.db`, `sync.lock`. The CLI and GUI share the
+database; sync is single-writer through the lock file.
+
+## Accounts
+
+Each account is an `[[accounts]]` entry in `config.toml`; its token lives
+under `[tokens]` in `secrets.toml`, keyed by the account id:
+
+```toml
+# config.toml
+[[accounts]]
+id = "fastmail"            # a-z, 0-9, '-'; unique; used by --account
+name = "Fastmail"          # display name (optional)
+email = "me@fastmail.com"  # default sender address
+session_url = "https://api.fastmail.com/jmap/session"
+enabled = true
+
+[[accounts]]
+id = "work"
+email = "me@work.example"
+```
+
+```toml
+# secrets.toml
+[tokens]
+fastmail = "..."
+work = "..."
+```
+
+Files from the single-account version (`[account]`, top-level `token`)
+load as the account `default` and are rewritten in the new layout on the
+next write. The cache database is rebuilt when its schema version is
+older than the program's (the next sync refetches mail); config and
+secrets are never discarded.
+
+With several enabled accounts the GUI sidebar gets one group per account
+and an "All inboxes" entry that merges them; Settings, General manages
+the accounts. In the CLI, `--account <id>` picks an account. Reads
+(`email list`, `email search`, `mailbox list`) cover every account
+without it, and rows carry `account_id`. An email id given without
+`--account` is looked up in every account and is an error when more than
+one has it. `posto account list|add|remove|set|set-token|show|identities`
+manage the accounts; `posto sync run` syncs each enabled account and
+reports each outcome (a failing account does not stop the others).
 
 ## Keyboard shortcuts (defaults)
 
@@ -62,10 +106,12 @@ delete = "ctrl+d"
 
 `posto <noun> <verb>`; every command's `--help` ends with the JSON shape
 it prints. Nouns: `account`, `sync`, `mailbox`, `email`, `attachment`,
-`theme`, `shortcuts`. Exit codes: 0 ok, 2 usage, 3 not configured, 4 auth
+`theme`, `shortcuts`. `--account <id>` is global. Exit codes: 0 ok, 2 usage, 3 not configured, 4 auth
 rejected, 5 server/transport, 6 not found, 7 sync lock held, 1 other.
 
 ```sh
+posto account add --id work --email me@work.example
+printf '%s' "$TOKEN" | posto account set-token --account work --token-stdin
 posto email list --mailbox Inbox --unread --jsonl | jq -r .subject
 posto email show <id> --text
 posto email archive <id>...
@@ -97,6 +143,6 @@ as CSS variables; elsewhere it falls back to the system scheme.
 
 ## Not in this proof of concept
 
-IMAP, multiple accounts, contacts, calendar, conversation view, push,
+IMAP, moving mail between accounts, contacts, calendar, conversation view, push,
 offline action queue, outgoing attachments, HTML composer, keyring
 storage, packaging.

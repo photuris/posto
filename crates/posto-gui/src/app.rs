@@ -1,15 +1,16 @@
 //! Root component, global signals, action dispatch and background work.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dioxus::prelude::*;
-use posto_core::config::UiConfig;
+use posto_core::config::{Account, Config, UiConfig};
 use posto_core::jmap::{Client, Identity};
 use posto_core::shortcuts::{Action, Keymap};
-use posto_core::store::{Attachment, EmailBody, EmailSummary, ListQuery, Mailbox};
+use posto_core::store::{Attachment, EmailBody, EmailSummary, ListQuery, Mailbox, MsgRef};
 use posto_core::theme::{self, Theme, Watcher};
 use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -18,7 +19,7 @@ use crate::components::{
     Composer, ConfirmDialog, MessageList, MovePicker, Reader, Settings, Sidebar, Toolbar,
 };
 use crate::selection::{Click, Selection};
-use crate::state::{self, Backend};
+use crate::state::{self, Backend, Folder, group_by_account, row_key};
 use crate::{format, keys};
 
 /// A pending yes/no question; accepting runs `on_accept`.
@@ -42,14 +43,18 @@ const TICK: Duration = Duration::from_secs(15);
 /// How long a status toast stays.
 const TOAST: Duration = Duration::from_secs(6);
 
-pub static SELECTED_MAILBOX: GlobalSignal<Option<String>> = Signal::global(|| None);
+pub static SELECTED_MAILBOX: GlobalSignal<Option<Folder>> = Signal::global(|| None);
+/// The mailboxes of every enabled account.
 pub static MAILBOXES: GlobalSignal<Vec<Mailbox>> = Signal::global(Vec::new);
-/// The account's sending identities, as last synced.
-pub static IDENTITIES: GlobalSignal<Vec<Identity>> = Signal::global(Vec::new);
+/// Each account's sending identities, as last synced.
+pub static IDENTITIES: GlobalSignal<BTreeMap<String, Vec<Identity>>> =
+    Signal::global(BTreeMap::new);
 pub static EMAILS: GlobalSignal<Vec<EmailSummary>> = Signal::global(Vec::new);
-/// The selected messages; the focused one is shown in the reader.
+/// The selected messages, as row keys (`<account>/<id>`); the focused one is
+/// shown in the reader.
 pub static SELECTION: GlobalSignal<Selection> = Signal::global(Selection::default);
-pub static BODY: GlobalSignal<Option<EmailBody>> = Signal::global(|| None);
+/// The body of the focused message, with the message it belongs to.
+pub static BODY: GlobalSignal<Option<(MsgRef, EmailBody)>> = Signal::global(|| None);
 pub static BODY_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
 pub static ALLOW_REMOTE: GlobalSignal<bool> = Signal::global(|| false);
 pub static READER_MODE: GlobalSignal<bool> = Signal::global(|| false);
@@ -89,8 +94,23 @@ thread_local! {
 }
 
 /// The focused message: the one the reader shows and replies go to.
-pub fn selected_email() -> Option<String> {
-    SELECTION.read().focus.clone()
+pub fn selected_ref() -> Option<MsgRef> {
+    SELECTION.read().focus.as_deref().and_then(MsgRef::parse)
+}
+
+/// [`selected_ref`] without subscribing the caller to changes.
+fn focus_ref() -> Option<MsgRef> {
+    SELECTION.peek().focus.as_deref().and_then(MsgRef::parse)
+}
+
+/// Every selected message, in list order.
+pub fn selected_refs() -> Vec<MsgRef> {
+    SELECTION
+        .peek()
+        .ids
+        .iter()
+        .filter_map(|k| MsgRef::parse(k))
+        .collect()
 }
 
 /// The shared backend (see [`Backend`]).
@@ -436,7 +456,13 @@ pub fn dispatch(action: Action) {
         Action::ToggleRead => toggle(true),
         Action::ToggleFlag => toggle(false),
         Action::Move => {
-            if !SELECTION.peek().is_empty() {
+            let refs = selected_refs();
+
+            if refs.is_empty() {
+                // Nothing to move.
+            } else if group_by_account(&refs).len() > 1 {
+                set_status("Select messages from one account to move them.");
+            } else {
                 *SHOW_MOVE_PICKER.write() = true;
             }
         }
@@ -490,9 +516,9 @@ pub fn focus_root() {
         document::eval("document.activeElement?.blur?.(); document.getElementById('app')?.focus()");
 }
 
-/// Scrolls the list row for `id` into view.
-fn scroll_to_row(id: &str) {
-    let row = serde_json::to_string(&format!("row-{id}")).unwrap_or_default();
+/// Scrolls the list row with this key into view.
+fn scroll_to_row(key: &str) {
+    let row = serde_json::to_string(&format!("row-{key}")).unwrap_or_default();
 
     let _ = document::eval(&format!(
         "document.getElementById({row})?.scrollIntoView({{block: 'nearest'}})"
@@ -532,9 +558,9 @@ fn move_focus(delta: i32, extend: bool) {
     }
 }
 
-/// Selects a mailbox, leaving search.
-pub fn select_mailbox(id: String) {
-    *SELECTED_MAILBOX.write() = Some(id);
+/// Selects a folder, leaving search.
+pub fn select_mailbox(folder: Folder) {
+    *SELECTED_MAILBOX.write() = Some(folder);
     SEARCH_QUERY.write().clear();
     *LIST_LIMIT.write() = PAGE;
     change_selection(|s| *s = Selection::default());
@@ -561,16 +587,16 @@ pub fn search_input(query: String) {
     });
 }
 
-/// The ids of the rows on screen, in order.
+/// The keys of the rows on screen, in order.
 fn list_order() -> Vec<String> {
-    EMAILS.peek().iter().map(|e| e.id.clone()).collect()
+    EMAILS.peek().iter().map(row_key).collect()
 }
 
-/// A click on the row `id`.
-pub fn click_email(id: &str, kind: Click) {
+/// A click on the row with this key.
+pub fn click_email(key: &str, kind: Click) {
     let order = list_order();
 
-    change_selection(|s| s.click(&order, id, kind));
+    change_selection(|s| s.click(&order, key, kind));
 }
 
 /// Applies `edit` to the selection. When the focused message changes, loads its
@@ -586,23 +612,25 @@ fn change_selection(edit: impl FnOnce(&mut Selection)) {
         return;
     }
 
-    *ALLOW_REMOTE.write() = after.as_deref().is_some_and(remote_trusted);
+    let focus = after.as_deref().and_then(MsgRef::parse);
+
+    *ALLOW_REMOTE.write() = focus.as_ref().is_some_and(remote_trusted);
     *BODY.write() = None;
     *BODY_ERROR.write() = None;
 
-    if let Some(id) = after {
-        run(load_body(id.clone()));
-        run(mark_read_later(id));
+    if let Some(r) = focus {
+        run(load_body(r.clone()));
+        run(mark_read_later(r));
     }
 }
 
-/// True when the policy lets the sender of email `id` load remote content.
-fn remote_trusted(id: &str) -> bool {
+/// True when the policy lets the sender of the message load remote content.
+fn remote_trusted(r: &MsgRef) -> bool {
     let b = backend();
     let b = b.peek();
     let from = b
         .store
-        .email(id)
+        .email(&r.account_id, &r.id)
         .ok()
         .flatten()
         .and_then(|e| e.from.first().map(|a| a.email.clone()))
@@ -631,29 +659,30 @@ pub fn trust_domain(domain: &str) {
     *ALLOW_REMOTE.write() = true;
 }
 
-/// The body of `id`, connecting to the server when it is not cached.
-async fn body_for(id: &str) -> Result<EmailBody> {
+/// The body of a message, connecting to its account's server when it is not cached.
+async fn body_for(r: &MsgRef) -> Result<EmailBody> {
     let b = backend().peek().clone();
+    let cached = b.clients.get(&r.account_id).map(Arc::as_ref);
 
-    match body::fetch_body(&b.store, b.client.as_deref(), id).await {
+    match body::fetch_body(&b.store, cached, &r.account_id, &r.id).await {
         Err(Error::NotFound(_)) if !b.ui_test => {
-            let client = get_client().await?;
+            let client = get_client(&r.account_id).await?;
 
-            body::fetch_body(&b.store, client.as_deref(), id).await
+            body::fetch_body(&b.store, client.as_deref(), &r.account_id, &r.id).await
         }
         other => other,
     }
 }
 
-async fn load_body(id: String) {
-    let result = body_for(&id).await;
+async fn load_body(r: MsgRef) {
+    let result = body_for(&r).await;
 
-    if SELECTION.peek().focus.as_deref() != Some(id.as_str()) {
+    if focus_ref().as_ref() != Some(&r) {
         return;
     }
 
     match result {
-        Ok(body) => *BODY.write() = Some(body),
+        Ok(body) => *BODY.write() = Some((r, body)),
         Err(Error::NotFound(_)) => {
             *BODY_ERROR.write() = Some("This message body is not available offline.".into());
         }
@@ -661,55 +690,62 @@ async fn load_body(id: String) {
     }
 }
 
-async fn mark_read_later(id: String) {
+async fn mark_read_later(r: MsgRef) {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    if SELECTION.peek().focus.as_deref() != Some(id.as_str()) {
+    if focus_ref().as_ref() != Some(&r) {
         return;
     }
 
     let unread = backend()
         .peek()
         .store
-        .email(&id)
+        .email(&r.account_id, &r.id)
         .ok()
         .flatten()
         .is_some_and(|e| e.is_unread());
 
     if unread
-        && apply_local(std::slice::from_ref(&id), actions::Action::MarkRead)
+        && apply_local(std::slice::from_ref(&r), actions::Action::MarkRead)
             .await
             .is_ok()
     {
-        refresh_row(&id);
+        refresh_row(&r);
     }
 }
 
-/// The server connection; sets the "no token" banner as a side effect.
-pub async fn get_client() -> Result<Option<Arc<Client>>> {
-    let result = state::client(backend()).await;
-    let missing = matches!(result, Err(Error::NotConfigured(_)));
+/// The server connection of `account_id`; sets the "no token" banner as a side
+/// effect when it has no token.
+pub async fn get_client(account_id: &str) -> Result<Option<Arc<Client>>> {
+    let result = state::client(backend(), account_id).await;
 
-    if *NEEDS_TOKEN.peek() != missing {
-        *NEEDS_TOKEN.write() = missing;
+    if matches!(result, Err(Error::NotConfigured(_))) && !*NEEDS_TOKEN.peek() {
+        *NEEDS_TOKEN.write() = true;
     }
 
     result
 }
 
-/// Applies `action` to the server and store, and mirrors it in the mailbox badges.
-async fn apply_local(ids: &[String], action: actions::Action) -> Result<usize> {
+/// Applies `action` to the server and store, account by account, and mirrors
+/// it in the mailbox badges.
+async fn apply_local(refs: &[MsgRef], action: actions::Action) -> Result<usize> {
     let b = backend().peek().clone();
-    let client = get_client().await?;
-    let before: Vec<EmailSummary> = ids
-        .iter()
-        .filter_map(|id| b.store.email(id).ok().flatten())
-        .collect();
-    let applied = actions::apply(&b.store, client.as_deref(), ids, action).await?;
+    let mut applied = 0;
 
-    for old in &before {
-        if let Ok(Some(new)) = b.store.email(&old.id) {
-            bump_counts(old, &new);
+    for (account, ids) in group_by_account(refs) {
+        let client = get_client(&account).await?;
+        let before: Vec<EmailSummary> = ids
+            .iter()
+            .filter_map(|id| b.store.email(&account, id).ok().flatten())
+            .collect();
+
+        applied +=
+            actions::apply(&b.store, client.as_deref(), &account, &ids, action.clone()).await?;
+
+        for old in &before {
+            if let Ok(Some(new)) = b.store.email(&account, &old.id) {
+                bump_counts(old, &new);
+            }
         }
     }
 
@@ -718,7 +754,11 @@ async fn apply_local(ids: &[String], action: actions::Action) -> Result<usize> {
 
 /// Adjusts the mailbox badges for an email that changed from `old` to `new`.
 fn bump_counts(old: &EmailSummary, new: &EmailSummary) {
-    for m in MAILBOXES.write().iter_mut() {
+    for m in MAILBOXES
+        .write()
+        .iter_mut()
+        .filter(|m| m.account_id == old.account_id)
+    {
         let was = old.mailbox_ids.contains(&m.id);
         let is = new.mailbox_ids.contains(&m.id);
 
@@ -727,64 +767,129 @@ fn bump_counts(old: &EmailSummary, new: &EmailSummary) {
     }
 }
 
-/// Replaces the visible row for `id` with its current state.
-fn refresh_row(id: &str) {
-    let Ok(Some(fresh)) = backend().peek().store.email(id) else {
+/// Replaces the visible row of a message with its current state.
+fn refresh_row(r: &MsgRef) {
+    let Ok(Some(fresh)) = backend().peek().store.email(&r.account_id, &r.id) else {
         return;
     };
 
-    if let Some(row) = EMAILS.write().iter_mut().find(|e| e.id == id) {
+    if let Some(row) = EMAILS.write().iter_mut().find(|e| e.msg_ref() == *r) {
         *row = fresh;
     }
 }
 
-/// Re-reads the cached sending identities.
+/// Re-reads every account's cached sending identities.
 pub fn reload_identities() {
-    match backend().peek().store.identities() {
-        Ok(list) => *IDENTITIES.write() = list,
-        Err(e) => fail("Could not read identities", e),
-    }
-}
+    let b = backend().peek().clone();
+    let mut all = BTreeMap::new();
 
-/// Re-reads the mailbox list (and server counts); selects the inbox the first time.
-pub fn reload_mailboxes() {
-    match backend().peek().store.mailboxes() {
-        Ok(list) => {
-            if SELECTED_MAILBOX.peek().is_none() {
-                let first = list
-                    .iter()
-                    .find(|m| m.role.as_deref() == Some("inbox"))
-                    .or(list.first());
-
-                if let Some(m) = first {
-                    *SELECTED_MAILBOX.write() = Some(m.id.clone());
-                }
+    for a in &b.cfg.accounts {
+        match b.store.identities(&a.id) {
+            Ok(list) => {
+                all.insert(a.id.clone(), list);
             }
-
-            *MAILBOXES.write() = list;
+            Err(e) => return fail("Could not read identities", e),
         }
-        Err(e) => set_status(format!("Could not read mailboxes: {e}")),
+    }
+
+    *IDENTITIES.write() = all;
+}
+
+/// The folder to start on: the merged inbox with several accounts, else the
+/// first inbox (or first mailbox).
+fn default_folder(mailboxes: &[Mailbox], accounts: usize) -> Option<Folder> {
+    if accounts > 1 {
+        return Some(Folder::AllInboxes);
+    }
+
+    mailboxes
+        .iter()
+        .find(|m| m.role.as_deref() == Some("inbox"))
+        .or(mailboxes.first())
+        .map(|m| Folder::Mailbox {
+            account_id: m.account_id.clone(),
+            id: m.id.clone(),
+        })
+}
+
+/// True when `folder` still exists among `mailboxes` (or is offered at all).
+fn folder_exists(folder: &Folder, mailboxes: &[Mailbox], accounts: usize) -> bool {
+    match folder {
+        Folder::AllInboxes => accounts > 1,
+        Folder::Mailbox { account_id, id } => mailboxes
+            .iter()
+            .any(|m| m.account_id == *account_id && m.id == *id),
     }
 }
 
-/// Reloads the active query (search, else the selected mailbox) from the store.
+/// Re-reads the mailbox list (and server counts) of every enabled account;
+/// selects a default folder when none is selected or the selection is gone.
+pub fn reload_mailboxes() {
+    let b = backend().peek().clone();
+    let accounts = b.cfg.accounts_enabled().count();
+    let mut all = Vec::new();
+
+    for a in b.cfg.accounts_enabled() {
+        match b.store.mailboxes(&a.id) {
+            Ok(list) => all.extend(list),
+            Err(e) => return set_status(format!("Could not read mailboxes: {e}")),
+        }
+    }
+
+    let current = SELECTED_MAILBOX.peek().clone();
+
+    if !current
+        .as_ref()
+        .is_some_and(|f| folder_exists(f, &all, accounts))
+    {
+        let next = default_folder(&all, accounts);
+
+        if next != current {
+            *SELECTED_MAILBOX.write() = next;
+        }
+    }
+
+    *MAILBOXES.write() = all;
+}
+
+/// Reloads the active query (search, else the selected folder) from the store.
 pub async fn reload_list() {
     let b = backend().peek().clone();
     let query = SEARCH_QUERY.peek().trim().to_string();
-    let mailbox = SELECTED_MAILBOX.peek().clone();
+    let folder = SELECTED_MAILBOX.peek().clone();
     let limit = *LIST_LIMIT.peek();
     let store = b.store.clone();
-    let (q, mb) = (query.clone(), mailbox.clone());
+    let (q, f) = (query.clone(), folder.clone());
 
     let loaded = tokio::task::spawn_blocking(move || {
-        if q.is_empty() {
-            store.list_emails(&ListQuery {
-                mailbox_id: mb,
-                limit,
-                ..Default::default()
-            })
-        } else {
-            store.search(&q, limit)
+        if !q.is_empty() {
+            return store.search(None, &q, limit);
+        }
+
+        match f {
+            Some(Folder::AllInboxes) => store.list_emails(
+                None,
+                &ListQuery {
+                    role: Some("inbox".into()),
+                    limit,
+                    ..Default::default()
+                },
+            ),
+            Some(Folder::Mailbox { account_id, id }) => store.list_emails(
+                Some(&account_id),
+                &ListQuery {
+                    mailbox_id: Some(id),
+                    limit,
+                    ..Default::default()
+                },
+            ),
+            None => store.list_emails(
+                None,
+                &ListQuery {
+                    limit,
+                    ..Default::default()
+                },
+            ),
         }
     })
     .await
@@ -792,7 +897,7 @@ pub async fn reload_list() {
     .and_then(|r| r);
 
     // A newer query or mailbox choice made this result stale.
-    if SEARCH_QUERY.peek().trim() != query || *SELECTED_MAILBOX.peek() != mailbox {
+    if SEARCH_QUERY.peek().trim() != query || *SELECTED_MAILBOX.peek() != folder {
         return;
     }
 
@@ -805,6 +910,12 @@ pub async fn reload_list() {
             *EMAILS.write() = list
                 .into_iter()
                 .filter(|e| !backend.is_blocked(e))
+                .filter(|e| {
+                    backend
+                        .cfg
+                        .account(&e.account_id)
+                        .is_some_and(|a| a.enabled)
+                })
                 .collect();
         }
         Err(e) => set_status(format!("Could not load messages: {e}")),
@@ -816,13 +927,13 @@ async fn act_on_selected(action: actions::Action) {
     let Some(_busy) = Flag::take(&BUSY) else {
         return;
     };
-    let ids = SELECTION.peek().ids.clone();
+    let refs = selected_refs();
 
-    if ids.is_empty() {
+    if refs.is_empty() {
         return;
     }
 
-    let n = ids.len();
+    let n = refs.len();
     let s = if n == 1 { "" } else { "s" };
     let done = match &action {
         actions::Action::Archive => format!("Archived {n} message{s}"),
@@ -831,23 +942,23 @@ async fn act_on_selected(action: actions::Action) {
         _ => format!("Moved {n} message{s}"),
     };
 
-    match act_on_emails(&ids, action).await {
+    match act_on_emails(&refs, action).await {
         Ok(()) => set_status(done),
         Err(e) => fail("Action failed", e),
     }
 }
 
-/// Applies `action` to `ids`, reloads the list, and drops the ones that left it from the
+/// Applies `action` to `refs`, reloads the list, and drops the ones that left it from the
 /// selection. If that empties the selection, the row at the old focus's position takes over.
-async fn act_on_emails(ids: &[String], action: actions::Action) -> Result<()> {
+async fn act_on_emails(refs: &[MsgRef], action: actions::Action) -> Result<()> {
     let old_index = SELECTION
         .peek()
         .focus
         .as_ref()
-        .and_then(|f| EMAILS.peek().iter().position(|e| &e.id == f));
+        .and_then(|f| EMAILS.peek().iter().position(|e| row_key(e) == *f));
     let had_selection = !SELECTION.peek().is_empty();
 
-    apply_local(ids, action).await?;
+    apply_local(refs, action).await?;
     reload_list().await;
 
     let order = list_order();
@@ -881,10 +992,10 @@ pub fn mark_selected(action: actions::Action) {
         let Some(_busy) = Flag::take(&BUSY) else {
             return;
         };
-        let ids = SELECTION.peek().ids.clone();
+        let refs = selected_refs();
 
-        match apply_local(&ids, action).await {
-            Ok(_) => ids.iter().for_each(|id| refresh_row(id)),
+        match apply_local(&refs, action).await {
+            Ok(_) => refs.iter().for_each(refresh_row),
             Err(e) => fail("Action failed", e),
         }
     });
@@ -894,11 +1005,9 @@ pub fn mark_selected(action: actions::Action) {
 /// (unflagged) they all become read (flagged), else all become unread (unflagged).
 fn toggle(read: bool) {
     let store = backend().peek().store.clone();
-    let emails: Vec<EmailSummary> = SELECTION
-        .peek()
-        .ids
+    let emails: Vec<EmailSummary> = selected_refs()
         .iter()
-        .filter_map(|id| store.email(id).ok().flatten())
+        .filter_map(|r| store.email(&r.account_id, &r.id).ok().flatten())
         .collect();
 
     if emails.is_empty() {
@@ -915,33 +1024,67 @@ fn toggle(read: bool) {
 
 /// Opens the composer on a reply to the selected email.
 async fn start_reply(all: bool) {
-    let Some(id) = SELECTION.peek().focus.clone() else {
+    let Some(r) = focus_ref() else {
         return;
     };
     let b = backend().peek().clone();
-    let Ok(Some(summary)) = b.store.email(&id) else {
+    let Ok(Some(summary)) = b.store.email(&r.account_id, &r.id) else {
         return;
     };
-    let cached = BODY.peek().clone().filter(|body| body.email_id == id);
+    let cached = BODY
+        .peek()
+        .clone()
+        .filter(|(key, _)| *key == r)
+        .map(|(_, body)| body);
     let body = match cached {
         Some(body) => body,
-        None => match body_for(&id).await {
+        None => match body_for(&r).await {
             Ok(body) => body,
             Err(e) => return fail("Could not load the message to reply to", e),
         },
     };
+    let me = b
+        .cfg
+        .account(&r.account_id)
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    let identities = IDENTITIES
+        .peek()
+        .get(&r.account_id)
+        .cloned()
+        .unwrap_or_default();
 
-    open_composer(compose::reply(
-        &summary,
-        &body,
-        &b.cfg.account.email,
-        all,
-        &IDENTITIES.peek(),
-    ));
+    open_composer(compose::reply(&summary, &body, &me, all, &identities));
 }
 
-/// Opens the composer on `draft`.
-pub fn open_composer(draft: compose::Draft) {
+/// The account a new message is written from: the selected mailbox's, else the
+/// focused message's, else the default account.
+fn compose_account() -> String {
+    let from_folder = match SELECTED_MAILBOX.peek().as_ref() {
+        Some(Folder::Mailbox { account_id, .. }) => Some(account_id.clone()),
+        _ => None,
+    };
+
+    from_folder
+        .or_else(|| focus_ref().map(|r| r.account_id))
+        .or_else(|| {
+            let b = backend();
+            let b = b.peek();
+
+            b.cfg
+                .default_account()
+                .or(b.cfg.accounts.first())
+                .map(|a| a.id.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// Opens the composer on `draft`; a draft without an account gets [`compose_account`].
+pub fn open_composer(mut draft: compose::Draft) {
+    if draft.account_id.is_empty() {
+        draft.account_id = compose_account();
+    }
+
     *COMPOSER_TO.write() = format::addresses_text(&draft.to);
     *COMPOSER_CC.write() = format::addresses_text(&draft.cc);
     *COMPOSER.write() = Some(draft);
@@ -976,8 +1119,10 @@ async fn send_draft(archive: bool) {
     let b = backend().peek().clone();
 
     if !b.ui_test {
-        let sent = match get_client().await {
-            Ok(Some(client)) => compose::send(&b.cfg, &b.store, &client, &draft).await,
+        let sent = match get_client(&draft.account_id).await {
+            Ok(Some(client)) => {
+                compose::send(&b.cfg, &b.store, &client, &draft.account_id, &draft).await
+            }
             Ok(None) => Err(Error::Other("no connection".into())),
             Err(e) => Err(e),
         };
@@ -995,23 +1140,28 @@ async fn send_draft(archive: bool) {
         "Sent"
     });
 
-    match draft.reply_to_email_id.clone().filter(|_| archive) {
-        Some(id) => {
-            if let Err(e) = act_on_emails(std::slice::from_ref(&id), actions::Action::Archive).await
+    let replied_to = draft
+        .reply_to_email_id
+        .as_deref()
+        .map(|id| MsgRef::new(&draft.account_id, id));
+
+    match replied_to.clone().filter(|_| archive) {
+        Some(r) => {
+            if let Err(e) = act_on_emails(std::slice::from_ref(&r), actions::Action::Archive).await
             {
                 fail("Sent, but archiving failed", e);
             }
         }
         None => {
-            if let Some(id) = &draft.reply_to_email_id {
-                refresh_row(id);
+            if let Some(r) = &replied_to {
+                refresh_row(r);
             }
         }
     }
 }
 
-/// Downloads an attachment into the downloads folder.
-pub fn save_attachment(att: Attachment) {
+/// Downloads an attachment of a message of `account_id` into the downloads folder.
+pub fn save_attachment(account_id: String, att: Attachment) {
     run(async move {
         let b = backend().peek().clone();
 
@@ -1019,7 +1169,7 @@ pub fn save_attachment(att: Attachment) {
             return set_status("Preview attachments are not available.");
         }
 
-        let client = match get_client().await {
+        let client = match get_client(&account_id).await {
             Ok(Some(client)) => client,
             Ok(None) => return,
             Err(e) => return fail("Download failed", e),
@@ -1033,7 +1183,45 @@ pub fn save_attachment(att: Attachment) {
     });
 }
 
-/// Syncs with the server. Manual runs report progress; background runs only errors.
+/// The report error of an account that has no token.
+const NO_TOKEN: &str = "no token";
+
+/// One line about a sync pass: totals for one account, a per-account list for several.
+fn sync_summary(cfg: &Config, reports: &[sync::SyncReport]) -> String {
+    let outcome = |r: &sync::SyncReport| match r.error.as_deref() {
+        Some(NO_TOKEN) => "no token configured".to_string(),
+        Some(e) => format!("failed: {e}"),
+        None => format!(
+            "{} new, {} updated, {} removed",
+            r.emails_added, r.emails_updated, r.emails_removed
+        ),
+    };
+
+    match reports {
+        [only] => match only.error.as_deref() {
+            Some(NO_TOKEN) => "No token configured — open Settings".to_string(),
+            Some(e) => format!("Sync failed: {e}"),
+            None => format!("Synced: {}", outcome(only)),
+        },
+        _ => {
+            let parts: Vec<String> = reports
+                .iter()
+                .map(|r| {
+                    let name = cfg
+                        .account(&r.account_id)
+                        .map_or(r.account_id.as_str(), Account::display_name);
+
+                    format!("{name}: {}", outcome(r))
+                })
+                .collect();
+
+            format!("Synced — {}", parts.join("; "))
+        }
+    }
+}
+
+/// Syncs every enabled account. Manual runs report progress; background runs
+/// only new mail and errors.
 pub async fn run_sync(manual: bool) {
     if backend().peek().ui_test {
         if manual {
@@ -1055,39 +1243,70 @@ pub async fn run_sync(manual: bool) {
     }
 
     let b = backend().peek().clone();
-    let result = match get_client().await {
-        Ok(Some(client)) => {
-            let (cfg, store) = (b.cfg.clone(), b.store.clone());
+    let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
+    let mut unreachable: HashMap<String, String> = HashMap::new();
 
-            tokio::spawn(async move { sync::sync(&cfg, &store, &client).await })
-                .await
-                .map_err(|e| Error::Other(e.to_string()))
-                .and_then(|r| r)
-        }
-        Ok(None) => return,
-        Err(e) => Err(e),
-    };
-
-    match result {
-        Ok(report) => {
-            reload_mailboxes();
-            reload_identities();
-            reload_list().await;
-
-            if manual || report.emails_added > 0 {
-                set_status(format!(
-                    "Synced: {} new, {} updated, {} removed",
-                    report.emails_added, report.emails_updated, report.emails_removed
-                ));
+    for a in b.cfg.accounts_enabled() {
+        match get_client(&a.id).await {
+            Ok(Some(client)) => {
+                clients.insert(a.id.clone(), client);
+            }
+            // No token: the pass reports it for this account.
+            Ok(None) | Err(Error::NotConfigured(_)) => {}
+            Err(e) => {
+                unreachable.insert(a.id.clone(), e.to_string());
             }
         }
+    }
+
+    let cfg = b.cfg.clone();
+    let store = b.store.clone();
+    let result = tokio::spawn(async move { sync::sync_all(&cfg, &store, &clients).await })
+        .await
+        .map_err(|e| Error::Other(e.to_string()))
+        .and_then(|r| r);
+    let mut reports = match result {
+        Ok(reports) => reports,
         Err(Error::Locked(_)) => {
             if manual {
                 set_status("Sync already running");
             }
+
+            return;
         }
-        Err(Error::NotConfigured(_)) if !manual => {}
-        Err(e) => fail("Sync failed", e),
+        Err(e) => return fail("Sync failed", e),
+    };
+
+    for r in &mut reports {
+        if let Some(e) = unreachable.remove(&r.account_id) {
+            r.error = Some(e);
+        }
+    }
+
+    let missing_token = reports.iter().any(|r| r.error.as_deref() == Some(NO_TOKEN));
+
+    if *NEEDS_TOKEN.peek() != missing_token {
+        *NEEDS_TOKEN.write() = missing_token;
+    }
+
+    if reports
+        .iter()
+        .any(|r| r.error.as_deref() == Some(&Error::Auth.to_string()))
+    {
+        backend().write().reset_client();
+    }
+
+    reload_mailboxes();
+    reload_identities();
+    reload_list().await;
+
+    let added: usize = reports.iter().map(|r| r.emails_added).sum();
+    let failed = reports
+        .iter()
+        .any(|r| r.error.as_deref().is_some_and(|e| e != NO_TOKEN));
+
+    if manual || added > 0 || failed {
+        set_status(sync_summary(&b.cfg, &reports));
     }
 }
 
@@ -1121,7 +1340,6 @@ pub fn sync_soon() {
 #[cfg(test)]
 mod tests {
     use dioxus::core::RuntimeGuard;
-    use posto_core::config::Config;
     use posto_core::store::{Address, Store};
 
     use super::*;
@@ -1130,7 +1348,7 @@ mod tests {
     fn backend_with(cfg: Config) -> Backend {
         Backend {
             store: Arc::new(Store::open_memory().unwrap()),
-            client: None,
+            clients: HashMap::new(),
             cfg,
             ui_test: false,
             conn_rev: 0,
@@ -1204,6 +1422,7 @@ mod tests {
 
         store
             .upsert_mailboxes(&[Mailbox {
+                account_id: "default".into(),
                 id: "box".into(),
                 name: "Box".into(),
                 role: Some("inbox".into()),
@@ -1217,6 +1436,7 @@ mod tests {
         // PAGE + 1 emails, the newest of them blocked.
         let rows: Vec<EmailSummary> = (0..=PAGE)
             .map(|i| EmailSummary {
+                account_id: "default".into(),
                 id: format!("e{i:03}"),
                 thread_id: format!("t{i:03}"),
                 received_at: format!("2026-10-12T{:02}:{:02}:00Z", i / 60, i % 60),
@@ -1245,6 +1465,83 @@ mod tests {
 
         assert_eq!(EMAILS.peek().len(), PAGE as usize - 1);
         assert!(*HAS_MORE.peek(), "older allowed mail remains");
+    }
+
+    /// A mailbox of `account` for folder tests.
+    fn mailbox_of(account: &str, id: &str, role: Option<&str>) -> Mailbox {
+        Mailbox {
+            account_id: account.into(),
+            id: id.into(),
+            name: id.into(),
+            role: role.map(String::from),
+            parent_id: None,
+            sort_order: 0,
+            total: 0,
+            unread: 0,
+        }
+    }
+
+    #[test]
+    fn default_folder_is_unified_only_with_several_accounts() {
+        let boxes = [
+            mailbox_of("a", "a-arch", Some("archive")),
+            mailbox_of("a", "a-in", Some("inbox")),
+            mailbox_of("b", "b-in", Some("inbox")),
+        ];
+
+        assert_eq!(default_folder(&boxes, 2), Some(Folder::AllInboxes));
+        assert_eq!(
+            default_folder(&boxes, 1),
+            Some(Folder::Mailbox {
+                account_id: "a".into(),
+                id: "a-in".into()
+            })
+        );
+        assert_eq!(default_folder(&[], 1), None);
+        assert!(folder_exists(&Folder::AllInboxes, &boxes, 2));
+        assert!(!folder_exists(&Folder::AllInboxes, &boxes, 1));
+        assert!(!folder_exists(
+            &Folder::Mailbox {
+                account_id: "b".into(),
+                id: "a-in".into()
+            },
+            &boxes,
+            2
+        ));
+    }
+
+    #[test]
+    fn sync_summary_names_each_account() {
+        let mut cfg = Config::default();
+
+        cfg.accounts[0].name = "Home".into();
+        cfg.add_account(Account::new("work", "w@x.io")).unwrap();
+
+        let report = |id: &str, added: usize, error: Option<&str>| sync::SyncReport {
+            account_id: id.into(),
+            emails_added: added,
+            error: error.map(String::from),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sync_summary(&cfg, &[report("default", 3, None)]),
+            "Synced: 3 new, 0 updated, 0 removed"
+        );
+        assert_eq!(
+            sync_summary(&cfg, &[report("default", 0, Some(NO_TOKEN))]),
+            "No token configured — open Settings"
+        );
+        assert_eq!(
+            sync_summary(
+                &cfg,
+                &[
+                    report("default", 2, None),
+                    report("work", 0, Some("auth rejected"))
+                ]
+            ),
+            "Synced — Home: 2 new, 0 updated, 0 removed; w@x.io: failed: auth rejected"
+        );
     }
 }
 

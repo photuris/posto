@@ -18,6 +18,10 @@ pub struct Cli {
     /// Print each list element as one JSON object per line.
     #[arg(long, global = true)]
     pub jsonl: bool,
+    /// Account id to act on (default: the first enabled account; reads across
+    /// accounts when omitted).
+    #[arg(long, global = true)]
+    pub account: Option<String>,
     #[command(subcommand)]
     pub cmd: Noun,
 }
@@ -66,17 +70,45 @@ pub enum Noun {
 
 #[derive(Subcommand)]
 pub enum AccountCmd {
-    /// Read the API token from stdin and store it.
+    /// List the configured accounts.
     ///
-    /// Output: {"email": string, "session_url": string, "has_token": bool, "refresh_minutes": number}
+    /// Output: [{"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool}]
+    List,
+    /// Add an account (store its token with `account set-token --account <id>`).
+    ///
+    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    Add {
+        /// New account id: lower-case letters, digits and '-', at most 32.
+        #[arg(long)]
+        id: String,
+        /// Sender email address.
+        #[arg(long)]
+        email: String,
+        /// Display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// JMAP session URL (default: Fastmail).
+        #[arg(long)]
+        session_url: Option<String>,
+    },
+    /// Remove an account with its token and cached mail (never the last one).
+    ///
+    /// Output: {"removed": string}
+    Remove {
+        /// Account id.
+        id: String,
+    },
+    /// Read the API token from stdin and store it for the account.
+    ///
+    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     SetToken {
         /// Required: read the token from stdin (the CLI never prompts).
         #[arg(long, required = true)]
         token_stdin: bool,
     },
-    /// Update the sender email and/or JMAP session URL.
+    /// Update the account's name, sender email, JMAP session URL or enabled flag.
     ///
-    /// Output: {"email": string, "session_url": string, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Set {
         /// Sender email address.
         #[arg(long)]
@@ -84,12 +116,18 @@ pub enum AccountCmd {
         /// JMAP session URL.
         #[arg(long)]
         session_url: Option<String>,
+        /// Display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Sync and show the account (true or false).
+        #[arg(long)]
+        enabled: Option<bool>,
     },
     /// Show the account settings; never the token itself.
     ///
-    /// Output: {"email": string, "session_url": string, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Show,
-    /// List the cached sending identities (filled by `sync run`).
+    /// List the account's cached sending identities (filled by `sync run`).
     ///
     /// Output: [{"id": string, "name": string, "email": string}]
     Identities,
@@ -97,33 +135,35 @@ pub enum AccountCmd {
 
 #[derive(Subcommand)]
 pub enum SyncCmd {
-    /// Sync mailboxes and emails from the server.
+    /// Sync mailboxes and emails: every enabled account, or only `--account`.
     ///
-    /// Output: {"mailboxes": number, "emails_added": number, "emails_updated": number, "emails_removed": number, "initial": bool, "identities": number}
+    /// A failing account is reported in its own `error` field and does not stop the others; the command fails only when it syncs a single account that fails or when no account has a token.
+    ///
+    /// Output: [{"account_id": string, "mailboxes": number, "emails_added": number, "emails_updated": number, "emails_removed": number, "initial": bool, "identities": number, "inbox_added": [string], "error": string|null}]
     Run,
 }
 
 #[derive(Subcommand)]
 pub enum MailboxCmd {
-    /// List mailboxes with counts.
+    /// List mailboxes with counts, for every account or only `--account`.
     ///
-    /// Output: [{"id": string, "name": string, "role": string|null, "parent_id": string|null, "sort_order": number, "total": number, "unread": number}]
+    /// Output: [{"account_id": string, "id": string, "name": string, "role": string|null, "parent_id": string|null, "sort_order": number, "total": number, "unread": number}]
     List,
 }
 
 /// One or more email ids.
 #[derive(Args)]
 pub struct Ids {
-    /// Email ids.
+    /// Email ids; an id found in several accounts needs `--account`.
     #[arg(required = true)]
     pub ids: Vec<String>,
 }
 
 #[derive(Subcommand)]
 pub enum EmailCmd {
-    /// List emails, newest first.
+    /// List emails, newest first, across all accounts or only `--account`.
     ///
-    /// Output: [{"id": string, "thread_id": string, "received_at": string, "from": [{"name": string|null, "email": string}], "to": [address], "cc": [address], "subject": string, "preview": string, "size": number, "has_attachment": bool, "mailbox_ids": [string], "keywords": [string]}]
+    /// Output: [{"account_id": string, "id": string, "thread_id": string, "received_at": string, "from": [{"name": string|null, "email": string}], "to": [address], "cc": [address], "subject": string, "preview": string, "size": number, "has_attachment": bool, "mailbox_ids": [string], "keywords": [string]}]
     List {
         /// Mailbox name or id.
         #[arg(long)]
@@ -138,7 +178,7 @@ pub enum EmailCmd {
         #[arg(long)]
         unread: bool,
     },
-    /// Show one email with its body (fetched and cached if needed).
+    /// Show one email with its body (fetched and cached if needed); an id found in several accounts needs `--account`.
     ///
     /// Output: {"summary": email summary (see `email list`), "body": {"text": string|null, "html": string|null, "attachments": [{"blob_id": string, "name": string, "mime": string, "size": number}]}}
     Show {
@@ -215,7 +255,7 @@ pub enum EmailCmd {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Send a new email.
+    /// Send a new email from `--account` (default: the first enabled account).
     ///
     /// Output: {"id": string}
     Send {
