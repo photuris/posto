@@ -169,17 +169,20 @@ fn has_remote_resource(html: &str) -> bool {
                 break;
             }
 
-            let name_end = rest[1..]
+            // The first character is always part of the name, even `=`; step
+            // over all of its bytes so the slice stays on a char boundary.
+            let first = rest.chars().next().map_or(0, char::len_utf8);
+            let name_end = rest[first..]
                 .find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '/' | '>'))
-                .map_or(rest.len(), |i| i + 1);
+                .map_or(rest.len(), |i| i + first);
             let name = rest[..name_end].to_ascii_lowercase();
 
-            rest = rest[name_end..].trim_start();
+            rest = rest[name_end..].trim_start_matches(|c: char| c.is_ascii_whitespace());
 
             let mut value = "";
 
             if let Some(after) = rest.strip_prefix('=') {
-                let after = after.trim_start();
+                let after = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
                 let (v, tail) = match after.chars().next() {
                     Some(q @ ('"' | '\'')) => {
                         let body = &after[1..];
@@ -200,13 +203,68 @@ fn has_remote_resource(html: &str) -> bool {
                 rest = tail;
             }
 
-            if RESOURCE_ATTRIBUTES.contains(&name.as_str()) && !is_local_resource(value) {
+            if RESOURCE_ATTRIBUTES.contains(&name.as_str())
+                && !is_local_resource(&decode_char_refs(value))
+            {
                 return true;
             }
         }
     }
 
     false
+}
+
+/// Decodes the character references that can spell a `cid:` or
+/// `data:image/` prefix: numeric ones (`&#105;`, `&#x69;`) and `&colon;`,
+/// `&sol;`, `&Tab;`, `&NewLine;`, `&amp;`. Anything else stays as written,
+/// which can only make the value look remote.
+fn decode_char_refs(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+
+        let (decoded, len) = decode_char_ref(rest).unwrap_or(('&', 1));
+
+        out.push(decoded);
+        rest = &rest[len..];
+    }
+
+    out.push_str(rest);
+
+    out
+}
+
+/// Decodes the reference at the start of `s` (which begins with `&`) and
+/// returns the character and the byte length consumed.
+fn decode_char_ref(s: &str) -> Option<(char, usize)> {
+    const NAMED: &[(&str, char)] = &[
+        ("&colon;", ':'),
+        ("&sol;", '/'),
+        ("&Tab;", '\t'),
+        ("&NewLine;", '\n'),
+        ("&amp;", '&'),
+    ];
+
+    if let Some(&(name, c)) = NAMED.iter().find(|(name, _)| s.starts_with(name)) {
+        return Some((c, name.len()));
+    }
+
+    let num = s.strip_prefix("&#")?;
+    let (radix, digits) = match num.strip_prefix(['x', 'X']) {
+        Some(hex) => (16, hex),
+        None => (10, num),
+    };
+    let count = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    let c = char::from_u32(u32::from_str_radix(&digits[..count], radix).ok()?)?;
+    let prefix = s.len() - digits.len();
+    let semi = usize::from(digits[count..].starts_with(';'));
+
+    Some((c, prefix + count + semi))
 }
 
 /// True for the only resource values allowed without `allow_remote`.
@@ -361,6 +419,70 @@ mod tests {
         ] {
             let s = sanitize(html, false);
             assert!(!s.had_remote, "{html} flagged: {}", s.html);
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_encoded_local_resources() {
+        for src in [
+            "c&#105;d:abc",
+            "&#x63;id:abc",
+            "cid&colon;abc",
+            "data&#58;image/png;base64,AA==",
+            "&#100;ata&colon;image&sol;png;base64,AA==",
+        ] {
+            let s = sanitize(&format!(r#"<img src="{src}">"#), false);
+            assert!(s.html.contains("src="), "{src} dropped: {}", s.html);
+            assert!(!s.had_remote, "{src} flagged: {}", s.html);
+        }
+
+        for src in ["h&#116;tps://x/y.png", "&#x68;ttp&colon;&sol;&sol;x/y.png"] {
+            let s = sanitize(&format!(r#"<img src="{src}">"#), false);
+            assert!(!s.html.contains("src"), "{src} kept: {}", s.html);
+            assert!(s.had_remote, "{src} not flagged");
+        }
+    }
+
+    #[test]
+    fn sanitize_survives_unicode_markup() {
+        for html in [
+            "<p é=x>hello</p>",
+            "<p\u{a0}src=x>hello</p>",
+            "<p \u{a0}é=\"ü\" title=ü>hello</p>",
+            "<p 💥=1 💥>hello</p>",
+            "<p =é>hello</p>",
+            "<p é",
+            "<p é=",
+            "<p é='",
+            "<p title=é",
+            "<é src=http://x/y.png>hello",
+            "<💥>hello</💥>",
+            "é<",
+            "<é",
+            "<",
+        ] {
+            let s = sanitize(html, false);
+            assert!(!s.had_remote, "{html:?} flagged: {}", s.html);
+            assert!(
+                !s.html.contains('<') || s.html.contains("hello"),
+                "{html:?}: {}",
+                s.html
+            );
+        }
+
+        let s = sanitize("<p é=x>hello</p>", false);
+        assert_eq!(s.html, "<p>hello</p>");
+
+        // A non-ASCII attribute name does not hide a following remote image.
+        for html in [
+            "<img é=1 src=http://x/y.png>",
+            "<img\u{a0}é=1 src='http://x/y.png'>",
+            "<img 💥 src=\"http://x/y.png\">",
+            "<p é=\"ü\"><img src=http://x/y.png>",
+        ] {
+            let s = sanitize(html, false);
+            assert!(s.had_remote, "{html:?} not flagged: {}", s.html);
+            assert!(!s.html.contains("src"), "{html:?} kept src: {}", s.html);
         }
     }
 

@@ -833,10 +833,7 @@ async fn malformed_session_redacts_token() {
 
     Mock::given(method("GET"))
         .and(path("/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "apiUrl": [SECRET], "downloadUrl": "", "uploadUrl": "",
-            "primaryAccounts": { "urn:ietf:params:jmap:mail": "acc1" },
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(SECRET)))
         .mount(&server)
         .await;
 
