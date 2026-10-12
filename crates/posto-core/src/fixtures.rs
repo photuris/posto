@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::jmap::Identity;
-use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
+use crate::store::{Address, Attachment, Classified, EmailBody, EmailSummary, Mailbox, Store};
 
 /// Account the fixtures belong to: the id of a fresh config's only account.
 pub const ACCOUNT: &str = "default";
@@ -344,7 +344,45 @@ pub fn seed(store: &Store) -> Result<()> {
         }
     }
 
-    store.upsert_mailboxes(&mailboxes)
+    store.upsert_mailboxes(&mailboxes)?;
+    seed_classifier(store)
+}
+
+/// Two classifications (`fx-01` sure, `fx-05` unsure) and one queued email
+/// (`fx-11`), so the classifier views have something to show.
+fn seed_classifier(store: &Store) -> Result<()> {
+    let row = |id: &str, tray: &str, probs: [(&str, f64); 2], urgency, unsure| Classified {
+        account_id: ACCOUNT.into(),
+        email_id: id.into(),
+        tray: tray.into(),
+        probs: probs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        urgency,
+        personal: 0.5,
+        unsure,
+        model: "jev-fixture".into(),
+        input_tokens: 120,
+        classified_at: "2026-10-09T08:20:00Z".into(),
+        corrected_tray: None,
+        applied: true,
+        apply_error: None,
+    };
+
+    store.put_classification(&row(
+        "fx-01",
+        "promotional",
+        [("promotional", 0.88), ("updates", 0.07)],
+        1,
+        false,
+    ))?;
+    store.put_classification(&row(
+        "fx-05",
+        "needs_reply",
+        [("needs_reply", 0.46), ("social", 0.41)],
+        3,
+        true,
+    ))?;
+
+    store.enqueue_for_classification(ACCOUNT, &["fx-11".to_string()])
 }
 
 #[cfg(test)]
@@ -415,6 +453,15 @@ mod tests {
         assert!(news.iter().all(|e| e.account_id == "default"));
 
         assert_eq!(news.len(), 3);
+
+        let classified = store.classifications(Some(ACCOUNT), false, 0).unwrap();
+
+        assert_eq!(classified.len(), 2);
+        assert_eq!(
+            store.classifications(None, true, 0).unwrap()[0].email_id,
+            "fx-05"
+        );
+        assert_eq!(store.classify_queue_len(ACCOUNT).unwrap(), 1);
         assert_eq!(
             news.iter()
                 .filter(|e| !e.mailbox_ids.contains(&"mb-inbox".to_string()))

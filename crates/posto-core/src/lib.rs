@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod body;
+pub mod classify;
 pub mod compose;
 pub mod config;
 pub mod error;

@@ -42,6 +42,8 @@ pub struct Config {
     pub legacy_account: Option<LegacyAccount>,
     /// Sync tuning.
     pub sync: SyncConfig,
+    /// Mail classification (Jev).
+    pub classify: ClassifyConfig,
     /// Action name to key chord; empty means defaults.
     pub shortcuts: BTreeMap<String, String>,
     /// Blocked addresses or domains, lower-case.
@@ -82,6 +84,7 @@ impl Default for Config {
             accounts: vec![Account::default()],
             legacy_account: None,
             sync: SyncConfig::default(),
+            classify: ClassifyConfig::default(),
             shortcuts: BTreeMap::new(),
             blocked_senders: Vec::new(),
             ui: UiConfig::default(),
@@ -178,6 +181,54 @@ impl Default for SyncConfig {
         SyncConfig {
             refresh_minutes: 5,
             initial_limit: 1000,
+        }
+    }
+}
+
+/// Settings of the Jev mail classifier.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClassifyConfig {
+    /// Global switch; an account's own `classify` overrides it.
+    pub enabled: bool,
+    /// Jev model name.
+    pub model: String,
+    /// Top-two probability gap below which an answer is unsure.
+    pub unsure_margin: f64,
+    /// A needs-reply message with at least this urgency (1 to 5) gets `$flagged`.
+    pub flag_urgency_at: u8,
+    /// Most messages sent to Jev by one run.
+    pub max_per_run: u32,
+    /// Most characters of body text sent to Jev.
+    pub body_chars: u32,
+    /// Tray keys whose messages stay in the inbox.
+    pub keep_in_inbox: Vec<String>,
+    /// Mailbox that collects unsure messages.
+    pub unsure_mailbox: String,
+    /// Tray key to top-level mailbox name; spam always goes to the junk role.
+    pub trays: BTreeMap<String, String>,
+}
+
+impl Default for ClassifyConfig {
+    fn default() -> Self {
+        ClassifyConfig {
+            enabled: false,
+            model: "jev-latest".to_string(),
+            unsure_margin: 0.15,
+            flag_urgency_at: 4,
+            max_per_run: 50,
+            body_chars: 2000,
+            keep_in_inbox: vec!["needs_reply".to_string(), "updates".to_string()],
+            unsure_mailbox: "Unsure".to_string(),
+            trays: [
+                ("needs_reply", "Needs reply"),
+                ("updates", "Updates"),
+                ("promotional", "Promos"),
+                ("social", "Social"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
         }
     }
 }
@@ -300,6 +351,12 @@ impl Config {
     /// and of `POSTO_TOKEN`.
     pub fn default_account(&self) -> Option<&Account> {
         self.accounts_enabled().next()
+    }
+
+    /// Whether the classifier works on `account`: the account is enabled and
+    /// its own `classify` setting, else the global switch, is on.
+    pub fn classify_enabled_for(&self, account: &Account) -> bool {
+        account.enabled && account.classify.unwrap_or(self.classify.enabled)
     }
 
     /// Enabled accounts, in config order.
@@ -566,6 +623,42 @@ mod tests {
         assert_eq!(loaded.ui.list_width, 512);
         assert_eq!(loaded.remote_content, "always");
         assert_eq!(loaded.trusted_senders, ["news.example"]);
+    }
+
+    #[test]
+    fn classify_enabled_truth_table() {
+        for global in [false, true] {
+            for own in [None, Some(true), Some(false)] {
+                for enabled in [false, true] {
+                    let mut cfg = Config::default();
+
+                    cfg.classify.enabled = global;
+                    cfg.accounts[0].enabled = enabled;
+                    cfg.accounts[0].classify = own;
+
+                    assert_eq!(
+                        cfg.classify_enabled_for(&cfg.accounts[0]),
+                        enabled && own.unwrap_or(global),
+                        "global={global} own={own:?} enabled={enabled}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classify_config_round_trips_through_toml() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _dir = isolate();
+        let mut cfg = Config::default();
+
+        cfg.classify.enabled = true;
+        cfg.classify.unsure_margin = 0.25;
+        cfg.classify.trays.insert("social".into(), "People".into());
+        cfg.save().unwrap();
+
+        assert_eq!(Config::load().unwrap(), cfg);
+        assert_eq!(Config::default().classify.trays["promotional"], "Promos");
     }
 
     #[test]

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
+use crate::store::Mailbox;
 
 /// Capabilities sent in every request's `using`.
 const USING: [&str; 3] = [
@@ -275,5 +276,51 @@ impl Client {
 
         serde_json::from_value(r["list"].clone())
             .map_err(|_| Error::Jmap("malformed identities".into()))
+    }
+
+    /// Creates a top-level mailbox called `name`.
+    ///
+    /// The returned [`Mailbox`] is rebuilt from the request and the server's
+    /// `created` reply (which may hold only the id); its `account_id` is
+    /// empty and the caller sets the local slug before storing it. A create
+    /// is never retried: it may have been committed before a failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Jmap`] when the server refuses the create or does not
+    /// return an id, plus everything [`Client::call_one`] does.
+    pub async fn create_mailbox(&self, name: &str) -> Result<Mailbox> {
+        let r = self
+            .call_one(
+                "Mailbox/set",
+                json!({
+                    "accountId": self.session.account_id,
+                    "create": { "c": { "name": name, "parentId": null } },
+                }),
+            )
+            .await?;
+
+        if let Some(e) = r["notCreated"].get("c") {
+            return Err(Error::Jmap(format!(
+                "create mailbox {name:?}: {}",
+                self.describe(e)
+            )));
+        }
+
+        let created = &r["created"]["c"];
+        let id = created["id"]
+            .as_str()
+            .ok_or_else(|| Error::Jmap(format!("create mailbox {name:?}: no id returned")))?;
+
+        Ok(Mailbox {
+            account_id: String::new(),
+            id: id.to_string(),
+            name: created["name"].as_str().unwrap_or(name).to_string(),
+            role: created["role"].as_str().map(String::from),
+            parent_id: created["parentId"].as_str().map(String::from),
+            sort_order: created["sortOrder"].as_i64().unwrap_or(0),
+            total: created["totalEmails"].as_i64().unwrap_or(0),
+            unread: created["unreadEmails"].as_i64().unwrap_or(0),
+        })
     }
 }

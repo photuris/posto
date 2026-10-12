@@ -18,6 +18,14 @@ pub enum Action {
         /// Target mailbox id.
         mailbox_id: String,
     },
+    /// Add the `add` mailboxes and drop the `remove` ones, leaving every other
+    /// membership alone.
+    PatchMailboxes {
+        /// Mailbox ids to join.
+        add: Vec<String>,
+        /// Mailbox ids to leave.
+        remove: Vec<String>,
+    },
     /// Add `$seen`.
     MarkRead,
     /// Remove `$seen`.
@@ -36,6 +44,11 @@ pub enum Action {
 enum Change {
     /// Replace the mailbox set.
     Mailbox(String),
+    /// Join and leave individual mailboxes.
+    Patch {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
     /// Add (`true`) or remove (`false`) a keyword.
     Keyword(&'static str, bool),
 }
@@ -69,6 +82,7 @@ pub async fn apply(
         Action::Delete => role_mailbox(store, account, "trash")?,
         Action::Junk => role_mailbox(store, account, "junk")?,
         Action::Move { mailbox_id } => Change::Mailbox(mailbox_id),
+        Action::PatchMailboxes { add, remove } => Change::Patch { add, remove },
         Action::MarkRead => Change::Keyword("$seen", true),
         Action::MarkUnread => Change::Keyword("$seen", false),
         Action::Flag => Change::Keyword("$flagged", true),
@@ -80,6 +94,20 @@ pub async fn apply(
     if let Some(client) = client.filter(|_| !ids.is_empty()) {
         let patch = match &change {
             Change::Mailbox(id) => json!({ "mailboxIds": { id: true } }),
+            Change::Patch { add, remove } => {
+                // Removals first so an id in both lists ends up added.
+                let mut patch = Map::new();
+
+                for id in remove {
+                    patch.insert(format!("mailboxIds/{id}"), Value::Null);
+                }
+
+                for id in add {
+                    patch.insert(format!("mailboxIds/{id}"), Value::Bool(true));
+                }
+
+                Value::Object(patch)
+            }
             Change::Keyword(k, on) => json!({ format!("keywords/{k}"): on.then_some(true) }),
         };
         let update: Map<String, Value> = ids.iter().map(|id| (id.clone(), patch.clone())).collect();
@@ -108,6 +136,19 @@ pub async fn apply(
         match &change {
             Change::Mailbox(target) => {
                 store.set_mailbox_ids(account, id, std::slice::from_ref(target))?
+            }
+            Change::Patch { add, remove } => {
+                let mut mailboxes = email.mailbox_ids.clone();
+
+                mailboxes.retain(|m| !remove.contains(m));
+
+                for m in add {
+                    if !mailboxes.contains(m) {
+                        mailboxes.push(m.clone());
+                    }
+                }
+
+                store.set_mailbox_ids(account, id, &mailboxes)?
             }
             Change::Keyword(k, on) => {
                 email.keywords.retain(|x| x != k);

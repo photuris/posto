@@ -4,6 +4,7 @@
 //! config (not the server's account id). The database is a cache: when the
 //! schema version is not [`SCHEMA_VERSION`], the cache tables are rebuilt.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS email_mailboxes(account_id TEXT NOT NULL, email_id TE
 CREATE INDEX IF NOT EXISTS email_mailboxes_box ON email_mailboxes(account_id, mailbox_id);
 CREATE TABLE IF NOT EXISTS bodies(account_id TEXT NOT NULL, email_id TEXT NOT NULL, html TEXT, text TEXT, attachments_json TEXT NOT NULL, in_reply_to_json TEXT NOT NULL, references_json TEXT NOT NULL, message_id_json TEXT NOT NULL, PRIMARY KEY(account_id, email_id));
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(account_id UNINDEXED, email_id UNINDEXED, subject, from_text, preview, body_text);
+CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, PRIMARY KEY(account_id, email_id));
 CREATE TABLE IF NOT EXISTS classify_queue(account_id TEXT NOT NULL, email_id TEXT NOT NULL, added_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(account_id, email_id));
 ";
 
@@ -59,6 +61,9 @@ const EMAIL_COLS: &str = "e.account_id, e.id, e.thread_id, e.received_at, e.from
 /// SQL predicate: true when the email e has no `$seen` keyword.
 const UNREAD_SQL: &str = "NOT EXISTS (SELECT 1 FROM json_each(e.keywords_json) \
      WHERE value = '$seen')";
+
+/// Attempts after which a queued email is left alone until reset.
+pub const CLASSIFY_MAX_ATTEMPTS: u32 = 3;
 
 /// Page size used when a query passes limit 0.
 const DEFAULT_LIMIT: u32 = 200;
@@ -211,6 +216,59 @@ pub struct EmailBody {
     pub references: Vec<String>,
     /// `Message-ID` values (JMAP form).
     pub message_id: Vec<String>,
+}
+
+/// What the classifier recorded about one email.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Classified {
+    /// Local account slug.
+    pub account_id: String,
+    /// Server-assigned email id.
+    pub email_id: String,
+    /// Tray key Jev chose (or the user, for a manual row).
+    pub tray: String,
+    /// Probability of every tray key; empty for a manual row.
+    pub probs: BTreeMap<String, f64>,
+    /// Urgency, 1 to 5; 0 for a manual row.
+    pub urgency: u8,
+    /// Probability the email was written by a person to the recipient.
+    pub personal: f64,
+    /// True while the top two trays were too close to call and nobody corrected it.
+    pub unsure: bool,
+    /// Model name from the Jev response, or `manual`.
+    pub model: String,
+    /// Input tokens Jev billed.
+    pub input_tokens: u64,
+    /// RFC 3339 UTC time of the answer.
+    pub classified_at: String,
+    /// Tray the user chose instead, if any.
+    pub corrected_tray: Option<String>,
+    /// False while the mailbox changes are not yet confirmed by the server.
+    pub applied: bool,
+    /// Why the last attempt to apply the moves failed.
+    pub apply_error: Option<String>,
+}
+
+impl Classified {
+    /// The tray in force: the correction, else Jev's choice.
+    pub fn effective_tray(&self) -> &str {
+        self.corrected_tray.as_deref().unwrap_or(&self.tray)
+    }
+}
+
+/// One email waiting for (or failing) classification.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct QueueRow {
+    /// Local account slug.
+    pub account_id: String,
+    /// Server-assigned email id.
+    pub email_id: String,
+    /// RFC 3339 UTC time it was queued.
+    pub added_at: String,
+    /// Attempts made so far.
+    pub attempts: u32,
+    /// Why the last attempt failed.
+    pub last_error: Option<String>,
 }
 
 /// Parameters of [`Store::list_emails`].
@@ -432,9 +490,53 @@ fn upsert_email(conn: &Connection, m: &EmailSummary) -> Result<()> {
     Ok(())
 }
 
-/// Deletes one email and everything hanging off it, including its queue row.
+/// Column list matching [`classified_from_row`].
+const CLASSIFIED_COLS: &str = "account_id, email_id, tray, probs_json, urgency, personal, \
+     unsure, model, input_tokens, classified_at, corrected_tray, applied, apply_error";
+
+/// Maps a row selected with [`CLASSIFIED_COLS`] to a [`Classified`].
+fn classified_from_row(row: &Row) -> rusqlite::Result<Classified> {
+    Ok(Classified {
+        account_id: row.get(0)?,
+        email_id: row.get(1)?,
+        tray: row.get(2)?,
+        probs: json_col(row, 3)?,
+        urgency: row.get(4)?,
+        personal: row.get(5)?,
+        unsure: row.get(6)?,
+        model: row.get(7)?,
+        input_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+        classified_at: row.get(9)?,
+        corrected_tray: row.get(10)?,
+        applied: row.get(11)?,
+        apply_error: row.get(12)?,
+    })
+}
+
+/// Column list matching [`queue_row_from_row`].
+const QUEUE_COLS: &str = "account_id, email_id, added_at, attempts, last_error";
+
+/// Maps a row selected with [`QUEUE_COLS`] to a [`QueueRow`].
+fn queue_row_from_row(row: &Row) -> rusqlite::Result<QueueRow> {
+    Ok(QueueRow {
+        account_id: row.get(0)?,
+        email_id: row.get(1)?,
+        added_at: row.get(2)?,
+        attempts: row.get(3)?,
+        last_error: row.get(4)?,
+    })
+}
+
+/// Deletes one email and everything hanging off it, including its queue and
+/// classification rows.
 fn delete_email(conn: &Connection, account: &str, id: &str) -> rusqlite::Result<()> {
-    for table in ["emails", "bodies", "emails_fts", "classify_queue"] {
+    for table in [
+        "emails",
+        "bodies",
+        "emails_fts",
+        "classify_queue",
+        "classified",
+    ] {
         let key = if table == "emails" { "id" } else { "email_id" };
 
         conn.execute(
@@ -914,6 +1016,330 @@ impl Store {
         tx.commit()?;
 
         Ok(())
+    }
+
+    /// Finds a top-level mailbox of `account` by name, ignoring (Unicode)
+    /// case; when several match, the lowest sort order wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn top_level_mailbox_by_name(&self, account: &str, name: &str) -> Result<Option<Mailbox>> {
+        let wanted = name.to_lowercase();
+
+        Ok(self
+            .mailboxes(account)?
+            .into_iter()
+            .filter(|m| m.parent_id.is_none() && m.name.to_lowercase() == wanted)
+            .min_by(|a, b| (a.sort_order, &a.id).cmp(&(b.sort_order, &b.id))))
+    }
+
+    /// Whether any email of `account` in `thread_id`, other than
+    /// `exclude_email_id`, was sent from one of `addresses` (compared
+    /// ignoring case).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn thread_has_reply_from(
+        &self,
+        account: &str,
+        thread_id: &str,
+        exclude_email_id: &str,
+        addresses: &[String],
+    ) -> Result<bool> {
+        let wanted: Vec<String> = addresses.iter().map(|a| a.to_lowercase()).collect();
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT from_json FROM emails \
+             WHERE account_id = ?1 AND thread_id = ?2 AND id <> ?3",
+        )?;
+        let rows = stmt.query_map([account, thread_id, exclude_email_id], |r| {
+            json_col::<Vec<Address>>(r, 0)
+        })?;
+
+        for from in rows {
+            if from?
+                .iter()
+                .any(|a| wanted.contains(&a.email.to_lowercase()))
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Records a classification, replacing any earlier row of the same email.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn put_classification(&self, c: &Classified) -> Result<()> {
+        self.conn().execute(
+            &format!(
+                "INSERT OR REPLACE INTO classified({CLASSIFIED_COLS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            ),
+            params![
+                c.account_id,
+                c.email_id,
+                c.tray,
+                to_json(&c.probs)?,
+                c.urgency,
+                c.personal,
+                c.unsure,
+                c.model,
+                i64::try_from(c.input_tokens).unwrap_or(i64::MAX),
+                c.classified_at,
+                c.corrected_tray,
+                c.applied,
+                c.apply_error,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// The classification of one email.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn classification(&self, account: &str, id: &str) -> Result<Option<Classified>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT {CLASSIFIED_COLS} FROM classified \
+                     WHERE account_id = ?1 AND email_id = ?2"
+                ),
+                [account, id],
+                classified_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Classifications, newest first; `account` `None` spans every account.
+    /// `unsure_only` keeps the ones still unsure (a correction clears that).
+    /// A `limit` of 0 means no limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn classifications(
+        &self,
+        account: Option<&str>,
+        unsure_only: bool,
+        limit: u32,
+    ) -> Result<Vec<Classified>> {
+        let limit = if limit == 0 { -1 } else { i64::from(limit) };
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CLASSIFIED_COLS} FROM classified \
+             WHERE (?1 IS NULL OR account_id = ?1) AND (?2 = 0 OR unsure = 1) \
+             ORDER BY classified_at DESC, account_id, email_id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![account, unsure_only, limit], classified_from_row)?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Classifications whose mailbox changes the server has not confirmed,
+    /// oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn pending_classifications(&self) -> Result<Vec<Classified>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CLASSIFIED_COLS} FROM classified WHERE applied = 0 \
+             ORDER BY classified_at, account_id, email_id"
+        ))?;
+        let rows = stmt.query_map([], classified_from_row)?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records the outcome of applying a classification: `None` confirms it,
+    /// `Some(error)` leaves it pending with the reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn set_classification_applied(
+        &self,
+        account: &str,
+        id: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE classified SET applied = ?3, apply_error = ?4 \
+             WHERE account_id = ?1 AND email_id = ?2",
+            params![account, id, error.is_none(), error],
+        )?;
+
+        Ok(())
+    }
+
+    /// Records the user's choice of `tray` for an email and leaves the
+    /// classification pending (`applied = 0`), clearing `unsure`. An email
+    /// without a row gets a manual one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn set_correction(&self, account: &str, id: &str, tray: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO classified(account_id, email_id, tray, probs_json, urgency, \
+             personal, unsure, model, input_tokens, classified_at, corrected_tray, applied) \
+             VALUES (?1, ?2, ?3, '{}', 0, 0, 0, 'manual', 0, \
+             strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?3, 0) \
+             ON CONFLICT(account_id, email_id) DO UPDATE SET corrected_tray = ?3, \
+             unsure = 0, applied = 0, apply_error = NULL",
+            params![account, id, tray],
+        )?;
+
+        Ok(())
+    }
+
+    /// Queue rows, oldest first; `account` `None` spans every account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn classify_queue(&self, account: Option<&str>) -> Result<Vec<QueueRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUE_COLS} FROM classify_queue \
+             WHERE (?1 IS NULL OR account_id = ?1) \
+             ORDER BY added_at, account_id, email_id"
+        ))?;
+        let rows = stmt.query_map([account], queue_row_from_row)?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The oldest `limit` queue rows that are still worth a try: fewer than
+    /// [`CLASSIFY_MAX_ATTEMPTS`] attempts, an account in `accounts`, and no
+    /// classification yet. Eligibility is applied before the limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn next_classify_batch(&self, accounts: &[String], limit: usize) -> Result<Vec<QueueRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUE_COLS} FROM classify_queue q \
+             WHERE q.attempts < ?2 \
+             AND q.account_id IN (SELECT value FROM json_each(?1)) \
+             AND NOT EXISTS (SELECT 1 FROM classified c \
+                 WHERE c.account_id = q.account_id AND c.email_id = q.email_id) \
+             ORDER BY q.added_at, q.account_id, q.email_id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![to_json(accounts)?, CLASSIFY_MAX_ATTEMPTS, limit as i64],
+            queue_row_from_row,
+        )?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Counts one more attempt on a queue row and clears its last error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn begin_classify_attempt(&self, account: &str, id: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE classify_queue SET attempts = attempts + 1, last_error = NULL \
+             WHERE account_id = ?1 AND email_id = ?2",
+            [account, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Records why the last attempt on a queue row failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn set_queue_error(&self, account: &str, id: &str, error: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE classify_queue SET last_error = ?3 WHERE account_id = ?1 AND email_id = ?2",
+            [account, id, error],
+        )?;
+
+        Ok(())
+    }
+
+    /// Takes an email out of the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn remove_from_classify_queue(&self, account: &str, id: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM classify_queue WHERE account_id = ?1 AND email_id = ?2",
+            [account, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Drops queue rows whose email already has a confirmed classification
+    /// (it came back to the inbox) and returns how many.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn prune_classified_queue(&self) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM classify_queue WHERE EXISTS (SELECT 1 FROM classified c \
+             WHERE c.account_id = classify_queue.account_id \
+             AND c.email_id = classify_queue.email_id AND c.applied = 1)",
+            [],
+        )?)
+    }
+
+    /// Gives failed queue rows (`attempts` at the limit) a fresh start;
+    /// `account` `None` spans every account. Returns how many were reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn reset_failed_classifications(&self, account: Option<&str>) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE classify_queue SET attempts = 0 \
+             WHERE attempts >= ?1 AND (?2 IS NULL OR account_id = ?2)",
+            params![CLASSIFY_MAX_ATTEMPTS, account],
+        )?)
+    }
+
+    /// Ids of the newest `n` emails in the inbox of `account` that have no
+    /// classification and are not queued, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn unclassified_inbox_ids(&self, account: &str, n: usize) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT e.id FROM emails e \
+             JOIN email_mailboxes em ON em.account_id = e.account_id AND em.email_id = e.id \
+             JOIN mailboxes m ON m.account_id = em.account_id AND m.id = em.mailbox_id \
+             WHERE e.account_id = ?1 AND m.role = 'inbox' \
+             AND NOT EXISTS (SELECT 1 FROM classified c \
+                 WHERE c.account_id = e.account_id AND c.email_id = e.id) \
+             AND NOT EXISTS (SELECT 1 FROM classify_queue q \
+                 WHERE q.account_id = e.account_id AND q.email_id = e.id) \
+             ORDER BY e.received_at DESC, e.id LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account, n as i64], |r| r.get(0))?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Lists emails newest first; `account` `None` lists every account.
@@ -1739,6 +2165,238 @@ mod tests {
         assert_eq!((attempts, error.as_deref()), (2, Some("boom")));
         assert_eq!(store.classify_queue_len("a").unwrap(), 2);
         assert_eq!(store.classify_queue_len("b").unwrap(), 0);
+    }
+
+    /// An email of `account` in thread `thread` sent by `from`.
+    fn in_thread(account: &str, id: &str, thread: &str, from: &str) -> EmailSummary {
+        let mut e = email_in(account, id, "2026-10-01T10:00:00Z", "s", &["inbox"]);
+
+        e.thread_id = thread.into();
+        e.from = vec![Address {
+            name: None,
+            email: from.into(),
+        }];
+
+        e
+    }
+
+    #[test]
+    fn replied_in_thread_detected() {
+        let store = Store::open_memory().unwrap();
+        let own = vec!["me@example.com".to_string(), "shop@example.com".to_string()];
+
+        store
+            .upsert_emails(&[
+                in_thread("a", "cand", "t1", "ann@example.com"),
+                in_thread("a", "stranger", "t1", "bob@example.com"),
+                in_thread("a", "mine", "t2", "ME@Example.com"),
+                in_thread("a", "cand2", "t2", "ann@example.com"),
+                in_thread("b", "theirs", "t3", "me@example.com"),
+                in_thread("a", "cand3", "t3", "ann@example.com"),
+            ])
+            .unwrap();
+
+        let replied =
+            |thread: &str, id: &str| store.thread_has_reply_from("a", thread, id, &own).unwrap();
+
+        // Alone, and with only strangers: no reply.
+        assert!(!replied("t1", "cand"));
+        // Another message from the user's address, in a different case.
+        assert!(replied("t2", "cand2"));
+        // The candidate itself never counts, even from an own address.
+        assert!(!replied("t2", "mine"));
+        // The same thread id under another account does not count.
+        assert!(!replied("t3", "cand3"));
+    }
+
+    #[test]
+    fn top_level_mailbox_lookup_prefers_lowest_sort_order() {
+        let store = Store::open_memory().unwrap();
+        let mut late = mailbox("m2", "Updates", None);
+        let mut first = mailbox("m1", "UPDATES", None);
+        let mut nested = mailbox("m3", "Updates", None);
+
+        late.sort_order = 9;
+        first.sort_order = 2;
+        nested.sort_order = 0;
+        nested.parent_id = Some("m1".into());
+        store.upsert_mailboxes(&[late, first, nested]).unwrap();
+
+        assert_eq!(
+            store
+                .top_level_mailbox_by_name("a", "updates")
+                .unwrap()
+                .unwrap()
+                .id,
+            "m1"
+        );
+        assert!(
+            store
+                .top_level_mailbox_by_name("b", "updates")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A classification of `id` with the given state.
+    fn classified(account: &str, id: &str, unsure: bool, applied: bool) -> Classified {
+        Classified {
+            account_id: account.into(),
+            email_id: id.into(),
+            tray: "updates".into(),
+            probs: BTreeMap::from([("updates".to_string(), 0.8)]),
+            urgency: 2,
+            personal: 0.25,
+            unsure,
+            model: "jev-test".into(),
+            input_tokens: 77,
+            classified_at: "2026-10-01T10:00:00Z".into(),
+            corrected_tray: None,
+            applied,
+            apply_error: None,
+        }
+    }
+
+    #[test]
+    fn classification_rows_round_trip_and_correct() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .put_classification(&classified("a", "e1", true, false))
+            .unwrap();
+        store
+            .put_classification(&classified("a", "e2", false, true))
+            .unwrap();
+
+        assert_eq!(
+            store.classification("a", "e1").unwrap().unwrap(),
+            classified("a", "e1", true, false)
+        );
+        assert_eq!(store.classification("b", "e1").unwrap(), None);
+        assert_eq!(store.classifications(Some("a"), true, 0).unwrap().len(), 1);
+        assert_eq!(store.classifications(None, false, 1).unwrap().len(), 1);
+        assert_eq!(store.pending_classifications().unwrap().len(), 1);
+
+        store
+            .set_classification_applied("a", "e1", Some("nope"))
+            .unwrap();
+        assert_eq!(
+            store
+                .classification("a", "e1")
+                .unwrap()
+                .unwrap()
+                .apply_error
+                .as_deref(),
+            Some("nope")
+        );
+        store.set_classification_applied("a", "e1", None).unwrap();
+        assert!(store.pending_classifications().unwrap().is_empty());
+
+        // A correction clears unsure and goes pending again.
+        store.set_correction("a", "e1", "social").unwrap();
+
+        let c = store.classification("a", "e1").unwrap().unwrap();
+
+        assert_eq!(c.corrected_tray.as_deref(), Some("social"));
+        assert_eq!(c.effective_tray(), "social");
+        assert!(!c.unsure && !c.applied);
+        assert_eq!(c.apply_error, None);
+
+        // An unseen email gets a manual row.
+        store.set_correction("a", "e9", "spam").unwrap();
+
+        let m = store.classification("a", "e9").unwrap().unwrap();
+
+        assert_eq!(
+            (m.model.as_str(), m.urgency, m.applied),
+            ("manual", 0, false)
+        );
+        assert_eq!(m.corrected_tray.as_deref(), Some("spam"));
+
+        // Destroying the email drops its classification.
+        store.delete_emails("a", &["e2".to_string()]).unwrap();
+        assert_eq!(store.classification("a", "e2").unwrap(), None);
+    }
+
+    #[test]
+    fn queue_batch_filters_before_limit() {
+        let store = Store::open_memory().unwrap();
+
+        for (account, id) in [("a", "old"), ("b", "new1"), ("b", "new2"), ("b", "tried")] {
+            store
+                .enqueue_for_classification(account, &[id.to_string()])
+                .unwrap();
+        }
+
+        // Spread the timestamps so the order is defined.
+        for (i, id) in ["old", "new1", "new2", "tried"].iter().enumerate() {
+            store
+                .conn()
+                .execute(
+                    "UPDATE classify_queue SET added_at = ?1 WHERE email_id = ?2",
+                    params![format!("2026-10-01T10:00:0{i}Z"), id],
+                )
+                .unwrap();
+        }
+
+        for _ in 0..CLASSIFY_MAX_ATTEMPTS {
+            store.begin_classify_attempt("b", "tried").unwrap();
+        }
+
+        let ids = |limit| -> Vec<String> {
+            store
+                .next_classify_batch(&["b".to_string()], limit)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.email_id)
+                .collect()
+        };
+
+        // The older row of the ineligible account and the exhausted row never fill the limit.
+        assert_eq!(ids(1), ["new1"]);
+        assert_eq!(ids(5), ["new1", "new2"]);
+
+        // A classification takes a row out of the batch; confirmed ones are pruned.
+        store
+            .put_classification(&classified("b", "new1", false, true))
+            .unwrap();
+        assert_eq!(ids(5), ["new2"]);
+        assert_eq!(store.prune_classified_queue().unwrap(), 1);
+        assert_eq!(store.classify_queue_len("b").unwrap(), 2);
+
+        // Resetting gives the exhausted row another go.
+        assert_eq!(store.reset_failed_classifications(None).unwrap(), 1);
+        assert_eq!(ids(5), ["new2", "tried"]);
+    }
+
+    #[test]
+    fn unclassified_inbox_ids_skips_classified_and_queued() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .upsert_mailboxes(&[
+                mailbox("inbox", "Inbox", Some("inbox")),
+                mailbox("x", "X", None),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                email("e1", "2026-10-01T10:00:01Z", "s", &["inbox"]),
+                email("e2", "2026-10-01T10:00:02Z", "s", &["inbox"]),
+                email("e3", "2026-10-01T10:00:03Z", "s", &["inbox"]),
+                email("e4", "2026-10-01T10:00:04Z", "s", &["inbox"]),
+                email("e5", "2026-10-01T10:00:05Z", "s", &["x"]),
+            ])
+            .unwrap();
+        store
+            .put_classification(&classified("a", "e4", false, true))
+            .unwrap();
+        store
+            .enqueue_for_classification("a", &["e3".to_string()])
+            .unwrap();
+
+        assert_eq!(store.unclassified_inbox_ids("a", 10).unwrap(), ["e2", "e1"]);
+        assert_eq!(store.unclassified_inbox_ids("a", 1).unwrap(), ["e2"]);
     }
 
     #[test]
