@@ -11,7 +11,7 @@ use crate::jmap::Client;
 use crate::store::{Address, EmailSummary, Mailbox, Store};
 
 /// Email properties kept in the store.
-const EMAIL_PROPS: [&str; 11] = [
+const EMAIL_PROPS: [&str; 12] = [
     "id",
     "threadId",
     "mailboxIds",
@@ -23,6 +23,7 @@ const EMAIL_PROPS: [&str; 11] = [
     "subject",
     "preview",
     "size",
+    "hasAttachment",
 ];
 
 /// Largest page for `Email/query` and chunk for `Email/get`.
@@ -356,15 +357,12 @@ async fn query_ids(client: &Client, limit: usize) -> Result<Vec<String>> {
 
             match &first_state {
                 None => first_state = Some(query_state),
-                Some(s) if *s != query_state => {
-                    if restarts == MAX_RESTARTS {
-                        // ponytail: gives up on a consistent snapshot; the next delta repairs drift
-                        return Ok(ids);
-                    }
-
+                Some(s) if *s != query_state && restarts < MAX_RESTARTS => {
                     restarts += 1;
                     continue 'restart;
                 }
+                // ponytail: after the restart budget, keep paging this pass even
+                // though the snapshot moved; a later delta repairs any drift
                 Some(_) => {}
             }
 

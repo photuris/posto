@@ -131,7 +131,6 @@ impl Keymap {
         let mut keys = 0;
         for token in s.split('+').map(|t| t.trim().to_lowercase()) {
             match token.as_str() {
-                "" => {}
                 "ctrl" | "control" => chord.ctrl = true,
                 "shift" => chord.shift = true,
                 "alt" => chord.alt = true,
@@ -142,9 +141,9 @@ impl Keymap {
                 }
             }
         }
-        if keys != 1 {
+        if keys != 1 || chord.key.is_empty() {
             return Err(Error::Config(format!(
-                "chord {s:?} needs exactly one key, found {keys}"
+                "chord {s:?} needs exactly one non-empty key, found {keys}"
             )));
         }
         Ok(chord)
@@ -230,6 +229,13 @@ mod tests {
         assert!(Keymap::parse_chord("").is_err());
         assert!(Keymap::parse_chord("ctrl+a+b").is_err());
         assert!(Keymap::parse_chord("ctrl").is_err());
+
+        for bad in ["ctrl++a", "ctrl+a+", "+a", "ctrl+", "+", "ctrl+ +a"] {
+            assert!(
+                matches!(Keymap::parse_chord(bad), Err(Error::Config(_))),
+                "{bad:?} accepted"
+            );
+        }
     }
 
     #[test]

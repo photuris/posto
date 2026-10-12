@@ -72,9 +72,19 @@ impl std::fmt::Debug for Client {
     }
 }
 
-/// Maps a transport failure to [`Error::Http`] without the request URL.
-fn transport(e: reqwest::Error) -> Error {
-    Error::Http(e.without_url().to_string())
+/// Replaces every occurrence of `token` in `text` with `<redacted>`.
+fn scrub(text: &str, token: &str) -> String {
+    if token.is_empty() {
+        return text.to_string();
+    }
+
+    text.replace(token, "<redacted>")
+}
+
+/// Maps a transport failure to [`Error::Http`] without the request URL or
+/// the token.
+fn transport(token: &str) -> impl Fn(reqwest::Error) -> Error + '_ {
+    move |e| Error::Http(scrub(&e.without_url().to_string(), token))
 }
 
 /// Maps non-2xx statuses to errors; 401 and 403 mean the token is rejected.
@@ -105,10 +115,11 @@ impl Client {
             .bearer_auth(token)
             .send()
             .await
-            .map_err(transport)?;
-        let raw: Value = check(resp)?.json().await.map_err(transport)?;
+            .map_err(transport(token))?;
+        let raw: Value = check(resp)?.json().await.map_err(transport(token))?;
+        // Static message: serde errors can quote the response.
         let mut session: Session = serde_json::from_value(raw.clone())
-            .map_err(|e| Error::Jmap(format!("session: {e}")))?;
+            .map_err(|_| Error::Jmap("malformed session".into()))?;
 
         session.account_id = raw["primaryAccounts"][MAIL]
             .as_str()
@@ -125,6 +136,12 @@ impl Client {
     /// The session this client was built from.
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// `text` with the bearer token replaced by `<redacted>`. Run server-supplied
+    /// text through this before it goes into an error.
+    pub fn redact(&self, text: &str) -> String {
+        scrub(text, &self.token)
     }
 
     /// Sends one JMAP request of `[name, args, call_id]` triples.
@@ -148,11 +165,12 @@ impl Client {
             .json(&body)
             .send()
             .await
-            .map_err(transport)?;
-        let mut raw: Value = check(resp)?.json().await.map_err(transport)?;
+            .map_err(transport(&self.token))?;
+        let mut raw: Value = check(resp)?.json().await.map_err(transport(&self.token))?;
 
+        // Static message: serde errors can quote the response.
         serde_json::from_value(raw["methodResponses"].take())
-            .map_err(|e| Error::Jmap(format!("malformed response: {e}")))
+            .map_err(|_| Error::Jmap("malformed response".into()))
     }
 
     /// Sends a single method call and returns its response arguments.
@@ -169,15 +187,21 @@ impl Client {
             .ok_or_else(|| Error::Jmap("empty response".into()))?;
 
         if rname == "error" {
-            let kind = rargs["type"].as_str().unwrap_or("unknown");
-
-            return Err(Error::Jmap(match rargs["description"].as_str() {
-                Some(d) => format!("{kind}: {d}"),
-                None => kind.to_string(),
-            }));
+            return Err(Error::Jmap(self.describe(&rargs)));
         }
 
         Ok(rargs)
+    }
+
+    /// `type: description` of a JMAP error object (a method error or a
+    /// `SetError`), with the token redacted.
+    pub fn describe(&self, error: &Value) -> String {
+        let kind = error["type"].as_str().unwrap_or("unknown");
+
+        self.redact(&match error["description"].as_str() {
+            Some(d) => format!("{kind}: {d}"),
+            None => kind.to_string(),
+        })
     }
 
     /// Downloads a blob through the session's download template.
@@ -199,9 +223,13 @@ impl Client {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(transport)?;
+            .map_err(transport(&self.token))?;
 
-        Ok(check(resp)?.bytes().await.map_err(transport)?.to_vec())
+        Ok(check(resp)?
+            .bytes()
+            .await
+            .map_err(transport(&self.token))?
+            .to_vec())
     }
 
     /// Uploads a blob and returns its blob id.
@@ -223,8 +251,8 @@ impl Client {
             .body(data)
             .send()
             .await
-            .map_err(transport)?;
-        let raw: Value = check(resp)?.json().await.map_err(transport)?;
+            .map_err(transport(&self.token))?;
+        let raw: Value = check(resp)?.json().await.map_err(transport(&self.token))?;
 
         raw["blobId"]
             .as_str()
@@ -246,6 +274,6 @@ impl Client {
             .await?;
 
         serde_json::from_value(r["list"].clone())
-            .map_err(|e| Error::Jmap(format!("malformed identities: {e}")))
+            .map_err(|_| Error::Jmap("malformed identities".into()))
     }
 }

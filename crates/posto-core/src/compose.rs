@@ -75,7 +75,8 @@ fn parse_address(part: &str) -> Option<Address> {
 pub fn reply(summary: &EmailSummary, body: &EmailBody, me: &str, reply_all: bool) -> Draft {
     let is_me = |a: &Address| a.email.eq_ignore_ascii_case(me);
 
-    let to: Vec<Address> = if summary.from.iter().any(is_me) {
+    // Own sent mail only when every author is me; a co-author stays a recipient.
+    let to: Vec<Address> = if !summary.from.is_empty() && summary.from.iter().all(is_me) {
         summary.to.clone()
     } else {
         summary.from.clone()
@@ -181,16 +182,6 @@ fn find<'a>(rs: &'a [Response], name: &str, id: &str) -> Option<(usize, &'a Valu
         .map(|(idx, (_, args, _))| (idx, args))
 }
 
-/// `type: description` of a JMAP error object (`SetError` or method error).
-fn describe(e: &Value) -> String {
-    let kind = e["type"].as_str().unwrap_or("unknown");
-
-    match e["description"].as_str() {
-        Some(d) => format!("{kind}: {d}"),
-        None => kind.to_string(),
-    }
-}
-
 /// Creates the email in Drafts, submits it, and moves it to Sent, in one
 /// request. Marks the replied-to email `$answered`. Returns the new email id.
 ///
@@ -274,9 +265,9 @@ pub async fn send(cfg: &Config, store: &Store, client: &Client, draft: &Draft) -
         ])
         .await?;
 
-    let id = created_id(&responses)?;
-    check_submission(&responses)?;
-    check_moved_to_sent(&responses, &id)?;
+    let id = created_id(client, &responses)?;
+    check_submission(client, &responses)?;
+    check_moved_to_sent(client, &responses, &id)?;
 
     if let Some(reply_to) = &draft.reply_to_email_id
         && let Err(e) = actions::apply(
@@ -294,16 +285,16 @@ pub async fn send(cfg: &Config, store: &Store, client: &Client, draft: &Draft) -
 }
 
 /// Step (a): the id of the email created in Drafts.
-fn created_id(rs: &[Response]) -> Result<String> {
+fn created_id(client: &Client, rs: &[Response]) -> Result<String> {
     let Some((_, r)) = find(rs, "Email/set", "0") else {
         return Err(Error::Jmap(match find(rs, "error", "0") {
-            Some((_, e)) => describe(e),
+            Some((_, e)) => client.describe(e),
             None => "no create response".into(),
         }));
     };
 
     if let Some(e) = r["notCreated"].get("d") {
-        return Err(Error::Jmap(format!("create: {}", describe(e))));
+        return Err(Error::Jmap(format!("create: {}", client.describe(e))));
     }
 
     r["created"]["d"]["id"]
@@ -313,23 +304,23 @@ fn created_id(rs: &[Response]) -> Result<String> {
 }
 
 /// Step (b): the submission was accepted.
-fn check_submission(rs: &[Response]) -> Result<()> {
+fn check_submission(client: &Client, rs: &[Response]) -> Result<()> {
     let Some((_, r)) = find(rs, "EmailSubmission/set", "1") else {
         return Err(Error::Jmap(match find(rs, "error", "1") {
-            Some((_, e)) => e["type"].as_str().unwrap_or("unknown").to_string(),
+            Some((_, e)) => client.redact(e["type"].as_str().unwrap_or("unknown")),
             None => "no submission response".into(),
         }));
     };
 
     match r["notCreated"].get("s") {
-        Some(e) => Err(Error::Jmap(format!("submit: {}", describe(e)))),
+        Some(e) => Err(Error::Jmap(format!("submit: {}", client.describe(e)))),
         None => Ok(()),
     }
 }
 
 /// Step (c): the implicit `Email/set` after the submission moved the email.
 /// The mail is already sent, so every failure here is [`Error::Other`].
-fn check_moved_to_sent(rs: &[Response], id: &str) -> Result<()> {
+fn check_moved_to_sent(client: &Client, rs: &[Response], id: &str) -> Result<()> {
     let fail = |detail: String| {
         Err(Error::Other(format!(
             "sent as {id}, but moving to Sent failed: {detail}"
@@ -345,13 +336,13 @@ fn check_moved_to_sent(rs: &[Response], id: &str) -> Result<()> {
 
     if let Some(r) = after("Email/set") {
         return match r["notUpdated"].get(id) {
-            Some(e) => fail(describe(e)),
+            Some(e) => fail(client.describe(e)),
             None => Ok(()),
         };
     }
 
     match after("error") {
-        Some(e) => fail(describe(e)),
+        Some(e) => fail(client.describe(e)),
         None => fail("no update response".into()),
     }
 }
@@ -447,6 +438,28 @@ mod tests {
     }
 
     #[test]
+    fn reply_to_mixed_senders_keeps_original_from() {
+        let mut s = summary(
+            addr(None, "me@x.io"),
+            vec![addr(None, "carol@x.io")],
+            vec![],
+        );
+        s.from.push(addr(None, "bob@x.io"));
+
+        let d = reply(&s, &body("x"), "me@x.io", false);
+
+        assert_eq!(d.to, s.from, "a co-author must stay a recipient");
+
+        s.from = vec![addr(None, "me@x.io"), addr(None, "ME@x.io")];
+
+        assert_eq!(
+            reply(&s, &body("x"), "me@x.io", false).to,
+            s.to,
+            "all authors are me: reply to the recipients"
+        );
+    }
+
+    #[test]
     fn reply_all_excludes_me_and_dedupes() {
         let me = addr(None, "Me@X.io");
         let carol = addr(None, "carol@z.io");
@@ -473,6 +486,27 @@ mod tests {
         assert!(out.contains("<strong>"), "{out}");
         assert!(out.contains("<table>"), "{out}");
         assert!(!out.contains("<script"), "{out}");
+    }
+
+    #[test]
+    fn render_markdown_keeps_strikethrough_and_task_state() {
+        let out = render_markdown("~~gone~~\n\n- [x] done\n- [ ] todo");
+        assert!(out.contains("<del>gone</del>"), "{out}");
+
+        let items: Vec<&str> = out.split("<li>").skip(1).collect();
+        assert_eq!(items.len(), 2, "{out}");
+        assert!(
+            items[0].contains("checked") && items[0].contains("done"),
+            "{out}"
+        );
+        assert!(
+            !items[1].contains("checked") && items[1].contains("todo"),
+            "{out}"
+        );
+        assert!(
+            items.iter().all(|i| i.contains(r#"type="checkbox""#)),
+            "{out}"
+        );
     }
 
     #[test]

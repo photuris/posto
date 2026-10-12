@@ -2,6 +2,7 @@
 
 use posto_core::actions::{Action, apply};
 use posto_core::body::{fetch_body, save_attachment};
+use posto_core::compose::{Draft, send};
 use posto_core::config::Config;
 use posto_core::jmap::Client;
 use posto_core::store::{EmailSummary, Mailbox, Store};
@@ -577,6 +578,353 @@ async fn save_attachment_downloads_and_dedupes() -> Result<()> {
     assert_eq!(two, dir.path().join("report (2).pdf"));
     assert_eq!(std::fs::read(&one)?, b"%PDF-");
     assert_eq!(std::fs::read(&two)?, b"%PDF-");
+
+    Ok(())
+}
+
+const SECRET: &str = "review-secret-bearer-123";
+
+async fn secret_client(server: &MockServer) -> Client {
+    Client::connect(&format!("{}/session", server.uri()), SECRET)
+        .await
+        .unwrap()
+}
+
+/// Mounts a catch-all `POST /api` reply with these `methodResponses`.
+async fn reply_raw(server: &MockServer, method_responses: Value) {
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "methodResponses": method_responses })),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn sync_preserves_attachment_flag() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+    let dir = tempfile::tempdir()?;
+
+    reply(
+        &server,
+        "Mailbox/get",
+        json!({"ids": null}),
+        json!({"state": "m1", "list": []}),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "Email/get",
+        json!({"ids": []}),
+        json!({"state": "s0", "list": []}),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "Email/query",
+        json!({"position": 0}),
+        json!({"queryState": "q", "ids": ["e1"]}),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "Email/query",
+        json!({"position": 1}),
+        json!({"queryState": "q", "ids": []}),
+        1,
+    )
+    .await;
+
+    // Like a real server, return only the requested properties (plus id).
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(Call {
+            name: "Email/get",
+            args: json!({"ids": ["e1"]}),
+        })
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let requested = body["methodCalls"][0][1]["properties"].as_array().unwrap();
+            let mut e = email_json("e1");
+
+            e["hasAttachment"] = json!(true);
+            e.as_object_mut()
+                .unwrap()
+                .retain(|k, _| k == "id" || requested.iter().any(|p| p == k));
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "methodResponses": [["Email/get", {"state": "s1", "list": [e]}, "0"]]
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    sync_with_lock(
+        &dir.path().join("sync.lock"),
+        &Config::default(),
+        &store,
+        &c,
+    )
+    .await?;
+
+    assert!(
+        store.email("e1")?.unwrap().has_attachment,
+        "a server email with an attachment lost its attachment flag"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_continues_after_restart_budget() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+    let dir = tempfile::tempdir()?;
+
+    reply(
+        &server,
+        "Mailbox/get",
+        json!({"ids": null}),
+        json!({"state": "m1", "list": []}),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "Email/get",
+        json!({"ids": []}),
+        json!({"state": "s0", "list": []}),
+        1,
+    )
+    .await;
+
+    // Every response carries a new queryState, so no pass is ever consistent.
+    let sequence = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(Call {
+            name: "Email/query",
+            args: json!({}),
+        })
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let position = body["methodCalls"][0][1]["position"].as_u64().unwrap();
+            let n = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let page = match position {
+                0 => json!(["e1"]),
+                1 => json!(["e2"]),
+                _ => json!([]),
+            };
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "methodResponses": [["Email/query", {
+                    "queryState": format!("q{n}"), "ids": page
+                }, "0"]]
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(Call {
+            name: "Email/get",
+            args: json!({}),
+        })
+        .and(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            !body["methodCalls"][0][1]["ids"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        })
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let wanted = body["methodCalls"][0][1]["ids"].as_array().unwrap();
+            let emails: Vec<Value> = wanted
+                .iter()
+                .map(|id| email_json(id.as_str().unwrap()))
+                .collect();
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "methodResponses": [["Email/get", {"state": "s0", "list": emails}, "0"]]
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let mut cfg = Config::default();
+    cfg.sync.initial_limit = 2;
+
+    let report = sync_with_lock(&dir.path().join("sync.lock"), &cfg, &store, &c).await?;
+
+    assert_eq!(
+        report.emails_added, 2,
+        "restart budget stopped paging before the limit or an empty page"
+    );
+    assert!(store.email("e2")?.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn error_description_redacts_token() {
+    let server = server().await;
+    let c = secret_client(&server).await;
+
+    reply_raw(
+        &server,
+        json!([["error", {
+            "type": format!("bad-{SECRET}"),
+            "description": format!("Rejected Authorization: Bearer {SECRET}"),
+        }, "0"]]),
+    )
+    .await;
+
+    let err = c.call_one("Email/get", json!({})).await.unwrap_err();
+    let text = format!("{err} {err:?}");
+
+    assert!(!text.contains(SECRET), "error leaked token: {text}");
+    assert!(text.contains("<redacted>"), "{text}");
+}
+
+#[tokio::test]
+async fn malformed_response_redacts_token() {
+    let server = server().await;
+    let c = secret_client(&server).await;
+
+    reply_raw(&server, json!(SECRET)).await;
+
+    let err = c.call_one("Email/get", json!({})).await.unwrap_err();
+    let text = format!("{err} {err:?}");
+
+    assert!(!text.contains(SECRET), "serde error leaked token: {text}");
+    assert!(matches!(err, Error::Jmap(_)), "{text}");
+}
+
+#[tokio::test]
+async fn malformed_identities_redacts_token() {
+    let server = server().await;
+    let c = secret_client(&server).await;
+
+    reply_raw(&server, json!([["Identity/get", { "list": SECRET }, "0"]])).await;
+
+    let err = c.identities().await.unwrap_err();
+    let text = format!("{err} {err:?}");
+
+    assert!(!text.contains(SECRET), "serde error leaked token: {text}");
+    assert!(matches!(err, Error::Jmap(_)), "{text}");
+}
+
+#[tokio::test]
+async fn malformed_session_redacts_token() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "apiUrl": [SECRET], "downloadUrl": "", "uploadUrl": "",
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "acc1" },
+        })))
+        .mount(&server)
+        .await;
+
+    let err = Client::connect(&format!("{}/session", server.uri()), SECRET)
+        .await
+        .unwrap_err();
+    let text = format!("{err} {err:?}");
+
+    assert!(!text.contains(SECRET), "serde error leaked token: {text}");
+    assert!(matches!(err, Error::Jmap(_)), "{text}");
+}
+
+#[tokio::test]
+async fn send_error_description_redacts_token() {
+    let server = server().await;
+    let c = secret_client(&server).await;
+    let store = Store::open_memory().unwrap();
+
+    store
+        .upsert_mailboxes(&[mailbox("mb-drafts", "drafts"), mailbox("mb-sent", "sent")])
+        .unwrap();
+    reply(
+        &server,
+        "Identity/get",
+        json!({}),
+        json!({"list": [{"id": "i1", "name": "Me", "email": "me@example.com"}]}),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "Email/set",
+        json!({}),
+        json!({"notCreated": {"d": {
+            "type": "invalidProperties",
+            "description": format!("Authorization: Bearer {SECRET}"),
+        }}}),
+        1,
+    )
+    .await;
+
+    let err = send(&Config::default(), &store, &c, &Draft::default())
+        .await
+        .unwrap_err();
+    let text = format!("{err} {err:?}");
+
+    assert!(!text.contains(SECRET), "send error leaked token: {text}");
+    assert!(matches!(err, Error::Jmap(_)), "{text}");
+}
+
+#[tokio::test]
+async fn offline_action_counts_only_mirrored_emails() -> Result<()> {
+    let store = Store::open_memory()?;
+
+    store.upsert_emails(&[email("e1", "mb-inbox")])?;
+
+    let count = apply(&store, None, &ids(&["missing"]), Action::MarkRead).await?;
+    assert_eq!(count, 0, "nothing was mirrored for a nonexistent email");
+
+    let count = apply(&store, None, &ids(&["e1", "missing"]), Action::MarkRead).await?;
+    assert_eq!(count, 1);
+
+    store.upsert_mailboxes(&[mailbox("mb-archive", "archive")])?;
+
+    let count = apply(&store, None, &ids(&["missing"]), Action::Archive).await?;
+    assert_eq!(count, 0, "a mailbox move of an unknown email was counted");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn online_action_counts_server_accepted_unknown_email() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    reply(
+        &server,
+        "Email/set",
+        json!({}),
+        json!({"updated": {"missing": null}}),
+        1,
+    )
+    .await;
+
+    let count = apply(&store, Some(&c), &ids(&["missing"]), Action::MarkRead).await?;
+
+    assert_eq!(count, 1, "the server applied it, so it is counted");
 
     Ok(())
 }

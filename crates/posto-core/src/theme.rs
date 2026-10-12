@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecursiveMode, Watcher as _};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// How long to wait for a burst of file events to settle.
+/// How long to collect a burst of file events before re-reading the theme.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Colour scheme read from an Omarchy `colors.toml`.
@@ -143,8 +143,13 @@ pub struct Watcher {
 impl Drop for Watcher {
     fn drop(&mut self) {
         let _ = self.stop.send(Message::Stop);
+
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            // Dropped from inside `on_change`: the worker cannot join itself, so
+            // it exits on the stop message once the callback returns.
+            if worker.thread().id() != std::thread::current().id() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -166,9 +171,12 @@ impl Worker {
                 Ok(Message::Changed) => {}
                 Ok(Message::Stop) | Err(_) => return,
             }
-            // Debounce: swallow the rest of the burst.
-            loop {
-                match self.rx.recv_timeout(DEBOUNCE) {
+            // Debounce: swallow events for a fixed window, so a steady stream
+            // of unrelated events cannot postpone the check forever.
+            let deadline = Instant::now() + DEBOUNCE;
+
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                match self.rx.recv_timeout(left) {
                     Ok(Message::Changed) => {}
                     Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                     Err(RecvTimeoutError::Timeout) => break,
@@ -203,7 +211,6 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -213,12 +220,17 @@ mod tests {
 
     /// Waits for a theme whose accent is `accent`; earlier ones are skipped.
     fn expect_accent(rx: &mpsc::Receiver<Theme>, accent: &str) {
-        let deadline = Instant::now() + TIMEOUT;
+        expect_accent_within(rx, accent, TIMEOUT);
+    }
+
+    /// Like [`expect_accent`] with an explicit time limit.
+    fn expect_accent_within(rx: &mpsc::Receiver<Theme>, accent: &str, limit: Duration) {
+        let deadline = Instant::now() + limit;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let theme = rx
                 .recv_timeout(left)
-                .unwrap_or_else(|_| panic!("no theme with accent {accent} within 5s"));
+                .unwrap_or_else(|_| panic!("no theme with accent {accent} within {limit:?}"));
             if theme.colors.get("accent").map(String::as_str) == Some(accent) {
                 return;
             }
@@ -301,5 +313,104 @@ mod tests {
 
         std::fs::write(dir.path().join("themes/b/colors.toml"), colors("#444444")).unwrap();
         expect_accent(&rx, "#444444");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_survives_continuous_unrelated_events() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = omarchy_layout(dir.path());
+        let (tx, rx) = mpsc::channel();
+        let _watcher = watch_at(&path, move |t| {
+            let _ = tx.send(t);
+        })
+        .unwrap()
+        .expect("theme exists");
+
+        // Writes into the watched `current/` dir every 10 ms, far below the debounce.
+        let running = Arc::new(AtomicBool::new(true));
+        let noise = {
+            let running = Arc::clone(&running);
+            let file = dir.path().join("current/noise");
+            std::thread::spawn(move || {
+                while running.load(Ordering::Relaxed) {
+                    std::fs::write(&file, "x").unwrap();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(dir.path().join("themes/a/colors.toml"), colors("#222222")).unwrap();
+
+        let started = Instant::now();
+        let seen = std::panic::catch_unwind(|| {
+            expect_accent_within(&rx, "#222222", Duration::from_millis(1500));
+        });
+
+        running.store(false, Ordering::Relaxed);
+        noise.join().unwrap();
+
+        assert!(
+            seen.is_ok(),
+            "no update within {:?} while unrelated events kept arriving",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_watcher_inside_callback_does_not_panic() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = omarchy_layout(dir.path());
+        let slot: Arc<Mutex<Option<Watcher>>> = Arc::new(Mutex::new(None));
+        let (tx, rx) = mpsc::channel();
+        let callback_slot = Arc::clone(&slot);
+        let watcher = watch_at(&path, move |_| {
+            // Unsubscribe from inside the callback, as a one-shot listener would.
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(callback_slot.lock().unwrap().take());
+            }));
+            let _ = tx.send(dropped.is_ok());
+        })
+        .unwrap()
+        .expect("theme exists");
+
+        *slot.lock().unwrap() = Some(watcher);
+        std::fs::write(dir.path().join("themes/a/colors.toml"), colors("#222222")).unwrap();
+
+        assert_eq!(
+            rx.recv_timeout(TIMEOUT),
+            Ok(true),
+            "dropping the watcher inside its callback panicked"
+        );
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_watcher_stops_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = omarchy_layout(dir.path());
+        let (tx, rx) = mpsc::channel();
+        let watcher = watch_at(&path, move |t| {
+            let _ = tx.send(t);
+        })
+        .unwrap()
+        .expect("theme exists");
+
+        drop(watcher);
+        std::fs::write(dir.path().join("themes/a/colors.toml"), colors("#222222")).unwrap();
+
+        // The worker is joined, so its sender is gone: a later change gets no callback.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(600)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 }

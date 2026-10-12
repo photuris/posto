@@ -45,6 +45,9 @@ const TAGS: &[&str] = &[
     "hr",
     "font",
     "center",
+    "del",
+    "s",
+    "input",
 ];
 
 const GENERIC_ATTRIBUTES: &[&str] = &[
@@ -70,9 +73,13 @@ const GENERIC_ATTRIBUTES: &[&str] = &[
 const RESOURCE_ATTRIBUTES: &[&str] = &["src", "srcset", "background", "poster"];
 
 /// Removes active content, event handlers and (unless `allow_remote`)
-/// remote resources from `html`. Links open in a new window.
+/// remote resources from `html`. Links open in a new window. `del`, `s` and
+/// inert (always `disabled`) checkbox `input`s survive so GFM strikethrough
+/// and task lists render.
 pub fn sanitize(html: &str, allow_remote: bool) -> Sanitised {
-    let had_remote = Arc::new(AtomicBool::new(false));
+    // Ammonia drops disallowed attributes and schemes before the filter below
+    // runs, so look for resource references in the raw input first.
+    let had_remote = Arc::new(AtomicBool::new(!allow_remote && has_remote_resource(html)));
     let flag = Arc::clone(&had_remote);
 
     let mut builder = ammonia::Builder::default();
@@ -83,7 +90,14 @@ pub fn sanitize(html: &str, allow_remote: bool) -> Sanitised {
         .tag_attributes(HashMap::from([
             ("a", HashSet::from(["href"])),
             ("img", HashSet::from(["src"])),
+            // Task-list checkboxes only; `type` is limited to "checkbox" below.
+            ("input", HashSet::from(["checked", "disabled"])),
         ]))
+        .tag_attribute_values(HashMap::from([(
+            "input",
+            HashMap::from([("type", HashSet::from(["checkbox"]))]),
+        )]))
+        .set_tag_attribute_value("input", "disabled", "")
         .url_schemes(
             ["http", "https", "mailto", "cid", "data"]
                 .into_iter()
@@ -95,8 +109,7 @@ pub fn sanitize(html: &str, allow_remote: bool) -> Sanitised {
                 return Some(value.into());
             }
             if RESOURCE_ATTRIBUTES.contains(&attribute) {
-                let lower = value.trim_start().to_ascii_lowercase();
-                if lower.starts_with("cid:") || lower.starts_with("data:image/") {
+                if is_local_resource(value) {
                     return Some(value.into());
                 }
                 flag.store(true, Ordering::Relaxed);
@@ -123,6 +136,84 @@ pub fn sanitize(html: &str, allow_remote: bool) -> Sanitised {
         html,
         had_remote: had_remote.load(Ordering::Relaxed),
     }
+}
+
+/// True when a tag in `html` has a resource attribute whose value is not
+/// `cid:` or `data:image/`.
+///
+/// Detection only: the sanitiser output never depends on this. It is a
+/// tolerant scan that follows the HTML tag syntax (case-insensitive names,
+/// `/` between attributes, quoted or bare values) and does not special-case
+/// comments or raw-text elements, so it may flag more than ammonia drops,
+/// never less for markup ammonia would parse as a tag.
+fn has_remote_resource(html: &str) -> bool {
+    let mut rest = html;
+
+    while let Some(open) = rest.find('<') {
+        rest = &rest[open + 1..];
+
+        if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+
+        let name_end = rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
+            .unwrap_or(rest.len());
+
+        rest = &rest[name_end..];
+
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+
+            if rest.is_empty() || rest.starts_with('>') {
+                break;
+            }
+
+            let name_end = rest[1..]
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '/' | '>'))
+                .map_or(rest.len(), |i| i + 1);
+            let name = rest[..name_end].to_ascii_lowercase();
+
+            rest = rest[name_end..].trim_start();
+
+            let mut value = "";
+
+            if let Some(after) = rest.strip_prefix('=') {
+                let after = after.trim_start();
+                let (v, tail) = match after.chars().next() {
+                    Some(q @ ('"' | '\'')) => {
+                        let body = &after[1..];
+
+                        body.find(q)
+                            .map_or((body, ""), |i| (&body[..i], &body[i + 1..]))
+                    }
+                    _ => {
+                        let end = after
+                            .find(|c: char| c.is_ascii_whitespace() || c == '>')
+                            .unwrap_or(after.len());
+
+                        (&after[..end], &after[end..])
+                    }
+                };
+
+                value = v;
+                rest = tail;
+            }
+
+            if RESOURCE_ATTRIBUTES.contains(&name.as_str()) && !is_local_resource(value) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// True for the only resource values allowed without `allow_remote`.
+fn is_local_resource(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+
+    lower.starts_with("cid:") || lower.starts_with("data:image/")
 }
 
 /// Drops every CSS declaration that could load a resource. Escapes and
@@ -237,6 +328,57 @@ mod tests {
             assert!(!s.html.contains("background"), "{style}: {}", s.html);
             assert!(s.had_remote);
         }
+    }
+
+    #[test]
+    fn sanitize_flags_resources_ammonia_drops_first() {
+        for html in [
+            r#"<img srcset="https://example.com/pixel 1x">"#,
+            r#"<img src="ftp://example.com/pixel">"#,
+            r#"<td background="https://example.com/b.png">x</td>"#,
+            r#"<img poster="//example.com/p.png">"#,
+            "<IMG SRC=//example.com/y.png>",
+            r#"<img/alt="a"/src='http://example.com/y.png'>"#,
+            r#"<img src=" ">"#,
+        ] {
+            let s = sanitize(html, false);
+            assert!(s.had_remote, "{html} not flagged: {}", s.html);
+            for attr in ["src", "srcset", "background", "poster"] {
+                assert!(!s.html.contains(attr), "{html} kept {attr}: {}", s.html);
+            }
+            assert!(
+                !sanitize(html, true).had_remote,
+                "{html} flagged when allowed"
+            );
+        }
+
+        for html in [
+            r#"<img src="cid:abc" alt="x">"#,
+            r#"<img src=" DATA:image/png;base64,AA==">"#,
+            r#"<p title="src=http://example.com">text</p>"#,
+            "<p>&lt;img src=\"http://example.com/y.png\"&gt;</p>",
+            "<p>a < b and src=http://example.com</p>",
+        ] {
+            let s = sanitize(html, false);
+            assert!(!s.had_remote, "{html} flagged: {}", s.html);
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_inert_checkboxes_and_strikethrough() {
+        let s = sanitize(
+            r#"<del>a</del><s>b</s><input type="checkbox" checked name="n" onclick="x()"><input type="text" value="v">"#,
+            false,
+        );
+        assert!(s.html.contains("<del>a</del>"), "{}", s.html);
+        assert!(s.html.contains("<s>b</s>"), "{}", s.html);
+        assert!(s.html.contains(r#"type="checkbox""#), "{}", s.html);
+        assert!(s.html.contains("checked"), "{}", s.html);
+        assert!(!s.html.contains("name="), "{}", s.html);
+        assert!(!s.html.contains("onclick"), "{}", s.html);
+        assert!(!s.html.contains("value="), "{}", s.html);
+        assert!(!s.html.contains(r#"type="text""#), "{}", s.html);
+        assert_eq!(s.html.matches("disabled").count(), 2, "{}", s.html);
     }
 
     #[test]

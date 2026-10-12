@@ -50,6 +50,7 @@ fn role_mailbox(store: &Store, role: &str) -> Result<Change> {
 /// Applies `action` to `ids` on the server (when `client` is given) and in the store.
 ///
 /// Ids the server refuses (`notUpdated`) are neither mirrored nor counted.
+/// Without a client, only emails the store knows are counted.
 ///
 /// # Errors
 ///
@@ -95,18 +96,23 @@ pub async fn apply(
     let mut applied = 0;
 
     for id in ids.iter().filter(|id| !refused.contains(id)) {
+        let Some(mut email) = store.email(id)? else {
+            // Unknown locally: only a server that accepted it makes it applied.
+            applied += usize::from(client.is_some());
+
+            continue;
+        };
+
         match &change {
             Change::Mailbox(target) => store.set_mailbox_ids(id, std::slice::from_ref(target))?,
             Change::Keyword(k, on) => {
-                if let Some(mut email) = store.email(id)? {
-                    email.keywords.retain(|x| x != k);
+                email.keywords.retain(|x| x != k);
 
-                    if *on {
-                        email.keywords.push((*k).to_string());
-                    }
-
-                    store.set_keywords(id, &email.keywords)?;
+                if *on {
+                    email.keywords.push((*k).to_string());
                 }
+
+                store.set_keywords(id, &email.keywords)?;
             }
         }
 
