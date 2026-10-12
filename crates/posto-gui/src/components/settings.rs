@@ -32,7 +32,7 @@ fn close() {
     focus_root();
 }
 
-/// Account, token, refresh, blocked senders and shortcuts.
+/// Account, token, refresh, blocked senders, remote content and shortcuts.
 #[component]
 pub fn Settings() -> Element {
     let cfg = backend().peek().cfg.clone();
@@ -42,6 +42,9 @@ pub fn Settings() -> Element {
     let mut refresh = use_signal(|| cfg.sync.refresh_minutes);
     let mut blocked = use_signal(|| cfg.blocked_senders.clone());
     let mut blocked_input = use_signal(String::new);
+    let mut remote_always = use_signal(|| cfg.remote_content == "always");
+    let mut trusted = use_signal(|| cfg.trusted_senders.clone());
+    let mut trusted_input = use_signal(String::new);
     let mut shortcuts = use_signal(|| chord_rows(&cfg.shortcuts));
     let mut token_open = use_signal(|| false);
     let mut token_value = use_signal(String::new);
@@ -82,6 +85,8 @@ pub fn Settings() -> Element {
         };
         cfg.sync.refresh_minutes = refresh();
         cfg.blocked_senders = blocked();
+        cfg.remote_content = if remote_always() { "always" } else { "ask" }.to_string();
+        cfg.trusted_senders = trusted();
         cfg.shortcuts = BTreeMap::new();
 
         let defaults = Keymap::defaults();
@@ -261,6 +266,46 @@ pub fn Settings() -> Element {
                         }
                     }
 
+                    h3 { "Remote Content" }
+                    div { class: "setting-row",
+                        label { "Remote images and styles" }
+                        select {
+                            value: if remote_always() { "always" } else { "ask" },
+                            onchange: move |evt| remote_always.set(evt.value() == "always"),
+                            option { value: "ask", "Ask per message" }
+                            option { value: "always", "Always load" }
+                        }
+                    }
+                    div { class: "setting-row",
+                        input {
+                            r#type: "text",
+                            placeholder: "Trusted address or domain",
+                            value: "{trusted_input}",
+                            onfocusin: focus_in,
+                            onfocusout: focus_out,
+                            oninput: move |evt| trusted_input.set(evt.value()),
+                        }
+                        button {
+                            disabled: trusted_input().trim().is_empty(),
+                            onclick: move |_| {
+                                let entry = trusted_input().trim().to_lowercase();
+
+                                if !entry.is_empty() && !trusted().contains(&entry) {
+                                    trusted.write().push(entry);
+                                }
+
+                                trusted_input.set(String::new());
+                            },
+                            "Add"
+                        }
+                    }
+                    for (i, entry) in trusted().into_iter().enumerate() {
+                        div { key: "{entry}", class: "setting-row blocked",
+                            span { "{entry}" }
+                            button { onclick: move |_| { trusted.write().remove(i); }, "Remove" }
+                        }
+                    }
+
                     h3 { "Shortcuts" }
                     for (i, (action, text)) in rows.iter().cloned().enumerate() {
                         div { key: "{keys::action_name(action)}", class: "setting-row shortcut",
@@ -293,9 +338,11 @@ pub fn Settings() -> Element {
                             onclick: move |_| {
                                 shortcuts.set(chord_rows(&BTreeMap::new()));
                                 blocked.set(Vec::new());
+                                trusted.set(Vec::new());
+                                remote_always.set(false);
                                 confirm_reset.set(false);
                             },
-                            "Clear shortcuts and blocked senders"
+                            "Clear shortcuts, blocked and trusted senders"
                         }
                         button { onclick: move |_| confirm_reset.set(false), "Cancel" }
                     } else {

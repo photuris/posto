@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dioxus::prelude::*;
+use posto_core::config::UiConfig;
 use posto_core::jmap::Client;
 use posto_core::shortcuts::{Action, Keymap};
 use posto_core::store::{Attachment, EmailBody, EmailSummary, ListQuery, Mailbox};
@@ -51,6 +52,10 @@ pub static THEME_CSS: GlobalSignal<String> = Signal::global(|| {
 pub static SIDEBAR_OPEN: GlobalSignal<bool> = Signal::global(|| true);
 /// True while an `<input>` or `<textarea>` has focus.
 pub static TYPING: GlobalSignal<bool> = Signal::global(|| false);
+pub static SIDEBAR_WIDTH: GlobalSignal<u32> = Signal::global(|| UiConfig::default().sidebar_width);
+pub static LIST_WIDTH: GlobalSignal<u32> = Signal::global(|| UiConfig::default().list_width);
+/// The column divider being dragged, if any.
+static DRAG: GlobalSignal<Option<Drag>> = Signal::global(|| None);
 pub static NEEDS_TOKEN: GlobalSignal<bool> = Signal::global(|| false);
 /// Set while a mutating action runs, so a second key press cannot race it.
 static BUSY: GlobalSignal<bool> = Signal::global(|| false);
@@ -72,6 +77,89 @@ pub fn backend() -> Signal<Backend> {
 /// Starts `fut` so that it outlives the component whose handler started it.
 pub fn run(fut: impl Future<Output = ()> + 'static) {
     dioxus::core::spawn_forever(fut);
+}
+
+/// Which column a divider resizes.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Divider {
+    Sidebar,
+    List,
+}
+
+/// A divider drag in progress: where it started and the width it started from.
+#[derive(Clone, Copy)]
+struct Drag {
+    divider: Divider,
+    start_x: f64,
+    start_width: u32,
+}
+
+/// Mailbox column width limits, in pixels.
+pub fn clamp_sidebar(width: u32) -> u32 {
+    width.clamp(140, 480)
+}
+
+/// Message-list column width limits, in pixels.
+pub fn clamp_list(width: u32) -> u32 {
+    width.clamp(240, 800)
+}
+
+/// Starts dragging `divider` from screen column `x`.
+pub fn begin_drag(divider: Divider, x: f64) {
+    let start_width = match divider {
+        Divider::Sidebar => *SIDEBAR_WIDTH.peek(),
+        Divider::List => *LIST_WIDTH.peek(),
+    };
+
+    *DRAG.write() = Some(Drag {
+        divider,
+        start_x: x,
+        start_width,
+    });
+}
+
+/// Moves the dragged divider to screen column `x`; a no-op when not dragging.
+pub fn drag_to(x: f64) {
+    let Some(drag) = *DRAG.peek() else {
+        return;
+    };
+    let width = (f64::from(drag.start_width) + x - drag.start_x).max(0.0) as u32;
+
+    match drag.divider {
+        Divider::Sidebar => *SIDEBAR_WIDTH.write() = clamp_sidebar(width),
+        Divider::List => *LIST_WIDTH.write() = clamp_list(width),
+    }
+}
+
+/// Ends a drag and saves the widths when they changed.
+pub fn end_drag() {
+    if DRAG.peek().is_none() {
+        return;
+    }
+
+    *DRAG.write() = None;
+
+    let ui = UiConfig {
+        sidebar_width: *SIDEBAR_WIDTH.peek(),
+        list_width: *LIST_WIDTH.peek(),
+    };
+
+    if backend().peek().cfg.ui == ui {
+        return;
+    }
+
+    backend().write().cfg.ui = ui;
+
+    if !backend().peek().ui_test {
+        save_config();
+    }
+}
+
+/// Writes the current config to disk, reporting a failure in the toast.
+pub fn save_config() {
+    if let Err(e) = backend().peek().cfg.save() {
+        set_status(format!("Could not save settings: {e}"));
+    }
 }
 
 /// Resets a `GlobalSignal<bool>` to false when dropped.
@@ -110,6 +198,9 @@ pub fn App() -> Element {
         // Saved shortcuts apply from the first key press, not only after Settings.
         *KEYMAP.write() =
             Keymap::from_config(&backend.cfg.shortcuts).unwrap_or_else(|_| Keymap::defaults());
+
+        *SIDEBAR_WIDTH.write() = clamp_sidebar(backend.cfg.ui.sidebar_width);
+        *LIST_WIDTH.write() = clamp_list(backend.cfg.ui.list_width);
 
         // Owned by the root scope: detached tasks (`run`) use it from there and
         // outlive this component's scope.
@@ -167,6 +258,13 @@ pub fn App() -> Element {
         }
     });
 
+    // A collapsed sidebar takes no column and no divider.
+    let columns = if SIDEBAR_OPEN() {
+        format!("{}px 6px {}px 6px 1fr", SIDEBAR_WIDTH(), LIST_WIDTH())
+    } else {
+        format!("{}px 6px 1fr", LIST_WIDTH())
+    };
+
     rsx! {
         document::Style { {include_str!("../assets/style.css")} }
         div {
@@ -202,11 +300,30 @@ pub fn App() -> Element {
                     button { onclick: |_| *SHOW_SETTINGS.write() = true, "Settings" }
                 }
             }
-            div { class: "panes",
+            div {
+                class: if DRAG().is_some() { "panes dragging" } else { "panes" },
+                style: "grid-template-columns: {columns}",
+                onmousemove: |evt| drag_to(evt.client_coordinates().x),
+                onmouseup: |_| end_drag(),
+                onmouseleave: |_| end_drag(),
                 if SIDEBAR_OPEN() {
                     Sidebar {}
+                    div {
+                        class: "resizer",
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            begin_drag(Divider::Sidebar, evt.client_coordinates().x);
+                        },
+                    }
                 }
                 MessageList {}
+                div {
+                    class: "resizer",
+                    onmousedown: |evt| {
+                        evt.prevent_default();
+                        begin_drag(Divider::List, evt.client_coordinates().x);
+                    },
+                }
                 div { class: "right",
                     Toolbar {}
                     Reader {}
@@ -382,7 +499,7 @@ pub fn search_input(query: String) {
 
 /// Selects `id` (or nothing), loads its body and marks it read after a second.
 pub fn select_email(id: Option<String>) {
-    *ALLOW_REMOTE.write() = false;
+    *ALLOW_REMOTE.write() = id.as_deref().is_some_and(remote_trusted);
     *BODY.write() = None;
     *BODY_ERROR.write() = None;
     *SELECTED_EMAIL.write() = id.clone();
@@ -391,6 +508,41 @@ pub fn select_email(id: Option<String>) {
         run(load_body(id.clone()));
         run(mark_read_later(id));
     }
+}
+
+/// True when the policy lets the sender of email `id` load remote content.
+fn remote_trusted(id: &str) -> bool {
+    let b = backend();
+    let b = b.peek();
+    let from = b
+        .store
+        .email(id)
+        .ok()
+        .flatten()
+        .and_then(|e| e.from.first().map(|a| a.email.clone()))
+        .unwrap_or_default();
+
+    state::remote_allowed(&b.cfg, &from)
+}
+
+/// Adds `domain` to the trusted senders, saves, and loads remote content now.
+pub fn trust_domain(domain: &str) {
+    let domain = domain.to_lowercase();
+    let mut shared = backend();
+
+    {
+        let mut b = shared.write();
+
+        if !b.cfg.trusted_senders.contains(&domain) {
+            b.cfg.trusted_senders.push(domain);
+        }
+    }
+
+    if !shared.peek().ui_test {
+        save_config();
+    }
+
+    *ALLOW_REMOTE.write() = true;
 }
 
 /// The body of `id`, connecting to the server when it is not cached.
@@ -869,6 +1021,16 @@ mod tests {
 
         dom.rebuild_in_place();
         dom
+    }
+
+    #[test]
+    fn clamp_widths() {
+        assert_eq!(clamp_sidebar(139), 140);
+        assert_eq!(clamp_sidebar(481), 480);
+        assert_eq!(clamp_sidebar(300), 300);
+        assert_eq!(clamp_list(239), 240);
+        assert_eq!(clamp_list(801), 800);
+        assert_eq!(clamp_list(300), 300);
     }
 
     #[test]

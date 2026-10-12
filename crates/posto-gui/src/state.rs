@@ -82,6 +82,15 @@ pub fn sender_blocked(blocked: &[String], address: &str) -> bool {
     })
 }
 
+/// True when remote content may load for mail from `from` without asking.
+///
+/// That is the case under the `"always"` policy, or when the sender or its
+/// domain is in `cfg.trusted_senders`.
+pub fn remote_allowed(cfg: &Config, from: &str) -> bool {
+    cfg.remote_content == "always"
+        || (!from.trim().is_empty() && sender_blocked(&cfg.trusted_senders, from))
+}
+
 /// The connected client, connecting with the stored token when needed.
 ///
 /// `Ok(None)` in UI test mode. `Error::NotConfigured` when there is no token.
@@ -212,5 +221,24 @@ mod tests {
         assert!(sender_blocked(&list, "anyone@junk.io"));
         assert!(!sender_blocked(&list, "other@example.com"));
         assert!(!sender_blocked(&[String::new()], "a@b.c"));
+    }
+
+    #[test]
+    fn remote_policy() {
+        let mut cfg = Config {
+            trusted_senders: vec!["example.org".into(), "x@y.io".into()],
+            ..Config::default()
+        };
+
+        assert!(remote_allowed(&cfg, "a@example.org"));
+        assert!(remote_allowed(&cfg, "x@y.io"));
+        assert!(!remote_allowed(&cfg, "b@other.org"));
+        assert!(!remote_allowed(&cfg, "z@y.io"));
+        assert!(!remote_allowed(&cfg, ""));
+
+        cfg.remote_content = "always".into();
+
+        assert!(remote_allowed(&cfg, "b@other.org"));
+        assert!(remote_allowed(&cfg, ""));
     }
 }

@@ -6,6 +6,7 @@ use crate::app::{
     EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_EMAIL, SELECTED_MAILBOX, SIDEBAR_OPEN,
     load_more, select_email,
 };
+use crate::components::Icon;
 use crate::format;
 
 /// Avatar, sender, date, subject, preview and mailbox chips for every email in view.
@@ -47,7 +48,7 @@ pub fn MessageList() -> Element {
 
                         *SIDEBAR_OPEN.write() = !open;
                     },
-                    "☰"
+                    Icon { name: "menu" }
                 }
                 div {
                     div { class: "list-title", "{title}" }
@@ -98,10 +99,14 @@ pub fn MessageList() -> Element {
                                             span { class: "dot", title: "Unread" }
                                         }
                                         if e.is_flagged() {
-                                            span { class: "flag", title: "Flagged", "⚑" }
+                                            span { class: "flag", title: "Flagged",
+                                                Icon { name: "flag", size: 12 }
+                                            }
                                         }
                                         if e.has_attachment {
-                                            span { class: "clip", title: "Has attachment", "📎" }
+                                            span { class: "clip", title: "Has attachment",
+                                                Icon { name: "paperclip", size: 12 }
+                                            }
                                         }
                                         span { class: "date", {format::short_date(&e.received_at, now)} }
                                     }

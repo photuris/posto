@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use posto_core::shortcuts::Action;
 
 use crate::app::{KEYMAP, SEARCH_QUERY, SHOW_SETTINGS, dispatch, search_input};
-use crate::components::{focus_in, focus_out};
+use crate::components::{Icon, focus_in, focus_out};
 use crate::keys;
 
 /// Tooltip such as `Archive (e)`.
@@ -19,13 +19,13 @@ fn title(label: &str, action: Action) -> String {
 #[component]
 pub fn Toolbar() -> Element {
     let buttons = [
-        ("✎", "Compose", Action::Compose),
-        ("↩", "Reply", Action::Reply),
-        ("↩↩", "Reply all", Action::ReplyAll),
-        ("🗄", "Archive", Action::Archive),
-        ("🚫", "Junk", Action::Junk),
-        ("🗑", "Delete", Action::Delete),
-        ("⟳", "Sync", Action::Sync),
+        ("compose", "Compose", Action::Compose),
+        ("reply", "Reply", Action::Reply),
+        ("reply-all", "Reply all", Action::ReplyAll),
+        ("archive", "Archive", Action::Archive),
+        ("junk", "Junk", Action::Junk),
+        ("trash", "Delete", Action::Delete),
+        ("refresh", "Sync", Action::Sync),
     ];
 
     rsx! {
@@ -41,14 +41,14 @@ pub fn Toolbar() -> Element {
                 onfocusout: focus_out,
                 oninput: |evt| search_input(evt.value()),
             }
-            for (glyph, label, action) in buttons {
+            for (icon, label, action) in buttons {
                 button {
                     key: "{label}",
                     class: "tool",
                     title: title(label, action),
                     onmousedown: |evt| evt.prevent_default(),
                     onclick: move |_| dispatch(action),
-                    "{glyph}"
+                    Icon { name: icon }
                 }
             }
             button {
@@ -56,7 +56,7 @@ pub fn Toolbar() -> Element {
                 title: "Settings",
                 onmousedown: |evt| evt.prevent_default(),
                 onclick: |_| *SHOW_SETTINGS.write() = true,
-                "⚙"
+                Icon { name: "settings" }
             }
         }
     }

@@ -27,7 +27,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Whole application configuration, stored as `config.toml`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
     /// Account identity and endpoint.
@@ -38,6 +38,45 @@ pub struct Config {
     pub shortcuts: BTreeMap<String, String>,
     /// Blocked addresses or domains, lower-case.
     pub blocked_senders: Vec<String>,
+    /// Layout the GUI restores at startup.
+    pub ui: UiConfig,
+    /// Remote-content policy: `"ask"` (default) or `"always"`.
+    pub remote_content: String,
+    /// Senders whose remote content always loads: lower-case addresses or domains.
+    pub trusted_senders: Vec<String>,
+}
+
+/// Column widths of the GUI, in pixels.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Width of the mailbox column.
+    pub sidebar_width: u32,
+    /// Width of the message-list column.
+    pub list_width: u32,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        UiConfig {
+            sidebar_width: 220,
+            list_width: 360,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            account: Account::default(),
+            sync: SyncConfig::default(),
+            shortcuts: BTreeMap::new(),
+            blocked_senders: Vec::new(),
+            ui: UiConfig::default(),
+            remote_content: "ask".to_string(),
+            trusted_senders: Vec::new(),
+        }
+    }
 }
 
 /// The one mail account.
@@ -249,9 +288,17 @@ mod tests {
         cfg.account.email = "me@example.com".into();
         cfg.shortcuts.insert("archive".into(), "ctrl+e".into());
         cfg.blocked_senders.push("spam.example".into());
+        cfg.ui.list_width = 512;
+        cfg.remote_content = "always".into();
+        cfg.trusted_senders.push("news.example".into());
         cfg.save().unwrap();
 
-        assert_eq!(Config::load().unwrap(), cfg);
+        let loaded = Config::load().unwrap();
+
+        assert_eq!(loaded, cfg);
+        assert_eq!(loaded.ui.list_width, 512);
+        assert_eq!(loaded.remote_content, "always");
+        assert_eq!(loaded.trusted_senders, ["news.example"]);
     }
 
     #[test]

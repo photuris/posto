@@ -6,9 +6,9 @@ use posto_core::store::{Address, EmailSummary};
 
 use crate::app::{
     ALLOW_REMOTE, BODY, BODY_ERROR, EMAILS, MAILBOXES, READER_MODE, SELECTED_EMAIL, backend,
-    save_attachment,
+    save_attachment, trust_domain,
 };
-use crate::components::frame_doc;
+use crate::components::{Icon, frame_doc};
 use crate::format;
 
 fn people(list: &[Address]) -> String {
@@ -47,6 +47,11 @@ pub fn Reader() -> Element {
         .map_or("(unknown)".to_string(), |a| format::who(a).to_string());
     let address = sender.as_ref().map(|a| a.email.clone()).unwrap_or_default();
     let hue = format::avatar_hue(&address);
+    let domain = address
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
     let chips: Vec<String> = MAILBOXES()
         .into_iter()
         .filter(|m| email.mailbox_ids.contains(&m.id))
@@ -100,18 +105,31 @@ pub fn Reader() -> Element {
 
                                 *READER_MODE.write() = !on;
                             },
-                            "Reader Mode"
+                            title: "Reader Mode",
+                            Icon { name: "book-open" }
+                            " Reader Mode"
                         }
                     }
                 }
             }
             if had_remote && !allow_remote && !reader_mode {
                 div { class: "remote-bar",
-                    span { "This message contains remote content." }
+                    span { class: "grow", "This message contains remote content." }
                     button {
                         onmousedown: |evt| evt.prevent_default(),
                         onclick: |_| *ALLOW_REMOTE.write() = true,
                         "Load Remote Content"
+                    }
+                    if !domain.is_empty() {
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: {
+                                let domain = domain.clone();
+
+                                move |_| trust_domain(&domain)
+                            },
+                            "Always from {domain}"
+                        }
                     }
                 }
             }
@@ -134,7 +152,8 @@ pub fn Reader() -> Element {
             if !attachments.is_empty() {
                 div { class: "attachments",
                     div { class: "attachments-title",
-                        "📎 {attachments.len()} "
+                        Icon { name: "paperclip", size: 14 }
+                        " {attachments.len()} "
                         if attachments.len() == 1 { "Attachment" } else { "Attachments" }
                     }
                     div { class: "attachment-list",

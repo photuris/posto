@@ -4,16 +4,17 @@ use dioxus::prelude::*;
 use posto_core::store::Mailbox;
 
 use crate::app::{MAILBOXES, SELECTED_MAILBOX, select_mailbox};
+use crate::components::Icon;
 
 fn icon(m: &Mailbox) -> &'static str {
     match m.role.as_deref() {
-        Some("inbox") => "📥",
-        Some("drafts") => "📝",
-        Some("sent") => "📤",
-        Some("archive") => "🗄",
-        Some("junk") => "🚫",
-        Some("trash") => "🗑",
-        _ => "📁",
+        Some("inbox") => "inbox",
+        Some("drafts") => "drafts",
+        Some("sent") => "sent",
+        Some("archive") => "archive",
+        Some("junk") => "junk",
+        Some("trash") => "trash",
+        _ => "folder",
     }
 }
 
@@ -35,7 +36,7 @@ pub fn Sidebar() -> Element {
 
                         move |_| select_mailbox(id.clone())
                     },
-                    span { class: "icon", {icon(&m)} }
+                    Icon { name: icon(&m) }
                     span { class: "name", "{m.name}" }
                     if m.unread > 0 {
                         span { class: "badge", "{m.unread}" }

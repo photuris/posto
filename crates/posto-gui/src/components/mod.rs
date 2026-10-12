@@ -1,6 +1,7 @@
 //! UI components. State lives in the globals of [`crate::app`].
 
 mod composer;
+mod icons;
 mod message_list;
 mod reader;
 mod settings;
@@ -10,6 +11,7 @@ mod toolbar;
 use dioxus::prelude::*;
 
 pub use composer::Composer;
+pub use icons::Icon;
 pub use message_list::MessageList;
 pub use reader::Reader;
 pub use settings::Settings;

@@ -29,7 +29,7 @@ html, body {
   color: var(--fg);
 }
 
-button, input, textarea { font: inherit; color: inherit; }
+button, input, textarea, select { font: inherit; color: inherit; }
 
 button {
   background: var(--posto-lighter-background);
@@ -50,6 +50,9 @@ input[type="text"], input[type="password"], input[type="number"], input:not([typ
   padding: 4px 8px;
   outline: none;
 }
+select {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+}
 input:focus, textarea:focus { border-color: var(--posto-accent); }
 input.invalid { border-color: #d33; }
 
@@ -62,7 +65,16 @@ input.invalid { border-color: #d33; }
   color: var(--fg);
 }
 
-.panes { flex: 1; display: flex; min-height: 0; }
+.panes { flex: 1; display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; }
+.panes.dragging { cursor: col-resize; user-select: none; }
+.panes.dragging iframe { pointer-events: none; }
+.resizer {
+  cursor: col-resize;
+  background: linear-gradient(var(--border), var(--border)) center / 1px 100% no-repeat;
+}
+.resizer:hover, .panes.dragging .resizer {
+  background: linear-gradient(var(--posto-accent), var(--posto-accent)) center / 2px 100% no-repeat;
+}
 
 .banner {
   display: flex; align-items: center; gap: 12px;
@@ -73,10 +85,9 @@ input.invalid { border-color: #d33; }
 
 /* Sidebar */
 .sidebar {
-  width: 210px; flex: none; overflow: auto;
+  min-width: 0; overflow: auto;
   padding: 8px;
   background: var(--posto-dark-background);
-  border-right: 1px solid var(--border);
 }
 .sidebar-title { padding: 8px 8px 6px; font-size: 12px; color: var(--posto-muted); }
 .mailbox {
@@ -85,15 +96,18 @@ input.invalid { border-color: #d33; }
 }
 .mailbox:hover { background: var(--hover); }
 .mailbox.selected { background: var(--sel); font-weight: 600; }
-.mailbox .icon { width: 20px; text-align: center; }
+.icon { flex: none; color: var(--posto-muted); }
+.mailbox:hover .icon, .mailbox.selected .icon, button:hover:not(:disabled) .icon,
+.row:hover .icon, .row.selected .icon { color: var(--fg); }
+.flag, .flag .icon { color: var(--posto-accent); }
+.flag, .clip { display: inline-flex; }
 .mailbox .name { flex: 1; }
 .badge { font-size: 12px; color: var(--posto-muted); }
 
 /* Message list */
 .list {
-  width: 380px; flex: none; min-height: 0;
+  min-width: 0; min-height: 0;
   display: flex; flex-direction: column;
-  border-right: 1px solid var(--border);
 }
 .list-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .list-title { font-weight: 600; }
@@ -119,8 +133,6 @@ input.invalid { border-color: #d33; }
 .row.selected .sender { font-weight: 600; }
 .date { font-size: 12px; color: var(--posto-muted); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--posto-accent); }
-.flag { color: #e08a00; font-size: 12px; }
-.clip { font-size: 11px; }
 .subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preview {
   font-size: 12px; color: var(--posto-muted);
@@ -141,7 +153,7 @@ input.invalid { border-color: #d33; }
   padding: 8px 12px; border-bottom: 1px solid var(--border);
 }
 .toolbar .search { width: 220px; margin-right: auto; }
-button.tool { padding: 3px 9px; background: transparent; border-color: transparent; font-size: 15px; }
+button.tool { display: inline-flex; align-items: center; padding: 5px 9px; background: transparent; border-color: transparent; }
 button.tool:hover { background: var(--hover); }
 
 .reader { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -153,13 +165,14 @@ button.tool:hover { background: var(--hover); }
 .from-name { font-weight: 600; }
 .from-email, .to-line { color: var(--posto-muted); }
 .reader-side { text-align: right; color: var(--posto-muted); font-size: 12px; }
-button.link { background: none; border: none; padding: 2px 0; color: var(--posto-muted); }
-button.link.active { color: var(--posto-accent); font-weight: 600; }
+button.link { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; padding: 2px 0; color: var(--posto-muted); }
+button.link.active, button.link.active .icon { color: var(--posto-accent); font-weight: 600; }
 .remote-bar {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; gap: 8px;
   padding: 6px 20px; background: var(--posto-lighter-background);
   border-bottom: 1px solid var(--border); color: var(--posto-muted);
 }
+.remote-bar .grow { flex: 1; }
 .reader-body { flex: 1; min-height: 0; overflow: auto; outline: none; display: flex; flex-direction: column; }
 iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 .reader-text {
@@ -168,7 +181,7 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .attachments { padding: 8px 20px 12px; border-top: 1px solid var(--border); }
-.attachments-title { font-size: 12px; color: var(--posto-muted); margin-bottom: 6px; }
+.attachments-title { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--posto-muted); margin-bottom: 6px; }
 .attachment-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .attachment { display: flex; flex-direction: column; align-items: flex-start; padding: 6px 12px; }
 .att-size { font-size: 12px; color: var(--posto-muted); }

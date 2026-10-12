@@ -18,6 +18,7 @@ fn main() {
     };
     let window = WindowBuilder::new()
         .with_title("Posto")
+        .with_decorations(false)
         .with_inner_size(LogicalSize::new(1400.0, 900.0))
         .with_min_inner_size(LogicalSize::new(900.0, 600.0));
 
