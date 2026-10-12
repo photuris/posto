@@ -174,10 +174,20 @@ fn mailbox_from(v: &Value) -> Result<Mailbox> {
     })
 }
 
-/// Collapses runs of whitespace (including newlines) into single spaces and trims the ends.
-/// Servers pad previews with long runs of spaces; stored summaries keep only the words.
+/// Collapses runs of whitespace (including newlines) into single spaces, trims the ends,
+/// and drops invisible format characters (zero-width spaces/joiners, soft hyphen, BOM,
+/// combining grapheme joiner) that newsletters use to pad preheader text.
 fn squash_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let invisible = |c: char| {
+        matches!(
+            c,
+            '\u{00AD}' | '\u{034F}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+        )
+    };
+    s.replace(invisible, "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn email_from(v: &Value) -> Result<EmailSummary> {
@@ -421,5 +431,7 @@ mod tests {
     fn preview_whitespace_is_squashed() {
         let v = json!({"id": "e1", "preview": "COMING UP      \n\t soon   "});
         assert_eq!(email_from(&v).unwrap().preview, "COMING UP soon");
+        let v = json!({"id": "e2", "preview": "\u{034f}   \u{200b}\u{feff}🚨 Joshua, polls\u{00ad} close"});
+        assert_eq!(email_from(&v).unwrap().preview, "🚨 Joshua, polls close");
     }
 }
