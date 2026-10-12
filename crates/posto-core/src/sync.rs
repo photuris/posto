@@ -174,6 +174,12 @@ fn mailbox_from(v: &Value) -> Result<Mailbox> {
     })
 }
 
+/// Collapses runs of whitespace (including newlines) into single spaces and trims the ends.
+/// Servers pad previews with long runs of spaces; stored summaries keep only the words.
+fn squash_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn email_from(v: &Value) -> Result<EmailSummary> {
     Ok(EmailSummary {
         id: str_of(v, "id")?,
@@ -183,7 +189,7 @@ fn email_from(v: &Value) -> Result<EmailSummary> {
         to: addresses(&v["to"]),
         cc: addresses(&v["cc"]),
         subject: v["subject"].as_str().unwrap_or_default().to_string(),
-        preview: v["preview"].as_str().unwrap_or_default().to_string(),
+        preview: squash_ws(v["preview"].as_str().unwrap_or_default()),
         size: v["size"].as_i64().unwrap_or(0),
         has_attachment: v["hasAttachment"].as_bool().unwrap_or(false),
         mailbox_ids: true_keys(&v["mailboxIds"]),
@@ -405,4 +411,15 @@ async fn sync_emails_initial(
     report.emails_updated += updated;
 
     store.set_state("email_state", &s0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_whitespace_is_squashed() {
+        let v = json!({"id": "e1", "preview": "COMING UP      \n\t soon   "});
+        assert_eq!(email_from(&v).unwrap().preview, "COMING UP soon");
+    }
 }
