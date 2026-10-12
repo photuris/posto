@@ -266,7 +266,7 @@ pub fn App() -> Element {
     };
 
     rsx! {
-        document::Style { {include_str!("../assets/style.css")} }
+        BaseStyle {}
         div {
             id: "app",
             class: "app",
@@ -1115,5 +1115,14 @@ mod tests {
 
         assert_eq!(EMAILS.peek().len(), PAGE as usize - 1);
         assert!(*HAS_MORE.peek(), "older allowed mail remains");
+    }
+}
+
+/// The static stylesheet. Lives in its own component that reads no signals, so it renders once;
+/// re-rendering `document::Style` from `App` on every state change logs a Dioxus warning.
+#[component]
+fn BaseStyle() -> Element {
+    rsx! {
+        document::Style { {include_str!("../assets/style.css")} }
     }
 }
