@@ -348,7 +348,7 @@ async fn settle(
         return Ok(());
     }
 
-    match apply_tray(cfg, store, client, &row).await {
+    match apply_tray(cfg, store, client, &row, revision).await {
         Ok(done) => {
             report.moved += 1;
             report.flagged += usize::from(done.flagged);
@@ -358,6 +358,7 @@ async fn settle(
                 id,
                 row.effective_tray(),
                 &done.removed,
+                done.patched,
                 revision,
             )? {
                 store.remove_from_classify_queue(account, id)?;
@@ -521,6 +522,10 @@ pub struct Applied {
     pub flagged: bool,
     /// The trays whose mailboxes the change took the email out of.
     pub removed: Vec<String>,
+    /// Whether a mailbox patch went to the server. False when none was
+    /// needed, there was no connection, or the row's intent had moved on
+    /// before the patch (nothing was sent then).
+    pub patched: bool,
 }
 
 /// Files the email per its effective tray and flags it when it is an urgent
@@ -538,6 +543,11 @@ pub struct Applied {
 /// spam, and the unsure mailbox, and returns to the inbox when the new tray
 /// keeps mail there. Without a connection only the local copy changes.
 ///
+/// `revision` is the intent revision `c` was read at (see
+/// [`Store::classification_with_revision`]). It is checked immediately before
+/// the patch goes out: when the row has moved on, nothing is sent or owned
+/// and the result has `patched` false.
+///
 /// # Errors
 ///
 /// Returns an error when a needed mailbox is missing and cannot be created,
@@ -547,6 +557,7 @@ pub async fn apply_tray(
     store: &Store,
     client: Option<&Client>,
     c: &Classified,
+    revision: i64,
 ) -> Result<Applied> {
     let tray: Tray = c.effective_tray().parse()?;
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
@@ -612,11 +623,28 @@ pub async fn apply_tray(
         .filter(|r| !add.contains(r))
         .collect();
 
+    // An older application must not send once a newer intent exists. This
+    // narrows the window but cannot close it across handles; a patch that
+    // still lands late is repaired by the pending pass (see
+    // `Store::confirm_classification`).
+    if store
+        .classification_with_revision(account, id)?
+        .is_none_or(|(_, now)| now != revision)
+    {
+        return Ok(Applied {
+            flagged: false,
+            removed: Vec::new(),
+            patched: false,
+        });
+    }
+
     // Recorded before the request: if it fails half way, a later correction
     // still knows to take this tray's mailbox away.
     store.own_tray(account, id, tray.as_str())?;
 
-    if !add.is_empty() || !remove.is_empty() {
+    let patched = !add.is_empty() || !remove.is_empty();
+
+    if patched {
         accepted(
             store,
             client,
@@ -625,6 +653,11 @@ pub async fn apply_tray(
             Action::PatchMailboxes { add, remove },
         )
         .await?;
+
+        // A newer application may have dropped this tray's ownership while
+        // the patch was in flight; the server holds it again now, so the
+        // newest intent's re-application must be able to take it away.
+        store.own_tray(account, id, tray.as_str())?;
     }
 
     // A flag cannot be taken back, so look at the row again: a correction
@@ -643,6 +676,7 @@ pub async fn apply_tray(
     Ok(Applied {
         flagged: flag,
         removed: removed_trays,
+        patched: patched && client.is_some(),
     })
 }
 
@@ -717,7 +751,7 @@ pub async fn correct(
         .ok_or_else(|| Error::NotFound(format!("classification {msg}")))?;
     let client = clients.get(account).map(Arc::as_ref);
 
-    match apply_tray(cfg, store, client, &row).await {
+    match apply_tray(cfg, store, client, &row, revision).await {
         Ok(_) if client.is_none() => Ok(()),
         Ok(done) => {
             store.confirm_classification(
@@ -725,6 +759,7 @@ pub async fn correct(
                 id,
                 row.effective_tray(),
                 &done.removed,
+                done.patched,
                 revision,
             )?;
 

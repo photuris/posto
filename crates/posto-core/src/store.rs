@@ -1412,10 +1412,14 @@ impl Store {
 
     /// Records that the server holds the mailbox changes for `tray` and
     /// confirms the row, unless the intent changed since `revision` was read
-    /// (see [`Store::classification_with_revision`]): then nothing is touched
-    /// (no ownership, no applied flag), `false` comes back and the caller's
-    /// work is superseded; the newest intent's own application settles the
-    /// row. Returns whether the row was confirmed.
+    /// (see [`Store::classification_with_revision`]): then `false` comes back
+    /// and the caller's work is superseded; intent and ownership are never
+    /// touched. The newest intent's own application settles the row, except
+    /// when `patched` says the superseded operation did send a mailbox patch:
+    /// that patch may have landed after the newest application and undone it,
+    /// so the current row is marked pending again (`applied = 0`) in the same
+    /// transaction and the next pending pass re-applies the newest intent.
+    /// Returns whether the row was confirmed.
     ///
     /// Ownership is merged into the row as it is now, in one immediate
     /// transaction: `tray` is added and only the `removed` trays (those this
@@ -1432,6 +1436,7 @@ impl Store {
         id: &str,
         tray: &str,
         removed: &[String],
+        patched: bool,
         revision: i64,
     ) -> Result<bool> {
         let mut conn = self.conn();
@@ -1449,6 +1454,15 @@ impl Store {
         };
 
         if current != revision {
+            if patched {
+                tx.execute(
+                    "UPDATE classified SET applied = 0 \
+                     WHERE account_id = ?1 AND email_id = ?2",
+                    [account, id],
+                )?;
+                tx.commit()?;
+            }
+
             return Ok(false);
         }
 

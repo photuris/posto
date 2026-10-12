@@ -2067,6 +2067,7 @@ async fn review_stale_confirmation_does_not_resurrect_removed_tray() -> Result<(
         &env.store,
         env.clients.get("a").map(Arc::as_ref),
         &old,
+        revision,
     )
     .await?;
     assert!(
@@ -2085,17 +2086,22 @@ async fn review_stale_confirmation_does_not_resurrect_removed_tray() -> Result<(
     );
     assert!(env.store.classification("a", "e1")?.unwrap().applied);
     // Resume confirmation of the already completed, older Social operation.
-    assert!(
-        !env.store
-            .confirm_classification("a", "e1", "social", &done.removed, revision)?
-    );
+    assert!(!env.store.confirm_classification(
+        "a",
+        "e1",
+        "social",
+        &done.removed,
+        done.patched,
+        revision
+    )?);
     drop(_turn);
     assert_eq!(
         env.store.owned_trays("a", "e1")?,
         vec!["updates".to_string()],
         "stale confirmation resurrected ownership of Social after a completed Updates correction removed it"
     );
-    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    // Social's patch was sent, so the row is pending for a repair pass.
+    assert!(!env.store.classification("a", "e1")?.unwrap().applied);
     Ok(())
 }
 
@@ -2131,6 +2137,7 @@ async fn superseded_confirmation_returns_false_and_changes_nothing() -> Result<(
         "e1",
         "social",
         &["promotional".to_string()],
+        false,
         revision
     )?);
 
@@ -2145,8 +2152,101 @@ async fn superseded_confirmation_returns_false_and_changes_nothing() -> Result<(
 
     assert!(
         env.store
-            .confirm_classification("a", "e1", "updates", &[], current)?
+            .confirm_classification("a", "e1", "updates", &[], false, current)?
     );
     assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_latest_intent_stays_applied_after_superseded_move_finishes_last() -> Result<()> {
+    let mut env = env().await;
+    let path = env._dir.path().join("shared.db");
+    env.store = Store::open(&path)?;
+    let second_store = Store::open(&path)?;
+    env.store
+        .upsert_emails(&[email("a", "e1", &["mb-inbox"])])?;
+    env.store.upsert_mailboxes(&[
+        mailbox("a", "mb-inbox", "Inbox", Some("inbox")),
+        mailbox("a", "mb-junk", "Junk", Some("junk")),
+        mailbox("a", "mb-social", "Social", None),
+        mailbox("a", "mb-promos", "Promos", None),
+        mailbox("a", "mb-updates", "Updates", None),
+    ])?;
+    delay_mailbox_patch(&env, "mailboxIds/mb-social", 600).await;
+    delay_mailbox_patch(&env, "mailboxIds/mb-promos", 300).await;
+    let msg = MsgRef::new("a", "e1");
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        let (first, second, latest) = tokio::join!(
+            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social),
+            async {
+                wait_for_mailbox_patch(&env, "mailboxIds/mb-social").await;
+                correct(
+                    &env.cfg,
+                    &second_store,
+                    &env.clients,
+                    &msg,
+                    Tray::Promotional,
+                )
+                .await
+            },
+            async {
+                wait_for_mailbox_patch(&env, "mailboxIds/mb-promos").await;
+                correct(&env.cfg, &second_store, &env.clients, &msg, Tray::Updates).await
+            },
+        );
+        first?;
+        second?;
+        latest?;
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect("corrections deadlocked")?;
+    // Social finished last and undid the newest application: the row is
+    // pending again, with the newest intent and its ownership intact.
+    let row = env.store.classification("a", "e1")?.unwrap();
+
+    assert_eq!(row.corrected_tray.as_deref(), Some("updates"));
+    assert!(!row.applied, "a late superseded patch left the row settled");
+
+    let report = env.run(None).await;
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    assert_eq!(
+        env.mailboxes_of("a", "e1"),
+        sorted(&["mb-inbox", "mb-updates"]),
+        "the pending pass did not restore the newest intent"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_tray_sends_nothing_once_the_intent_has_moved_on() -> Result<()> {
+    let env = env().await;
+    env.store
+        .upsert_emails(&[email("a", "e1", &["mb-inbox"])])?;
+    env.store.upsert_mailboxes(&[
+        mailbox("a", "mb-inbox", "Inbox", Some("inbox")),
+        mailbox("a", "mb-social", "Social", None),
+    ])?;
+    env.store.set_correction("a", "e1", "social")?;
+
+    let (old, revision) = env.store.classification_with_revision("a", "e1")?.unwrap();
+
+    env.store.set_correction("a", "e1", "updates")?;
+
+    let done = classify::apply_tray(
+        &env.cfg,
+        &env.store,
+        env.clients.get("a").map(Arc::as_ref),
+        &old,
+        revision,
+    )
+    .await?;
+
+    assert!(!done.patched);
+    assert!(patches(&env.jmap, "e1").await.is_empty());
+    assert!(env.store.owned_trays("a", "e1")?.is_empty());
     Ok(())
 }
