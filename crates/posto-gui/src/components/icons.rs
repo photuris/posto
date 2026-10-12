@@ -2,6 +2,32 @@
 
 use dioxus::prelude::*;
 
+/// Every name [`Icon`] can draw.
+#[cfg(test)]
+pub const NAMES: &[&str] = &[
+    "inbox",
+    "drafts",
+    "sent",
+    "archive",
+    "junk",
+    "trash",
+    "folder",
+    "compose",
+    "reply",
+    "reply-all",
+    "refresh",
+    "settings",
+    "search",
+    "paperclip",
+    "flag",
+    "menu",
+    "close",
+    "more",
+    "book-open",
+    "sun",
+    "chevron-down",
+];
+
 /// The SVG elements drawn for `name`; empty for an unknown name.
 fn shapes(name: &str) -> &'static str {
     match name {
@@ -88,29 +114,7 @@ mod tests {
 
     #[test]
     fn every_name_has_shapes_and_unknown_is_empty() {
-        for name in [
-            "inbox",
-            "drafts",
-            "sent",
-            "archive",
-            "junk",
-            "trash",
-            "folder",
-            "compose",
-            "reply",
-            "reply-all",
-            "refresh",
-            "settings",
-            "search",
-            "paperclip",
-            "flag",
-            "menu",
-            "close",
-            "more",
-            "book-open",
-            "sun",
-            "chevron-down",
-        ] {
+        for name in NAMES {
             assert!(!shapes(name).is_empty(), "{name} has no shapes");
         }
 

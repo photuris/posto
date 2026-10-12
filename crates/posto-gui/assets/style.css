@@ -200,7 +200,7 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
   display: flex; flex-direction: column; overflow: hidden;
 }
 .composer { width: min(980px, 92vw); height: min(720px, 88vh); }
-.composer-title, .settings-title { padding: 12px 18px; font-weight: 600; border-bottom: 1px solid var(--border); }
+.composer-title { padding: 12px 18px; font-weight: 600; border-bottom: 1px solid var(--border); }
 .field { display: flex; align-items: center; gap: 10px; padding: 4px 18px; border-bottom: 1px solid var(--border); }
 .field label { width: 64px; text-align: right; color: var(--posto-muted); }
 .field input { flex: 1; border: none; background: transparent; }
@@ -217,8 +217,26 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 .composer-status { flex: 1; text-align: right; color: var(--posto-muted); font-size: 12px; }
 .switch { display: flex; align-items: center; gap: 6px; }
 
-.settings { width: min(640px, 92vw); max-height: 88vh; }
-.settings-body { flex: 1; overflow: auto; padding: 4px 18px 12px; }
+.settings {
+  width: min(780px, 92vw); height: min(580px, 88vh);
+  display: grid; grid-template-columns: 180px 1fr; grid-template-rows: minmax(0, 1fr);
+}
+.settings-wide { grid-column: 1 / -1; }
+.settings-nav {
+  display: flex; flex-direction: column; gap: 2px; padding: 12px 8px;
+  background: var(--posto-lighter-background); border-right: 1px solid var(--border);
+}
+.nav-item {
+  display: flex; align-items: center; gap: 8px; text-align: left;
+  padding: 7px 12px; border: none; border-radius: 6px; background: transparent;
+}
+.nav-item.active {
+  background: var(--sel); color: var(--posto-accent); font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--posto-accent);
+}
+.nav-item.active .icon { color: var(--posto-accent); }
+.settings-page { overflow: auto; padding: 20px; min-height: 0; }
+.settings-page h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
 .settings h3 { margin: 18px 0 6px; font-size: 14px; }
 .setting-row {
   display: flex; align-items: center; gap: 10px;
@@ -227,6 +245,7 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 }
 .setting-row > span:first-child, .setting-row > label:first-child { flex: none; }
 .setting-row input[type="text"], .setting-row input[type="password"] { flex: 1; min-width: 0; }
+.setting-row .spacer { flex: 1; }
 .setting-row .muted { margin-left: auto; color: var(--posto-muted); }
 .setting-row.shortcut label { width: 120px; }
 .setting-row.shortcut input { flex: none; width: 140px; }
