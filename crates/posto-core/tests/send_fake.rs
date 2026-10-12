@@ -7,29 +7,9 @@ use posto_core::jmap::Client;
 use posto_core::store::{Address, EmailSummary, Mailbox, Store};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
-use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SESSION: &str = include_str!("fixtures/session.json");
-
-/// Matches the send request and checks the shape of both method calls.
-struct SendShape;
-
-impl Match for SendShape {
-    fn matches(&self, request: &Request) -> bool {
-        let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
-            return false;
-        };
-        let calls = &body["methodCalls"];
-        let create = &calls[0][1]["create"]["d"];
-        let patch = &calls[1][1]["onSuccessUpdateEmail"]["#s"];
-
-        calls[0][0] == "Email/set"
-            && create["mailboxIds"] == json!({ "mb-drafts": true })
-            && create["from"][0]["email"] == "Me@Example.com"
-            && create["bodyStructure"]["subParts"].as_array().map(Vec::len) == Some(2)
-            && patch["mailboxIds/mb-sent"] == true
-    }
-}
 
 async fn server() -> MockServer {
     let server = MockServer::start().await;
@@ -137,22 +117,106 @@ fn submit_responses(set_updated: Value) -> Value {
 async fn send_creates_and_submits() {
     let server = server().await;
     identities(&server, two_identities()).await;
-    Mock::given(method("POST"))
-        .and(path("/api"))
-        .and(body_string_contains("EmailSubmission/set"))
-        .and(SendShape)
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "methodResponses": submit_responses(json!({ "updated": { "e-new": null } })),
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    mount(
+        &server,
+        "EmailSubmission/set",
+        submit_responses(json!({ "updated": { "e-new": null } })),
+        1,
+    )
+    .await;
 
     let id = send(&cfg(), &store(), &client(&server).await, &draft())
         .await
         .unwrap();
 
     assert_eq!(id, "e-new");
+
+    // Assert on the recorded request, so a wrong field fails here by name.
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .find(|b| b["methodCalls"][1][0] == "EmailSubmission/set")
+        .expect("no send request recorded");
+    let calls = &body["methodCalls"];
+    let create = &calls[0][1]["create"]["d"];
+    let submission = &calls[1][1];
+
+    assert_eq!(calls[0][0], "Email/set");
+    assert_eq!(calls[0][2], "0");
+    assert_eq!(calls[1][2], "1");
+    assert_eq!(create["mailboxIds"], json!({ "mb-drafts": true }));
+    assert_eq!(create["from"][0]["email"], "Me@Example.com");
+    assert_eq!(
+        create["bodyStructure"]["subParts"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(submission["create"]["s"]["emailId"], "#d");
+    assert_eq!(submission["create"]["s"]["identityId"], "i2");
+    assert_eq!(
+        submission["onSuccessUpdateEmail"]["#s"]["mailboxIds/mb-sent"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn send_rejects_responses_with_wrong_call_ids() {
+    let created = json!({ "created": { "d": { "id": "e-new" } } });
+    let submitted = json!({ "created": { "s": { "id": "sub1" } } });
+    let moved = json!({ "updated": { "e-new": null } });
+    let cases = [
+        // (name, responses, expected Jmap message or None for Error::Other)
+        (
+            "create under the wrong id",
+            json!([
+                ["Email/set", created, "9"],
+                ["EmailSubmission/set", submitted, "1"],
+                ["Email/set", moved, "1"],
+            ]),
+            Some("no create response"),
+        ),
+        (
+            "submission under the wrong id",
+            json!([
+                ["Email/set", created, "0"],
+                ["EmailSubmission/set", submitted, "9"],
+                ["Email/set", moved, "1"],
+            ]),
+            Some("no submission response"),
+        ),
+        (
+            "move to Sent under the wrong id",
+            json!([
+                ["Email/set", created, "0"],
+                ["EmailSubmission/set", submitted, "1"],
+                ["Email/set", moved, "9"],
+            ]),
+            None,
+        ),
+    ];
+
+    for (name, responses, jmap_message) in cases {
+        let server = server().await;
+        identities(&server, two_identities()).await;
+        mount(&server, "EmailSubmission/set", responses, 1).await;
+
+        let result = send(&cfg(), &store(), &client(&server).await, &draft()).await;
+
+        assert!(result.is_err(), "{name}: accepted as {result:?}");
+
+        let err = result.unwrap_err();
+
+        match jmap_message {
+            Some(message) => assert!(
+                matches!(&err, Error::Jmap(m) if m == message),
+                "{name}: {err:?}"
+            ),
+            None => assert!(
+                matches!(&err, Error::Other(m) if m.contains("e-new") && m.contains("Sent")),
+                "{name}: {err:?}"
+            ),
+        }
+    }
 }
 
 #[tokio::test]
