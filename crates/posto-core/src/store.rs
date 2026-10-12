@@ -442,21 +442,19 @@ impl Store {
             .optional()?)
     }
 
-    /// Finds a mailbox by name, ignoring case.
+    /// Finds a mailbox by name, ignoring (Unicode) case.
     ///
     /// # Errors
     ///
     /// Returns an error on database failure.
     pub fn mailbox_by_name(&self, name: &str) -> Result<Option<Mailbox>> {
+        // SQLite's NOCASE folds ASCII only, so compare in Rust.
+        let wanted = name.to_lowercase();
+
         Ok(self
-            .conn()
-            .query_row(
-                "SELECT id, name, role, parent_id, sort_order, total, unread \
-                 FROM mailboxes WHERE name = ?1 COLLATE NOCASE LIMIT 1",
-                [name],
-                mailbox_from_row,
-            )
-            .optional()?)
+            .mailboxes()?
+            .into_iter()
+            .find(|m| m.name.to_lowercase() == wanted))
     }
 
     /// Inserts or updates emails, their mailbox links and their FTS rows in
@@ -874,6 +872,7 @@ mod tests {
 
         assert_eq!(old.len(), 0);
         assert_eq!(store.counts().unwrap(), vec![("m2".to_string(), 1, 0)]);
+        assert_eq!(store.email("a").unwrap().unwrap().mailbox_ids, ["m2"]);
     }
 
     #[test]
@@ -933,6 +932,25 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_by_name_ignores_unicode_case() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .upsert_mailboxes(&[
+                mailbox("i", "Inbox", Some("inbox")),
+                mailbox("r", "Årsrapporter", None),
+            ])
+            .unwrap();
+
+        let id = |name: &str| store.mailbox_by_name(name).unwrap().map(|m| m.id);
+
+        assert_eq!(id("INBOX").as_deref(), Some("i"));
+        assert_eq!(id("årsrapporter").as_deref(), Some("r"));
+        assert_eq!(id("ÅRSRAPPORTER").as_deref(), Some("r"));
+        assert_eq!(id("missing"), None);
+    }
+
+    #[test]
     fn delete_emails_removes_fts_and_joins() {
         let store = Store::open_memory().unwrap();
         let body = |id: &str| EmailBody {
@@ -971,7 +989,24 @@ mod tests {
         assert!(store.body("a").unwrap().is_none());
         assert!(store.body("b").unwrap().is_some());
 
+        // Raw table counts: the joined queries below hide orphan rows.
+        let raw_rows = |table: &str| -> i64 {
+            store
+                .conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        let tables = ["emails", "email_mailboxes", "bodies", "emails_fts"];
+
+        for table in tables {
+            assert_eq!(raw_rows(table), 1, "{table} before clear");
+        }
+
         store.clear_emails().unwrap();
+
+        for table in tables {
+            assert_eq!(raw_rows(table), 0, "{table} after clear");
+        }
 
         assert!(store.list_emails(&ListQuery::default()).unwrap().is_empty());
         assert!(store.search("betasubject", 0).unwrap().is_empty());

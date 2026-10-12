@@ -10,6 +10,9 @@ use crate::error::{Error, Result};
 /// Fastmail's JMAP session endpoint.
 const DEFAULT_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 
+/// Fixed message for an unparsable `secrets.toml`; carries no file text.
+const SECRETS_PARSE_ERROR: &str = "secrets.toml is not valid TOML";
+
 /// Returns `$POSTO_DATA_DIR`, else `dirs::data_dir()/posto`.
 ///
 /// The environment is read on every call so tests can change it.
@@ -76,14 +79,17 @@ impl Default for SyncConfig {
 }
 
 impl Config {
-    /// Reads `config.toml`; a missing file yields the defaults.
+    /// Reads `config.toml`, creating the data directory first; a missing
+    /// file yields the defaults.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] on read failure and [`Error::Config`] when the
+    /// Returns [`Error::Io`] on read or directory-creation failure and [`Error::Config`] when the
     /// file is not valid TOML.
     pub fn load() -> Result<Config> {
         let path = data_dir().join("config.toml");
+
+        std::fs::create_dir_all(data_dir())?;
 
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -144,8 +150,10 @@ impl Secrets {
 
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let file: SecretsFile = toml::from_str(&text)
-                    .map_err(|e| Error::Config(format!("secrets.toml: {e}")))?;
+                // The parser's message quotes the offending source line,
+                // which holds the token, so it is dropped on purpose.
+                let file: SecretsFile =
+                    toml::from_str(&text).map_err(|_| Error::Config(SECRETS_PARSE_ERROR.into()))?;
 
                 Ok(file.token.filter(|t| !t.is_empty()))
             }
@@ -218,9 +226,15 @@ mod tests {
     #[test]
     fn defaults_when_missing() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _dir = isolate();
+        let dir = isolate();
+        let nested = dir.path().join("not").join("yet");
+
+        // SAFETY: ENV_LOCK is held.
+        unsafe { std::env::set_var("POSTO_DATA_DIR", &nested) };
+
         let cfg = Config::load().unwrap();
 
+        assert!(nested.is_dir());
         assert_eq!(cfg.account.session_url, DEFAULT_SESSION_URL);
         assert_eq!(cfg.sync.refresh_minutes, 5);
         assert_eq!(cfg.sync.initial_limit, 1000);
@@ -266,6 +280,21 @@ mod tests {
 
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        // A malformed secrets file must not echo the token back.
+        std::fs::write(
+            dir.path().join("secrets.toml"),
+            "token = \"review_dummy_secret\n",
+        )
+        .unwrap();
+
+        let err = Secrets::token().unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        assert!(
+            !err.to_string().contains("review_dummy_secret"),
+            "error leaks token: {err}"
+        );
 
         Secrets::clear_token().unwrap();
         assert_eq!(Secrets::token().unwrap(), None);
