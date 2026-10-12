@@ -422,6 +422,8 @@ async fn delta_sync_recovers_from_cannot_calculate() -> Result<()> {
     store.set_account_state("a", "mailbox_state", "m1")?;
     store.set_account_state("a", "email_state", "expired")?;
     store.upsert_emails(&[email("e-stale", "mb-inbox")])?;
+    store.enqueue_for_classification("a", &["e-stale".into()])?;
+    store.enqueue_for_classification("b", &["e-stale".into()])?;
     store.put_body(
         "a",
         &posto_core::store::EmailBody {
@@ -489,6 +491,8 @@ async fn delta_sync_recovers_from_cannot_calculate() -> Result<()> {
     assert!(report.initial);
     assert!(store.email("a", "e-stale")?.is_none());
     assert!(store.body("a", "e-stale")?.is_none());
+    assert_eq!(store.classify_queue_len("a")?, 0);
+    assert_eq!(store.classify_queue_len("b")?, 1);
     assert!(store.email("a", "e1")?.is_some());
     assert_eq!(
         store.account_state("a", "email_state")?.as_deref(),

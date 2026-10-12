@@ -36,6 +36,9 @@ pub struct Backend {
     /// Bumped whenever an endpoint or token may have changed, so a connection
     /// that was already in flight is not cached under the new settings.
     pub conn_rev: u64,
+    /// Why `config.toml` could not be loaded. While set, `cfg` is a stand-in:
+    /// it is never written to disk and Settings stays closed.
+    pub config_error: Option<String>,
 }
 
 impl Backend {
@@ -58,17 +61,29 @@ impl Backend {
                 cfg,
                 ui_test,
                 conn_rev: 0,
+                config_error: None,
             });
         }
+
+        let (cfg, config_error) = config_or_stand_in(Config::load());
 
         Ok(Backend {
             store: Arc::new(Store::open(&Config::db_path())?),
             clients: HashMap::new(),
-            // A broken config.toml must not lock the user out of Settings.
-            cfg: Config::load().unwrap_or_default(),
+            cfg,
             ui_test,
             conn_rev: 0,
+            config_error,
         })
+    }
+
+    /// The config to write to disk, or the load error that forbids it: a
+    /// stand-in config must never overwrite the user's file.
+    pub fn config_for_save(&self) -> std::result::Result<&Config, &str> {
+        match &self.config_error {
+            Some(e) => Err(e),
+            None => Ok(&self.cfg),
+        }
     }
 
     /// Drops every connection and invalidates any connection still being made.
@@ -83,6 +98,14 @@ impl Backend {
             .from
             .iter()
             .any(|a| sender_blocked(&self.cfg.blocked_senders, &a.email))
+    }
+}
+
+/// The loaded config, or defaults plus the reason it could not be loaded.
+fn config_or_stand_in(loaded: Result<Config>) -> (Config, Option<String>) {
+    match loaded {
+        Ok(cfg) => (cfg, None),
+        Err(e) => (Config::default(), Some(e.to_string())),
     }
 }
 
@@ -227,6 +250,35 @@ mod tests {
         url
     }
 
+    #[test]
+    fn unreadable_config_is_never_saved() {
+        let (cfg, error) = config_or_stand_in(Err(Error::Config("duplicate account id".into())));
+        let broken = Backend {
+            store: Arc::new(Store::open_memory().unwrap()),
+            clients: HashMap::new(),
+            cfg,
+            ui_test: false,
+            conn_rev: 0,
+            config_error: error,
+        };
+
+        assert!(
+            broken
+                .config_error
+                .as_deref()
+                .unwrap()
+                .contains("duplicate")
+        );
+        assert!(broken.config_for_save().is_err());
+
+        let healthy = Backend {
+            config_error: None,
+            ..broken
+        };
+
+        assert!(healthy.config_for_save().is_ok());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn stale_connection_is_not_cached_after_settings_save() {
         let (requested, release) = (
@@ -246,6 +298,7 @@ mod tests {
                 cfg,
                 ui_test: false,
                 conn_rev: 0,
+                config_error: None,
             },
             ScopeId::ROOT,
         );

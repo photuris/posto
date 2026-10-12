@@ -419,6 +419,30 @@ struct SecretsFile {
     typesafe_key: Option<String>,
 }
 
+/// Writes `text` to `path` through a temporary file created with mode 0600
+/// (unix), so secret bytes are never readable by others, then renames it over
+/// `path`.
+fn write_private(path: &std::path::Path, text: &str) -> Result<()> {
+    use std::io::Write;
+
+    let tmp = path.with_extension("toml.tmp");
+    let mut options = std::fs::OpenOptions::new();
+
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+
+    options.open(&tmp)?.write_all(text.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+
+    Ok(())
+}
+
 /// Access to the API tokens and keys. Every setter reads the whole file,
 /// changes one key and writes it back, so keys never clobber each other.
 pub struct Secrets;
@@ -440,7 +464,15 @@ impl Secrets {
     }
 
     /// Migrates the legacy token, applies `change`, and writes the file (mode 0600 on unix).
+    ///
+    /// Holds an exclusive lock on `secrets.lock` across the read, the change
+    /// and the write, so concurrent processes never lose each other's keys.
     fn update(change: impl FnOnce(&mut SecretsFile)) -> Result<()> {
+        std::fs::create_dir_all(data_dir())?;
+
+        let mut lock =
+            fd_lock::RwLock::new(std::fs::File::create(data_dir().join("secrets.lock"))?);
+        let _guard = lock.write()?;
         let mut file = Self::read()?.unwrap_or_default();
 
         if let Some(legacy) = file.token.take() {
@@ -452,19 +484,8 @@ impl Secrets {
         change(&mut file);
 
         let text = toml::to_string(&file).map_err(|e| Error::Config(e.to_string()))?;
-        let path = data_dir().join("secrets.toml");
 
-        std::fs::create_dir_all(data_dir())?;
-        std::fs::write(&path, text)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-
-        Ok(())
+        write_private(&data_dir().join("secrets.toml"), &text)
     }
 
     /// The token stored for `account_id`, ignoring the environment. The legacy
@@ -831,6 +852,92 @@ mod tests {
         Secrets::set_token("default", "again").unwrap();
         Secrets::clear_token("default").unwrap();
         assert_eq!(Secrets::token("default").unwrap(), None);
+    }
+
+    #[test]
+    fn concurrent_setters_keep_every_token() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _dir = isolate();
+
+        // A large key widens the read-modify-write window.
+        Secrets::set_typesafe_key(&"k".repeat(4_000_000)).unwrap();
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    Secrets::set_token(&format!("acct{i}"), "t").unwrap();
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        for i in 0..8 {
+            assert_eq!(
+                Secrets::token(&format!("acct{i}")).unwrap().as_deref(),
+                Some("t"),
+                "token acct{i} was lost"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_bytes_are_never_group_or_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolate();
+
+        // A pre-existing loose file must come out 0600 too.
+        std::fs::write(dir.path().join("secrets.toml"), "").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("secrets.toml"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = {
+            let (done, path) = (done.clone(), dir.path().to_path_buf());
+
+            std::thread::spawn(move || {
+                let mut leaked = None;
+
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    for entry in std::fs::read_dir(&path).unwrap().flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+
+                        if !name.starts_with("secrets.toml") {
+                            continue;
+                        }
+
+                        let Ok(meta) = entry.metadata() else { continue };
+
+                        if meta.len() > 0 && meta.permissions().mode() & 0o077 != 0 {
+                            leaked = Some((name, meta.permissions().mode()));
+                        }
+                    }
+                }
+
+                leaked
+            })
+        };
+
+        Secrets::set_token("a", &"x".repeat(12_000_000)).unwrap();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(observer.join().unwrap(), None, "readable secret bytes");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("secrets.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

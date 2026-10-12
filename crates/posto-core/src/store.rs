@@ -957,7 +957,8 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes every email, mailbox link, body and FTS row of `account`.
+    /// Deletes every email, mailbox link, body, FTS and classify-queue row of
+    /// `account`; other accounts keep theirs.
     ///
     /// # Errors
     ///
@@ -966,7 +967,13 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
 
-        for table in ["emails", "email_mailboxes", "bodies", "emails_fts"] {
+        for table in [
+            "emails",
+            "email_mailboxes",
+            "bodies",
+            "emails_fts",
+            "classify_queue",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE account_id = ?1"),
                 [account],
@@ -2108,6 +2115,14 @@ mod tests {
             Some("s2")
         );
         // `gone` left the queue, `new` joined it.
+        let queued: Vec<_> = store
+            .classify_queue(Some("a"))
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.account_id, r.email_id))
+            .collect();
+
+        assert_eq!(queued, [("a".to_string(), "new".to_string())]);
         assert_eq!(store.classify_queue_len("a").unwrap(), 1);
         assert_eq!(raw_rows(&store, "classify_queue", "a"), 1);
 

@@ -430,6 +430,54 @@ fn sync_without_token_exits_3() {
 }
 
 #[test]
+fn sync_with_several_accounts_reports_each_missing_token() {
+    let sb = Sandbox::new();
+
+    sb.json(&["account", "add", "--id", "work", "--email", "w@x.io"]);
+
+    let out = sb.run_with(&["sync", "run"], None);
+    let reports: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+        panic!(
+            "stdout is not JSON: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let seen: Vec<_> = reports
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["account_id"].as_str().unwrap(),
+                r["error"].as_str().unwrap(),
+            )
+        })
+        .collect();
+
+    assert_eq!(seen, [("default", "no token"), ("work", "no token")]);
+}
+
+#[test]
+fn sync_without_enabled_account_says_so() {
+    let sb = Sandbox::new();
+
+    sb.json(&[
+        "account",
+        "set",
+        "--account",
+        "default",
+        "--enabled",
+        "false",
+    ]);
+
+    let out = sb.run_with(&["sync", "run"], None);
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(err["error"], "not configured: no enabled account");
+}
+
+#[test]
 fn account_identities_and_send_from_flag() {
     let sb = Sandbox::seeded();
     let ids = sb.json(&["account", "identities"]);

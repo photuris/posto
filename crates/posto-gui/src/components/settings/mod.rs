@@ -164,6 +164,22 @@ pub fn Settings() -> Element {
         close();
     };
 
+    if let Some(e) = backend().read().config_error.clone() {
+        return rsx! {
+            div { class: "overlay", onclick: |_| close(),
+                div { class: "settings", onclick: |evt| evt.stop_propagation(),
+                    div { class: "error pad settings-wide",
+                        "Settings are disabled: config.toml could not be loaded ({e}). Fix the file and restart."
+                    }
+                    div { class: "settings-foot settings-wide",
+                        span { class: "spacer" }
+                        button { onclick: |_| close(), "Close" }
+                    }
+                }
+            }
+        };
+    }
+
     rsx! {
         div { class: "overlay", onclick: |_| close(),
             div { class: "settings", onclick: |evt| evt.stop_propagation(),

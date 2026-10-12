@@ -204,7 +204,12 @@ pub fn end_drag() {
 
 /// Writes the current config to disk, reporting a failure in the toast.
 pub fn save_config() {
-    if let Err(e) = backend().peek().cfg.save() {
+    let result = match backend().peek().config_for_save() {
+        Ok(cfg) => cfg.save().map_err(|e| e.to_string()),
+        Err(_) => return,
+    };
+
+    if let Err(e) = result {
         set_status(format!("Could not save settings: {e}"));
     }
 }
@@ -355,6 +360,11 @@ pub fn App() -> Element {
                 }
             },
             style { {THEME_CSS()} }
+            if let Some(e) = backend().read().config_error.clone() {
+                div { class: "banner",
+                    "config.toml could not be loaded; settings are read-only until it is fixed: {e}"
+                }
+            }
             if NEEDS_TOKEN() {
                 div { class: "banner",
                     "No token configured — open Settings"
@@ -917,9 +927,29 @@ pub async fn reload_list() {
                         .is_some_and(|a| a.enabled)
                 })
                 .collect();
+
+            drop_disabled_accounts_from_selection();
         }
         Err(e) => set_status(format!("Could not load messages: {e}")),
     }
+}
+
+/// Forgets selected messages whose account is disabled or gone, so the reader,
+/// reply and bulk actions never act on mail that is no longer shown.
+fn drop_disabled_accounts_from_selection() {
+    let b = backend().peek().clone();
+    let shown: Vec<String> = SELECTION
+        .peek()
+        .ids
+        .iter()
+        .filter(|k| {
+            MsgRef::parse(k)
+                .is_some_and(|r| b.cfg.account(&r.account_id).is_some_and(|a| a.enabled))
+        })
+        .cloned()
+        .collect();
+
+    change_selection(|s| s.retain(&shown));
 }
 
 /// Applies `action` to every selected email.
@@ -1352,6 +1382,7 @@ mod tests {
             cfg,
             ui_test: false,
             conn_rev: 0,
+            config_error: None,
         }
     }
 
@@ -1465,6 +1496,44 @@ mod tests {
 
         assert_eq!(EMAILS.peek().len(), PAGE as usize - 1);
         assert!(*HAS_MORE.peek(), "older allowed mail remains");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disabling_an_account_clears_its_selection_and_reader() {
+        let dom = rendered(backend_with(Config::default()));
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        posto_core::fixtures::seed(&backend().peek().store).unwrap();
+        reload_mailboxes();
+        reload_list().await;
+
+        let key = "default/fx-01".to_string();
+
+        assert!(list_order().contains(&key));
+
+        SELECTION
+            .write()
+            .click(std::slice::from_ref(&key), &key, Click::Plain);
+        *BODY.write() = Some((
+            MsgRef::parse(&key).unwrap(),
+            EmailBody {
+                email_id: "fx-01".into(),
+                html: None,
+                text: Some("hi".into()),
+                attachments: vec![],
+                in_reply_to: vec![],
+                references: vec![],
+                message_id: vec![],
+            },
+        ));
+
+        backend().write().cfg.accounts[0].enabled = false;
+        reload_mailboxes();
+        reload_list().await;
+
+        assert!(EMAILS.peek().is_empty());
+        assert!(SELECTION.peek().is_empty(), "{:?}", SELECTION.peek().focus);
+        assert!(BODY.peek().is_none());
     }
 
     /// A mailbox of `account` for folder tests.

@@ -258,6 +258,10 @@ pub async fn sync_run(account: Option<&str>) -> Result<Value> {
         None => cfg.accounts_enabled().cloned().collect(),
     };
 
+    if targets.is_empty() {
+        return Err(Error::NotConfigured("no enabled account".into()));
+    }
+
     if let [only] = targets.as_slice() {
         let client = client_for(&cfg, only).await?;
 
@@ -282,10 +286,6 @@ pub async fn sync_run(account: Option<&str>) -> Result<Value> {
                 unreachable.insert(a.id.clone(), e.to_string());
             }
         }
-    }
-
-    if clients.is_empty() && unreachable.is_empty() {
-        return Err(Error::NotConfigured("token".into()));
     }
 
     let scoped = Config {
