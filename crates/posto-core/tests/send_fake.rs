@@ -160,6 +160,74 @@ async fn send_creates_and_submits() {
 }
 
 #[tokio::test]
+async fn send_uses_draft_from_identity() {
+    let server = server().await;
+    // The account address is the first identity, so only `draft.from` can
+    // select the second.
+    identities(
+        &server,
+        json!([
+            { "id": "i1", "name": "Me", "email": "me@example.com" },
+            { "id": "i2", "name": "Shop", "email": "Shop@Example.com" },
+        ]),
+    )
+    .await;
+    mount(
+        &server,
+        "EmailSubmission/set",
+        submit_responses(json!({ "updated": { "e-new": null } })),
+        1,
+    )
+    .await;
+
+    let mut d = draft();
+    d.from = Some(Address {
+        name: None,
+        email: "shop@example.com".into(),
+    });
+
+    send(&cfg(), &store(), &client(&server).await, &d)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .find(|b| b["methodCalls"][1][0] == "EmailSubmission/set")
+        .expect("no send request recorded");
+    let calls = &body["methodCalls"];
+
+    assert_eq!(
+        calls[0][1]["create"]["d"]["from"][0]["email"],
+        "Shop@Example.com"
+    );
+    assert_eq!(calls[1][1]["create"]["s"]["identityId"], "i2");
+}
+
+#[tokio::test]
+async fn send_rejects_unknown_from() {
+    let server = server().await;
+    identities(&server, two_identities()).await;
+    mount(&server, "Email/set", json!([]), 0).await;
+
+    let mut d = draft();
+    d.from = Some(Address {
+        name: None,
+        email: "nobody@x.io".into(),
+    });
+
+    let err = send(&cfg(), &store(), &client(&server).await, &d)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, Error::NotConfigured(m) if m.contains("nobody@x.io")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn send_rejects_responses_with_wrong_call_ids() {
     let created = json!({ "created": { "d": { "id": "e-new" } } });
     let submitted = json!({ "created": { "s": { "id": "sub1" } } });

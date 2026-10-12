@@ -2,8 +2,11 @@
 
 use dioxus::prelude::*;
 use posto_core::compose::{self, Draft};
+use posto_core::store::Address;
 
-use crate::app::{COMPOSER, COMPOSER_CC, COMPOSER_TO, STATUS, backend, close_composer, send};
+use crate::app::{
+    COMPOSER, COMPOSER_CC, COMPOSER_TO, IDENTITIES, STATUS, backend, close_composer, send,
+};
 use crate::components::{focus_in, focus_out, frame_doc};
 
 /// Edits the open draft.
@@ -17,14 +20,25 @@ fn edit(f: impl FnOnce(&mut Draft)) {
 #[component]
 pub fn Composer() -> Element {
     let draft = COMPOSER().unwrap_or_default();
-    let from = {
-        let email = backend().read().cfg.account.email.clone();
-
-        if email.is_empty() {
-            "Default Fastmail address".to_string()
-        } else {
-            email
-        }
+    let account = backend().read().cfg.account.email.clone();
+    let identities = IDENTITIES();
+    // The same default `compose::send` applies when `from` is unset.
+    let selected = draft
+        .from
+        .as_ref()
+        .map(|a| a.email.clone())
+        .or_else(|| {
+            identities
+                .iter()
+                .find(|i| i.email.eq_ignore_ascii_case(&account))
+                .or(identities.first())
+                .map(|i| i.email.clone())
+        })
+        .unwrap_or_default();
+    let from = if account.is_empty() {
+        "Default Fastmail address".to_string()
+    } else {
+        account
     };
     let preview = draft
         .markdown
@@ -37,7 +51,32 @@ pub fn Composer() -> Element {
                 div { class: "composer-title", "{draft.subject}" }
                 div { class: "field",
                     label { "From:" }
-                    span { class: "static", "{from}" }
+                    if identities.is_empty() {
+                        span { class: "static", "{from}" }
+                    } else {
+                        select {
+                            onchange: move |evt| {
+                                let email = evt.value();
+                                let picked = IDENTITIES
+                                    .peek()
+                                    .iter()
+                                    .find(|i| i.email == email)
+                                    .map(|i| Address {
+                                        name: (!i.name.is_empty()).then(|| i.name.clone()),
+                                        email: i.email.clone(),
+                                    });
+
+                                edit(|d| d.from = picked);
+                            },
+                            for i in identities.iter() {
+                                option {
+                                    value: "{i.email}",
+                                    selected: i.email.eq_ignore_ascii_case(&selected),
+                                    {format!("{} <{}>", i.name, i.email)}
+                                }
+                            }
+                        }
+                    }
                 }
                 div { class: "field",
                     label { "To:" }

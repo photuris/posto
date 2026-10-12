@@ -1,10 +1,14 @@
 //! Deterministic sample data for tests and the GUI's UI test mode.
 
 use crate::error::Result;
+use crate::jmap::Identity;
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 
 /// Address of the fixture account owner.
 const ME: &str = "me@example.com";
+
+/// Address of the fixture account's second identity.
+const SHOP: &str = "shop@example.com";
 
 /// Mailboxes: id, name, role, sort order.
 const MAILBOXES: [(&str, &str, Option<&str>, i64); 9] = [
@@ -251,6 +255,22 @@ pub fn seed(store: &Store) -> Result<()> {
         name: None,
         email: ME.into(),
     };
+    let alias = Address {
+        name: None,
+        email: SHOP.into(),
+    };
+    store.set_identities(&[
+        Identity {
+            id: "id-1".into(),
+            name: "Mikkel Malmberg".into(),
+            email: ME.into(),
+        },
+        Identity {
+            id: "id-2".into(),
+            name: "Mikkel (shop)".into(),
+            email: SHOP.into(),
+        },
+    ])?;
     let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
 
     for fx in &EMAILS {
@@ -282,7 +302,11 @@ pub fn seed(store: &Store) -> Result<()> {
             thread_id: format!("th-{num}"),
             received_at: fx.at.into(),
             from: vec![from],
-            to: vec![me.clone()],
+            to: vec![if fx.id == "fx-05" {
+                alias.clone()
+            } else {
+                me.clone()
+            }],
             cc: vec![],
             subject: fx.subject.into(),
             preview: fx.preview.into(),
@@ -324,6 +348,7 @@ mod tests {
         seed(&store).unwrap();
 
         assert_eq!(store.mailboxes().unwrap().len(), 9);
+        assert_eq!(store.identities().unwrap().len(), 2);
         assert_eq!(store.list_emails(&ListQuery::default()).unwrap().len(), 14);
         assert_eq!(
             store.mailbox_by_role("inbox").unwrap().unwrap().id,

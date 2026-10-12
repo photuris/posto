@@ -204,6 +204,7 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 .field { display: flex; align-items: center; gap: 10px; padding: 4px 18px; border-bottom: 1px solid var(--border); }
 .field label { width: 64px; text-align: right; color: var(--posto-muted); }
 .field input { flex: 1; border: none; background: transparent; }
+.field select { flex: 1; }
 .field .static { padding: 4px 8px; }
 .composer-body { flex: 1; min-height: 0; display: flex; }
 .composer-body textarea {

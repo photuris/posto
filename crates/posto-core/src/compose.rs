@@ -7,7 +7,7 @@ use crate::actions::{self, Action};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::html;
-use crate::jmap::Client;
+use crate::jmap::{Client, Identity};
 use crate::store::{Address, EmailBody, EmailSummary, Store};
 
 /// A message being composed.
@@ -24,6 +24,10 @@ pub struct Draft {
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     pub reply_to_email_id: Option<String>,
+    /// Sender; must be one of the account's identities. `None` means the
+    /// configured account address.
+    #[serde(default)]
+    pub from: Option<Address>,
 }
 
 /// Parses `"Name <a@b>, c@d"`. Parts are separated by `,` or `;` outside
@@ -71,8 +75,34 @@ fn parse_address(part: &str) -> Option<Address> {
     })
 }
 
-/// Builds a reply to `summary`. `me` is the sender's own address.
-pub fn reply(summary: &EmailSummary, body: &EmailBody, me: &str, reply_all: bool) -> Draft {
+/// The identity a reply to `summary` should come from: the first one the
+/// original was addressed to, then one it was copied to, then the one
+/// matching `me`.
+pub fn pick_identity(identities: &[Identity], summary: &EmailSummary, me: &str) -> Option<Address> {
+    let addressed = |list: &[Address]| {
+        identities
+            .iter()
+            .find(|i| list.iter().any(|a| a.email.eq_ignore_ascii_case(&i.email)))
+    };
+
+    addressed(&summary.to)
+        .or_else(|| addressed(&summary.cc))
+        .or_else(|| identities.iter().find(|i| i.email.eq_ignore_ascii_case(me)))
+        .map(|i| Address {
+            name: (!i.name.is_empty()).then(|| i.name.clone()),
+            email: i.email.clone(),
+        })
+}
+
+/// Builds a reply to `summary`. `me` is the sender's own address;
+/// `identities` are the account's sending identities.
+pub fn reply(
+    summary: &EmailSummary,
+    body: &EmailBody,
+    me: &str,
+    reply_all: bool,
+    identities: &[Identity],
+) -> Draft {
     let is_me = |a: &Address| a.email.eq_ignore_ascii_case(me);
 
     // Own sent mail only when every author is me; a co-author stays a recipient.
@@ -116,6 +146,7 @@ pub fn reply(summary: &EmailSummary, body: &EmailBody, me: &str, reply_all: bool
         in_reply_to: body.message_id.first().cloned(),
         references,
         reply_to_email_id: Some(summary.id.clone()),
+        from: pick_identity(identities, summary, me),
     }
 }
 
@@ -196,11 +227,17 @@ fn find<'a>(rs: &'a [Response], name: &str, id: &str) -> Option<(usize, &'a Valu
 /// [`Error::Other`]; callers must not resend then.
 pub async fn send(cfg: &Config, store: &Store, client: &Client, draft: &Draft) -> Result<String> {
     let identities = client.identities().await?;
-    let identity = identities
-        .iter()
-        .find(|i| i.email.eq_ignore_ascii_case(&cfg.account.email))
-        .or(identities.first())
-        .ok_or_else(|| Error::NotConfigured("no sending identity".into()))?;
+    let identity = match &draft.from {
+        Some(from) => identities
+            .iter()
+            .find(|i| i.email.eq_ignore_ascii_case(&from.email))
+            .ok_or_else(|| Error::NotConfigured(format!("no identity for {}", from.email)))?,
+        None => identities
+            .iter()
+            .find(|i| i.email.eq_ignore_ascii_case(&cfg.account.email))
+            .or(identities.first())
+            .ok_or_else(|| Error::NotConfigured("no sending identity".into()))?,
+    };
     let drafts = store
         .mailbox_by_role("drafts")?
         .ok_or_else(|| Error::NotFound("drafts mailbox".into()))?;
@@ -388,6 +425,30 @@ mod tests {
     }
 
     #[test]
+    fn pick_identity_prefers_to_then_cc_then_me() {
+        let ids = [("i1", "me@x.io"), ("i2", "shop@x.io")].map(|(id, email)| Identity {
+            id: id.into(),
+            name: String::new(),
+            email: email.into(),
+        });
+        let pick =
+            |s: &EmailSummary, ids: &[Identity]| pick_identity(ids, s, "me@x.io").map(|a| a.email);
+        let from = addr(None, "bob@y.io");
+        let other = addr(None, "other@y.io");
+        let shop = addr(None, "SHOP@x.io");
+
+        let s = summary(from.clone(), vec![shop.clone()], vec![]);
+        assert_eq!(pick(&s, &ids).as_deref(), Some("shop@x.io"));
+
+        let s = summary(from.clone(), vec![other.clone()], vec![shop]);
+        assert_eq!(pick(&s, &ids).as_deref(), Some("shop@x.io"));
+
+        let s = summary(from, vec![other], vec![]);
+        assert_eq!(pick(&s, &ids).as_deref(), Some("me@x.io"));
+        assert_eq!(pick(&s, &[]), None);
+    }
+
+    #[test]
     fn parse_addresses_mixed() {
         let got = parse_addresses("Ann <ann@x.io>, bob@y.io; bad, \"C, D\" <cd@z.io>");
         assert_eq!(
@@ -405,7 +466,7 @@ mod tests {
     fn reply_quotes_and_addresses() {
         let from = addr(Some("Bob"), "bob@y.io");
         let s = summary(from.clone(), vec![addr(None, "me@x.io")], vec![]);
-        let d = reply(&s, &body("hello\nworld"), "me@x.io", false);
+        let d = reply(&s, &body("hello\nworld"), "me@x.io", false, &[]);
 
         assert_eq!(d.subject, "Re: Lunch");
         assert_eq!(d.to, vec![from]);
@@ -425,14 +486,14 @@ mod tests {
         let mut again = s.clone();
         again.subject = "RE: Lunch".into();
         assert_eq!(
-            reply(&again, &body("x"), "me@x.io", false).subject,
+            reply(&again, &body("x"), "me@x.io", false, &[]).subject,
             "RE: Lunch"
         );
 
         // Replying to my own mail goes to the original recipients.
         let mine = summary(addr(None, "ME@x.io"), vec![addr(None, "bob@y.io")], vec![]);
         assert_eq!(
-            reply(&mine, &body("x"), "me@x.io", false).to,
+            reply(&mine, &body("x"), "me@x.io", false, &[]).to,
             vec![addr(None, "bob@y.io")]
         );
     }
@@ -446,14 +507,14 @@ mod tests {
         );
         s.from.push(addr(None, "bob@x.io"));
 
-        let d = reply(&s, &body("x"), "me@x.io", false);
+        let d = reply(&s, &body("x"), "me@x.io", false, &[]);
 
         assert_eq!(d.to, s.from, "a co-author must stay a recipient");
 
         s.from = vec![addr(None, "me@x.io"), addr(None, "ME@x.io")];
 
         assert_eq!(
-            reply(&s, &body("x"), "me@x.io", false).to,
+            reply(&s, &body("x"), "me@x.io", false, &[]).to,
             s.to,
             "all authors are me: reply to the recipients"
         );
@@ -473,7 +534,7 @@ mod tests {
                 addr(None, "bob@y.io"),
             ],
         );
-        let d = reply(&s, &body("x"), "me@x.io", true);
+        let d = reply(&s, &body("x"), "me@x.io", true, &[]);
         assert_eq!(d.to, vec![addr(None, "bob@y.io")]);
         assert_eq!(d.cc, vec![carol, dave]);
     }

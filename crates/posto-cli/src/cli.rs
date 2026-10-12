@@ -89,13 +89,17 @@ pub enum AccountCmd {
     ///
     /// Output: {"email": string, "session_url": string, "has_token": bool, "refresh_minutes": number}
     Show,
+    /// List the cached sending identities (filled by `sync run`).
+    ///
+    /// Output: [{"id": string, "name": string, "email": string}]
+    Identities,
 }
 
 #[derive(Subcommand)]
 pub enum SyncCmd {
     /// Sync mailboxes and emails from the server.
     ///
-    /// Output: {"mailboxes": number, "emails_added": number, "emails_updated": number, "emails_removed": number, "initial": bool}
+    /// Output: {"mailboxes": number, "emails_added": number, "emails_updated": number, "emails_removed": number, "initial": bool, "identities": number}
     Run,
 }
 
@@ -207,6 +211,9 @@ pub enum EmailCmd {
         /// Reply to everyone.
         #[arg(long)]
         all: bool,
+        /// Send from this identity address instead of the one the original was sent to.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Send a new email.
     ///
@@ -230,6 +237,9 @@ pub enum EmailCmd {
         /// Treat the body as Markdown.
         #[arg(long)]
         markdown: bool,
+        /// Send from this identity address (default: the account address).
+        #[arg(long)]
+        from: Option<String>,
     },
 }
 

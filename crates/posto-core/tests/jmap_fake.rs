@@ -257,6 +257,89 @@ async fn initial_sync_fills_store() -> Result<()> {
     Ok(())
 }
 
+/// Mounts an account with one mailbox and no emails, for a full sync.
+async fn mount_empty_account(server: &MockServer) {
+    reply(
+        server,
+        "Mailbox/get",
+        json!({ "ids": null }),
+        json!({ "state": "m1", "list": [mailbox_json("mb-inbox", "Inbox", Some("inbox"))] }),
+        1,
+    )
+    .await;
+    reply(
+        server,
+        "Email/get",
+        json!({ "ids": [] }),
+        json!({ "state": "s0", "list": [] }),
+        1,
+    )
+    .await;
+    reply(
+        server,
+        "Email/query",
+        json!({ "position": 0, "limit": 100 }),
+        json!({ "queryState": "q1", "ids": [] }),
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn initial_sync_stores_identities() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+    let dir = tempfile::tempdir()?;
+
+    mount_empty_account(&server).await;
+    reply(
+        &server,
+        "Identity/get",
+        json!({ "ids": null }),
+        json!({ "list": [
+            { "id": "id-1", "name": "Me", "email": "me@example.com" },
+            { "id": "id-2", "name": "Shop", "email": "shop@example.com" },
+        ] }),
+        1,
+    )
+    .await;
+
+    let report = sync_with_lock(
+        &dir.path().join("sync.lock"),
+        &Config::default(),
+        &store,
+        &c,
+    )
+    .await?;
+    let stored = store.identities()?;
+
+    assert_eq!(report.identities, 2);
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[1].email, "shop@example.com");
+
+    // A failing Identity/get must not fail the sync.
+    let server = self::server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    mount_empty_account(&server).await;
+    reply_error(&server, "Identity/get", json!({ "ids": null }), "forbidden").await;
+
+    let report = sync_with_lock(
+        &dir.path().join("sync.lock"),
+        &Config::default(),
+        &store,
+        &c,
+    )
+    .await?;
+
+    assert_eq!(report.identities, 0);
+    assert!(store.identities()?.is_empty());
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn delta_sync_applies_changes() -> Result<()> {
     let server = server().await;

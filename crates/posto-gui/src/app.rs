@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use dioxus::prelude::*;
 use posto_core::config::UiConfig;
-use posto_core::jmap::Client;
+use posto_core::jmap::{Client, Identity};
 use posto_core::shortcuts::{Action, Keymap};
 use posto_core::store::{Attachment, EmailBody, EmailSummary, ListQuery, Mailbox};
 use posto_core::theme::{self, Theme, Watcher};
@@ -28,6 +28,8 @@ const TOAST: Duration = Duration::from_secs(6);
 
 pub static SELECTED_MAILBOX: GlobalSignal<Option<String>> = Signal::global(|| None);
 pub static MAILBOXES: GlobalSignal<Vec<Mailbox>> = Signal::global(Vec::new);
+/// The account's sending identities, as last synced.
+pub static IDENTITIES: GlobalSignal<Vec<Identity>> = Signal::global(Vec::new);
 pub static EMAILS: GlobalSignal<Vec<EmailSummary>> = Signal::global(Vec::new);
 /// The selected messages; the focused one is shown in the reader.
 pub static SELECTION: GlobalSignal<Selection> = Signal::global(Selection::default);
@@ -263,6 +265,7 @@ pub fn App() -> Element {
 
     use_future(|| async {
         reload_mailboxes();
+        reload_identities();
         reload_list().await;
         focus_root();
         refresh_loop().await;
@@ -696,6 +699,14 @@ fn refresh_row(id: &str) {
     }
 }
 
+/// Re-reads the cached sending identities.
+pub fn reload_identities() {
+    match backend().peek().store.identities() {
+        Ok(list) => *IDENTITIES.write() = list,
+        Err(e) => fail("Could not read identities", e),
+    }
+}
+
 /// Re-reads the mailbox list (and server counts); selects the inbox the first time.
 pub fn reload_mailboxes() {
     match backend().peek().store.mailboxes() {
@@ -881,7 +892,13 @@ async fn start_reply(all: bool) {
         },
     };
 
-    open_composer(compose::reply(&summary, &body, &b.cfg.account.email, all));
+    open_composer(compose::reply(
+        &summary,
+        &body,
+        &b.cfg.account.email,
+        all,
+        &IDENTITIES.peek(),
+    ));
 }
 
 /// Opens the composer on `draft`.
@@ -1015,6 +1032,7 @@ pub async fn run_sync(manual: bool) {
     match result {
         Ok(report) => {
             reload_mailboxes();
+            reload_identities();
             reload_list().await;
 
             if manual || report.emails_added > 0 {

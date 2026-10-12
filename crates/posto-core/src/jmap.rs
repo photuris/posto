@@ -2,7 +2,7 @@
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Response, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -43,7 +43,7 @@ pub struct Session {
 }
 
 /// A sending identity.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Identity {
     /// Server-assigned id.
     pub id: String,

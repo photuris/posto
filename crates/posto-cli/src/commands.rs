@@ -73,6 +73,10 @@ pub fn account_show() -> Result<Value> {
     }))
 }
 
+pub fn account_identities() -> Result<Value> {
+    to_json(&open_store()?.identities()?)
+}
+
 pub fn account_set_token() -> Result<Value> {
     let mut token = String::new();
 
@@ -167,17 +171,42 @@ pub async fn email_move(mailbox: &str, ids: Vec<String>) -> Result<Value> {
     email_act(ids, Action::Move { mailbox_id }, "move").await
 }
 
-pub async fn email_reply(id: &str, body_file: &Path, markdown: bool, all: bool) -> Result<Value> {
+/// Parses a `--from` value; an invalid address is an error, never ignored.
+fn parse_from(from: Option<String>) -> Result<Option<posto_core::store::Address>> {
+    let Some(from) = from else {
+        return Ok(None);
+    };
+
+    compose::parse_addresses(&from)
+        .into_iter()
+        .next()
+        .map(Some)
+        .ok_or_else(|| Error::Other(format!("invalid --from address {from}")))
+}
+
+pub async fn email_reply(
+    id: &str,
+    body_file: &Path,
+    markdown: bool,
+    all: bool,
+    from: Option<String>,
+) -> Result<Value> {
+    let from = parse_from(from)?;
     let cfg = Config::load()?;
     let store = open_store()?;
     let summary = find_email(&store, id)?;
     let text = std::fs::read_to_string(body_file)?;
     let client = client().await?;
     let body = fetch_body(&store, Some(&client), id).await?;
-    let mut draft = compose::reply(&summary, &body, &cfg.account.email, all);
+    let identities = store.identities()?;
+    let mut draft = compose::reply(&summary, &body, &cfg.account.email, all, &identities);
 
     draft.body = text + &draft.body;
     draft.markdown = markdown;
+
+    if from.is_some() {
+        draft.from = from;
+    }
 
     Ok(json!({ "id": compose::send(&cfg, &store, &client, &draft).await? }))
 }
@@ -189,8 +218,10 @@ pub async fn email_send(
     subject: String,
     body_file: &Path,
     markdown: bool,
+    from: Option<String>,
 ) -> Result<Value> {
     let draft = Draft {
+        from: parse_from(from)?,
         to: compose::parse_addresses(&to.join(",")),
         cc: compose::parse_addresses(&cc.join(",")),
         bcc: compose::parse_addresses(&bcc.join(",")),

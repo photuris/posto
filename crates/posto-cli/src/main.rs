@@ -46,6 +46,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
         Noun::Account(AccountCmd::SetToken { .. }) => c::account_set_token(),
         Noun::Account(AccountCmd::Set { email, session_url }) => c::account_set(email, session_url),
         Noun::Account(AccountCmd::Show) => c::account_show(),
+        Noun::Account(AccountCmd::Identities) => c::account_identities(),
         Noun::Sync(SyncCmd::Run) => c::sync_run().await,
         Noun::Mailbox(MailboxCmd::List) => c::mailbox_list(),
         Noun::Email(cmd) => match cmd {
@@ -70,7 +71,8 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
                 body_file,
                 markdown,
                 all,
-            } => c::email_reply(&id, &body_file, markdown, all).await,
+                from,
+            } => c::email_reply(&id, &body_file, markdown, all, from).await,
             EmailCmd::Send {
                 to,
                 cc,
@@ -78,7 +80,8 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
                 subject,
                 body_file,
                 markdown,
-            } => c::email_send(to, cc, bcc, subject, &body_file, markdown).await,
+                from,
+            } => c::email_send(to, cc, bcc, subject, &body_file, markdown, from).await,
         },
         Noun::Attachment(AttachmentCmd::Save {
             email_id,

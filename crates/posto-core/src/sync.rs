@@ -45,6 +45,8 @@ pub struct SyncReport {
     pub emails_removed: usize,
     /// True when this was a full (first or recovery) sync.
     pub initial: bool,
+    /// Sending identities cached afterwards.
+    pub identities: usize,
 }
 
 /// Syncs under `data_dir()/sync.lock`.
@@ -107,6 +109,14 @@ pub async fn sync_with_lock(
     }
 
     report.mailboxes = store.mailboxes()?.len();
+
+    match client.identities().await {
+        Ok(identities) => {
+            store.set_identities(&identities)?;
+            report.identities = identities.len();
+        }
+        Err(e) => tracing::warn!("identity sync failed: {e}"),
+    }
 
     Ok(report)
 }

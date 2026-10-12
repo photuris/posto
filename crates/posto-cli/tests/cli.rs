@@ -211,6 +211,43 @@ fn sync_without_token_exits_3() {
 }
 
 #[test]
+fn account_identities_and_send_from_flag() {
+    let sb = Sandbox::seeded();
+    let ids = sb.json(&["account", "identities"]);
+    let ids = ids.as_array().unwrap();
+
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().any(|i| i["email"] == "shop@example.com"));
+
+    let body = sb.0.join("body.txt");
+
+    std::fs::write(&body, "hi").unwrap();
+
+    let out = sb.run_with(
+        &[
+            "email",
+            "send",
+            "--from",
+            "nobody@example.com",
+            "--to",
+            "a@b.c",
+            "--subject",
+            "s",
+            "--body-file",
+            body.to_str().unwrap(),
+        ],
+        None,
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn usage_error_exits_2() {
     let out = Sandbox::new().run_with(&["email"], None);
 

@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::jmap::Identity;
 
 /// Database schema; every statement is idempotent.
 const SCHEMA: &str = "
@@ -354,6 +355,30 @@ impl Store {
         )?;
 
         Ok(())
+    }
+
+    /// Replaces the cached sending identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn set_identities(&self, identities: &[Identity]) -> Result<()> {
+        let json = serde_json::to_string(identities).map_err(|e| Error::Other(e.to_string()))?;
+
+        self.set_state("identities", &json)
+    }
+
+    /// The cached sending identities; empty before the first sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure or when the cache is corrupt.
+    pub fn identities(&self) -> Result<Vec<Identity>> {
+        match self.state("identities")? {
+            Some(json) => serde_json::from_str(&json)
+                .map_err(|_| Error::Other("corrupt identity cache".into())),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Inserts or updates mailboxes.
