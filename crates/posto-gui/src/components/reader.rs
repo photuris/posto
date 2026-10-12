@@ -57,6 +57,11 @@ pub fn Reader() -> Element {
                         }
                         button {
                             onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Classify),
+                            "Classify as…"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
                             onclick: |_| mark_selected(actions::Action::MarkRead),
                             "Mark read"
                         }
@@ -183,6 +188,14 @@ pub fn Reader() -> Element {
                             title: "Reader Mode",
                             Icon { name: "book-open" }
                             " Reader Mode"
+                        }
+                        button {
+                            class: "link",
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Classify),
+                            title: "File this message under a classifier tray",
+                            Icon { name: "flag" }
+                            " Classify as…"
                         }
                     }
                 }

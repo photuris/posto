@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dioxus::prelude::*;
+use posto_core::classify::{Classification, Classifier, Tray};
 use posto_core::config::{Config, Secrets};
 use posto_core::jmap::Client;
 use posto_core::store::{EmailSummary, MsgRef, Store};
@@ -21,6 +22,43 @@ pub enum Folder {
         /// Server mailbox id.
         id: String,
     },
+    /// The classifier's unsure, uncorrected messages of one account.
+    Unsure {
+        /// Local account slug.
+        account_id: String,
+    },
+}
+
+/// Stands in for Jev in UI test mode, so no key and no network are needed: a
+/// subject with a question mark needs a reply, anything else is an update.
+/// Never unsure.
+pub struct FakeJev;
+
+impl Classifier for FakeJev {
+    async fn classify(&self, state: &str) -> Result<Classification> {
+        let asks = state
+            .lines()
+            .find_map(|l| l.strip_prefix("Subject:"))
+            .is_some_and(|subject| subject.contains('?'));
+        let tray = if asks {
+            Tray::NeedsReply
+        } else {
+            Tray::Updates
+        };
+
+        Ok(Classification {
+            tray,
+            probs: Tray::ALL
+                .iter()
+                .map(|t| (t.as_str().to_string(), if *t == tray { 0.9 } else { 0.025 }))
+                .collect(),
+            urgency: if asks { 3 } else { 1 },
+            personal: if asks { 0.8 } else { 0.1 },
+            unsure: false,
+            model: "fake-jev".into(),
+            input_tokens: 0,
+        })
+    }
 }
 
 /// Store, server connections and settings, shared through a `Signal<Backend>` context.
@@ -318,6 +356,33 @@ mod tests {
 
         assert!(connected.is_err(), "stale client was returned");
         assert!(backend.peek().clients.is_empty(), "stale client was cached");
+    }
+
+    #[tokio::test]
+    async fn fake_jev_is_deterministic() {
+        use posto_core::classify::state::{StateInput, state_block};
+
+        let ask = |subject: &str| {
+            state_block(&StateInput {
+                from_name: "Ann",
+                from_email: "ann@example.com",
+                subject,
+                received_at: "2026-10-12T10:00:00Z",
+                has_unsubscribe: false,
+                replied: false,
+                body: "Hello? Is this an unrelated question mark in the body?",
+            })
+        };
+        let lunch = FakeJev.classify(&ask("Lunch Thursday?")).await.unwrap();
+        let invoice = FakeJev.classify(&ask("Your invoice")).await.unwrap();
+
+        assert_eq!(lunch.tray, Tray::NeedsReply);
+        assert_eq!(invoice.tray, Tray::Updates);
+        assert!(!lunch.unsure && !invoice.unsure);
+        assert_eq!(
+            lunch,
+            FakeJev.classify(&ask("Lunch Thursday?")).await.unwrap()
+        );
     }
 
     #[test]

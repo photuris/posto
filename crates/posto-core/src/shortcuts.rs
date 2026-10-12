@@ -31,6 +31,8 @@ pub enum Action {
     ExtendNext,
     ExtendPrev,
     SelectAll,
+    /// Files the selection under a classifier tray chosen by the user.
+    Classify,
     /// Deletes the selection without asking; what the Delete confirmation runs.
     DeleteConfirmed,
 }
@@ -100,6 +102,7 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::ExtendNext, "shift+j"),
     (Action::ExtendPrev, "shift+k"),
     (Action::SelectAll, "ctrl+a"),
+    (Action::Classify, "t"),
     (Action::DeleteConfirmed, "ctrl+shift+delete"),
 ];
 
@@ -232,6 +235,7 @@ mod tests {
             Action::ExtendNext,
             Action::ExtendPrev,
             Action::SelectAll,
+            Action::Classify,
             Action::DeleteConfirmed,
         ];
         for action in all {
@@ -256,6 +260,7 @@ mod tests {
                 | Action::ExtendNext
                 | Action::ExtendPrev
                 | Action::SelectAll
+                | Action::Classify
                 | Action::DeleteConfirmed => {}
             }
             assert!(map.chord_for(action).is_some(), "{action:?} unbound");
@@ -269,6 +274,7 @@ mod tests {
         assert_eq!(map.lookup(&chord("#")), Some(Action::Delete));
         assert_eq!(map.lookup(&chord("delete")), Some(Action::Delete));
         assert_eq!(map.lookup(&chord("backspace")), Some(Action::Back));
+        assert_eq!(map.lookup(&chord("t")), Some(Action::Classify));
     }
 
     #[test]

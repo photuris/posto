@@ -1,0 +1,358 @@
+//! Classification page: the Jev switch and key, tuning, tray mailboxes,
+//! keep-in-inbox and the per-account opt-in.
+
+use dioxus::prelude::*;
+use posto_core::classify::Tray;
+use posto_core::config::{ClassifyConfig, Config, Secrets};
+
+use crate::app::{backend, set_status};
+use crate::components::{focus_in, focus_out};
+
+/// The trays with a mailbox of their own; spam always goes to Junk.
+const FILED: [Tray; 4] = [
+    Tray::NeedsReply,
+    Tray::Updates,
+    Tray::Promotional,
+    Tray::Social,
+];
+
+/// What is wrong with the classifier settings, if anything.
+pub fn problems(c: &ClassifyConfig) -> Option<String> {
+    if c.model.trim().is_empty() {
+        return Some("Enter the Jev model name.".into());
+    }
+
+    if !(0.0..=1.0).contains(&c.unsure_margin) {
+        return Some("The unsure margin must be between 0 and 1.".into());
+    }
+
+    if !(1..=5).contains(&c.flag_urgency_at) {
+        return Some("The flag threshold must be between 1 and 5.".into());
+    }
+
+    let names: Vec<String> = FILED
+        .iter()
+        .map(|t| {
+            c.trays
+                .get(t.as_str())
+                .map(|n| n.trim().to_lowercase())
+                .unwrap_or_default()
+        })
+        .collect();
+    let unsure = c.unsure_mailbox.trim().to_lowercase();
+
+    for (i, name) in names.iter().enumerate() {
+        if name.is_empty() {
+            return Some("Every tray needs a mailbox name.".into());
+        }
+
+        if *name == "inbox" || *name == unsure {
+            return Some(format!(
+                "{:?} cannot be a tray mailbox.",
+                c.trays[FILED[i].as_str()].trim()
+            ));
+        }
+
+        if names[..i].contains(name) {
+            return Some(format!(
+                "Two trays use the mailbox {:?}.",
+                c.trays[FILED[i].as_str()].trim()
+            ));
+        }
+    }
+
+    None
+}
+
+/// Strips stray spaces from the names the user typed.
+pub fn tidy(c: &mut ClassifyConfig) {
+    c.model = c.model.trim().to_string();
+    c.unsure_mailbox = c.unsure_mailbox.trim().to_string();
+
+    for name in c.trays.values_mut() {
+        *name = name.trim().to_string();
+    }
+}
+
+/// The next opt-in state when an account's checkbox is clicked: follow the
+/// global switch, then on, then off, then back.
+fn cycle(state: Option<bool>) -> Option<bool> {
+    match state {
+        None => Some(true),
+        Some(true) => Some(false),
+        Some(false) => None,
+    }
+}
+
+#[component]
+pub fn ClassificationPage(mut draft: Signal<Config>) -> Element {
+    let ui_test = backend().peek().ui_test;
+    let mut key_open = use_signal(|| false);
+    let mut key_value = use_signal(String::new);
+    let mut key_rev = use_signal(|| 0u32);
+    let mut key_error = use_signal(|| None::<String>);
+    let mut margin_text = use_signal(|| draft.peek().classify.unsure_margin.to_string());
+
+    // Re-read the key state after a save.
+    let _ = key_rev();
+
+    let cfg = draft();
+    let c = &cfg.classify;
+    let key_set = !ui_test && Secrets::typesafe_key().ok().flatten().is_some();
+    let error = problems(c);
+
+    rsx! {
+        h3 { "Jev" }
+        div { class: "setting-row",
+            label { "Classify new mail" }
+            input {
+                r#type: "checkbox",
+                checked: c.enabled,
+                onchange: move |evt| draft.write().classify.enabled = evt.checked(),
+            }
+            span { class: "muted", "After each sync, for the accounts switched on below." }
+        }
+        div { class: "setting-row",
+            span { "TypeSafe API key" }
+            span { class: "muted",
+                if ui_test {
+                    "Not needed (UI test mode)"
+                } else if key_set {
+                    "Key configured"
+                } else {
+                    "No key configured"
+                }
+            }
+            button { onclick: move |_| key_open.set(!key_open()), "Set Key…" }
+        }
+        if key_open() {
+            div { class: "setting-row",
+                input {
+                    r#type: "password",
+                    placeholder: "Paste API key",
+                    value: "{key_value}",
+                    onmounted: |evt| async move {
+                        let _ = evt.set_focus(true).await;
+                    },
+                    onfocusin: focus_in,
+                    onfocusout: focus_out,
+                    oninput: move |evt| key_value.set(evt.value()),
+                }
+                button {
+                    onclick: move |_| {
+                        let key = key_value().trim().to_string();
+
+                        if key.is_empty() {
+                            return key_error.set(Some("Enter a key first".into()));
+                        }
+
+                        if backend().peek().ui_test {
+                            set_status("UI test mode: the key is not stored.");
+                            key_open.set(false);
+                            return;
+                        }
+
+                        match Secrets::set_typesafe_key(&key) {
+                            Ok(()) => {
+                                key_rev += 1;
+                                key_error.set(None);
+                                key_open.set(false);
+                                key_value.set(String::new());
+                            }
+                            Err(e) => key_error.set(Some(e.to_string())),
+                        }
+                    },
+                    "Save"
+                }
+            }
+        }
+        if let Some(e) = key_error() {
+            div { class: "error", "{e}" }
+        }
+        div { class: "hint",
+            "Stored in secrets.toml in the Posto data folder (mode 0600); TYPESAFE_API_KEY overrides it."
+        }
+        div { class: "setting-row",
+            label { "Model" }
+            input {
+                r#type: "text",
+                value: "{c.model}",
+                onfocusin: focus_in,
+                onfocusout: focus_out,
+                oninput: move |evt| draft.write().classify.model = evt.value(),
+            }
+        }
+        div { class: "setting-row",
+            label { "Unsure margin" }
+            input {
+                class: "number",
+                r#type: "text",
+                value: "{margin_text}",
+                onfocusin: focus_in,
+                onfocusout: focus_out,
+                oninput: move |evt| {
+                    margin_text.set(evt.value());
+
+                    if let Ok(v) = evt.value().trim().parse::<f64>() {
+                        draft.write().classify.unsure_margin = v;
+                    }
+                },
+            }
+            span { class: "muted", "0 to 1" }
+        }
+        div { class: "hint",
+            "When Jev's two best trays are closer than this, the message stays in the inbox and is marked Unsure."
+        }
+        div { class: "setting-row",
+            label { "Flag urgent replies at" }
+            input {
+                class: "number",
+                r#type: "number",
+                min: "1",
+                max: "5",
+                value: "{c.flag_urgency_at}",
+                onfocusin: focus_in,
+                onfocusout: focus_out,
+                oninput: move |evt| {
+                    if let Ok(n) = evt.value().trim().parse::<u8>() {
+                        draft.write().classify.flag_urgency_at = n;
+                    }
+                },
+            }
+            span { class: "muted", "urgency 1 to 5" }
+        }
+
+        h3 { "Trays" }
+        for tray in FILED {
+            div { key: "{tray}", class: "setting-row tray",
+                label { {tray_title(tray)} }
+                input {
+                    r#type: "text",
+                    value: "{c.trays.get(tray.as_str()).cloned().unwrap_or_default()}",
+                    onfocusin: focus_in,
+                    onfocusout: focus_out,
+                    oninput: move |evt| {
+                        draft
+                            .write()
+                            .classify
+                            .trays
+                            .insert(tray.as_str().to_string(), evt.value());
+                    },
+                }
+                label { class: "check",
+                    input {
+                        r#type: "checkbox",
+                        checked: c.keep_in_inbox.iter().any(|k| k == tray.as_str()),
+                        onchange: move |evt| {
+                            let mut d = draft.write();
+                            let keep = &mut d.classify.keep_in_inbox;
+
+                            keep.retain(|k| k != tray.as_str());
+
+                            if evt.checked() {
+                                keep.push(tray.as_str().to_string());
+                            }
+                        },
+                    }
+                    "Keep in inbox"
+                }
+            }
+        }
+        div { class: "setting-row tray",
+            label { "Spam" }
+            span { class: "muted", "Junk (fixed)" }
+        }
+        div { class: "hint",
+            "Each tray is a top-level mailbox, created when first needed. Unsure messages always stay in the inbox."
+        }
+
+        h3 { "Accounts" }
+        for (i , a) in cfg.accounts.iter().enumerate() {
+            {
+                let state = a.classify;
+                let effective = state.unwrap_or(c.enabled);
+
+                rsx! {
+                    div { key: "{i}-{state:?}-{effective}", class: "setting-row",
+                        input {
+                            r#type: "checkbox",
+                            checked: effective,
+                            onchange: move |_| {
+                                if let Some(a) = draft.write().accounts.get_mut(i) {
+                                    a.classify = cycle(a.classify);
+                                }
+                            },
+                        }
+                        label { "{a.display_name()}" }
+                        span { class: "muted",
+                            match state {
+                                None if effective => "follow global (on)",
+                                None => "follow global (off)",
+                                Some(true) => "on",
+                                Some(false) => "off",
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(e) = error {
+            div { class: "error", "{e}" }
+        }
+    }
+}
+
+/// The page's label for a tray.
+fn tray_title(tray: Tray) -> &'static str {
+    match tray {
+        Tray::NeedsReply => "Needs reply",
+        Tray::Updates => "Updates",
+        Tray::Promotional => "Promotional",
+        Tray::Social => "Social",
+        Tray::Spam => "Spam",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_rejects_bad_settings() {
+        let ok = ClassifyConfig::default();
+
+        assert_eq!(problems(&ok), None);
+
+        let mut empty = ok.clone();
+
+        empty.trays.insert("social".into(), "  ".into());
+        assert!(problems(&empty).unwrap().contains("mailbox name"));
+
+        let mut twice = ok.clone();
+
+        twice.trays.insert("social".into(), "UPDATES".into());
+        assert!(problems(&twice).unwrap().contains("Two trays"));
+
+        let mut clash = ok.clone();
+
+        clash.trays.insert("social".into(), "unsure".into());
+        assert!(problems(&clash).unwrap().contains("cannot be"));
+
+        let mut margin = ok.clone();
+
+        margin.unsure_margin = 1.5;
+        assert!(problems(&margin).is_some());
+
+        let mut urgency = ok;
+
+        urgency.flag_urgency_at = 0;
+        assert!(problems(&urgency).is_some());
+    }
+
+    #[test]
+    fn account_toggle_cycles_through_follow_on_off() {
+        assert_eq!(cycle(None), Some(true));
+        assert_eq!(cycle(Some(true)), Some(false));
+        assert_eq!(cycle(Some(false)), None);
+    }
+}

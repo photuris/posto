@@ -6,8 +6,8 @@ mod output;
 
 use clap::Parser;
 use cli::{
-    AccountCmd, AttachmentCmd, Cli, DevCmd, EmailCmd, MailboxCmd, Noun, ShortcutsCmd, SyncCmd,
-    ThemeCmd,
+    AccountCmd, AttachmentCmd, ClassifyCmd, Cli, DevCmd, EmailCmd, MailboxCmd, Noun, ShortcutsCmd,
+    SyncCmd, ThemeCmd,
 };
 use commands as c;
 use posto_core::Result;
@@ -119,6 +119,18 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
             blob_id,
             dir,
         }) => c::attachment_save(account, &email_id, &blob_id, dir).await,
+        Noun::Classify(cmd) => match cmd {
+            ClassifyCmd::Run {
+                limit,
+                backfill,
+                retry_failed,
+                dry_run,
+            } => c::classify_run(account, limit, backfill, retry_failed, dry_run).await,
+            ClassifyCmd::Status => c::classify_status(account),
+            ClassifyCmd::Show { id } => c::classify_show(account, &id),
+            ClassifyCmd::Correct { id, tray } => c::classify_correct(account, &id, &tray).await,
+            ClassifyCmd::Key { .. } => c::classify_key(),
+        },
         Noun::Theme(ThemeCmd::Show) => c::theme_show(),
         Noun::Shortcuts(ShortcutsCmd::List) => c::shortcuts_list(),
         Noun::Dev(DevCmd::Seed) => c::dev_seed(),

@@ -3,7 +3,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use posto_core::store::{EmailBody, EmailSummary, Store};
 use serde_json::{Value, json};
@@ -108,7 +109,7 @@ fn mailbox_list_after_seed() {
     let v = Sandbox::seeded().json(&["mailbox", "list"]);
     let list = v.as_array().unwrap();
 
-    assert_eq!(list.len(), 9);
+    assert_eq!(list.len(), 13);
     assert_eq!(list[0]["role"], "inbox");
     assert_eq!(list[0]["account_id"], "default");
 }
@@ -541,4 +542,123 @@ fn help_has_output_schema() {
     let out = Sandbox::new().run_with(&["email", "show", "--help"], None);
 
     assert!(String::from_utf8(out.stdout).unwrap().contains("Output:"));
+}
+
+/// Enables the classifier for the sandbox's default account, pointing its
+/// session URL at `session_url`.
+fn enable_classifier(sb: &Sandbox, session_url: &str) {
+    std::fs::write(
+        sb.0.join("config.toml"),
+        format!(
+            "[[accounts]]\nid = \"default\"\nemail = \"me@example.com\"\n\
+             session_url = \"{session_url}\"\n\n[classify]\nenabled = true\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn classify_status_and_correct_offline() {
+    let sb = Sandbox::seeded();
+    let status = sb.json(&["classify", "status"]);
+    let account = &status["accounts"][0];
+
+    assert_eq!(account["id"], "default");
+    assert_eq!(account["classified"], 2);
+    assert_eq!(account["unsure"], 1);
+    assert_eq!(account["queued"], 1);
+    assert_eq!(account["failed"], 0);
+    assert_eq!(account["pending_apply"], 0);
+    assert_eq!(account["by_tray"]["promotional"], 1);
+
+    let done = sb.json(&["classify", "correct", "fx-01", "updates"]);
+
+    assert_eq!(done["offline"], true);
+    assert_eq!(
+        sb.json(&["classify", "show", "fx-01"])["corrected_tray"],
+        "updates"
+    );
+
+    let updates = sb
+        .json(&["mailbox", "list"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "Updates")
+        .expect("seed has an Updates mailbox")["id"]
+        .clone();
+    let shown = sb.json(&["email", "show", "fx-01"]);
+
+    assert!(
+        shown["summary"]["mailbox_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&updates),
+        "{shown}"
+    );
+    // Offline, the move waits for the next run.
+    assert_eq!(
+        sb.json(&["classify", "status"])["accounts"][0]["pending_apply"],
+        1
+    );
+
+    let bad = sb.run_with(&["classify", "correct", "fx-01", "nonsense"], None);
+
+    assert_eq!(bad.status.code(), Some(2));
+}
+
+#[test]
+fn classify_run_requires_key() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/session", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let sb = Sandbox::seeded();
+
+    // Counts every connection and hangs up on it, so a command that does
+    // reach the server fails fast instead of waiting for an answer.
+    let counter = hits.clone();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+
+    enable_classifier(&sb, &url);
+    sb.run_with(&["account", "set-token", "--token-stdin"], Some("dummy"));
+
+    let out = sb.run_with(&["classify", "run"], None);
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert_eq!(err["error"], "not configured: typesafe key");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "connected before the key check"
+    );
+}
+
+#[test]
+fn classify_dry_run_writes_nothing() {
+    let sb = Sandbox::seeded();
+
+    enable_classifier(&sb, "http://127.0.0.1:9/session");
+
+    let before = sb.json(&["classify", "status"]);
+    let dry = sb.json(&["classify", "run", "--dry-run", "--backfill", "3"]);
+
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["queued"][0]["email_id"], "fx-11");
+    assert!(
+        dry["queued"][0]["state"]
+            .as_str()
+            .unwrap()
+            .contains("Subject: Q3 VAT")
+    );
+    assert_eq!(dry["backfill"].as_array().unwrap().len(), 3);
+    assert_eq!(sb.json(&["classify", "status"]), before);
+    assert_eq!(before["accounts"][0]["queued"], 1);
+    assert_eq!(before["accounts"][0]["classified"], 2);
 }

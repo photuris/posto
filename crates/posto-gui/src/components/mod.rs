@@ -20,7 +20,11 @@ pub use settings::Settings;
 pub use sidebar::Sidebar;
 pub use toolbar::Toolbar;
 
-use crate::app::{MAILBOXES, SHOW_MOVE_PICKER, TYPING, focus_root, move_selected, selected_refs};
+use crate::app::{
+    MAILBOXES, SHOW_CLASSIFY_PICKER, SHOW_MOVE_PICKER, TYPING, backend, classify_selected,
+    focus_root, move_selected, selected_refs, tray_label,
+};
+use posto_core::classify::Tray;
 
 /// `onfocusin` for inputs: shortcuts are suspended while typing.
 pub fn focus_in(_: FocusEvent) {
@@ -69,31 +73,81 @@ pub fn reader_frame_doc(inner: &str) -> String {
 /// the mailboxes of their account (a move never crosses accounts).
 #[component]
 pub fn MovePicker() -> Element {
+    let account = selected_refs().first().map(|r| r.account_id.clone());
+    let items: Vec<(String, String)> = MAILBOXES()
+        .into_iter()
+        .filter(|m| Some(&m.account_id) == account.as_ref())
+        .map(|m| (m.id, m.name))
+        .collect();
+
+    rsx! {
+        ListPicker {
+            title: "Move to…",
+            placeholder: "Filter mailboxes",
+            items,
+            on_pick: move |id: String| move_selected(id),
+            on_close: |_| *SHOW_MOVE_PICKER.write() = false,
+        }
+    }
+}
+
+/// The five classifier trays, labelled by mailbox name, to file the selected
+/// emails under.
+#[component]
+pub fn ClassifyPicker() -> Element {
+    let cfg = backend().read().cfg.clone();
+    let items: Vec<(String, String)> = Tray::ALL
+        .into_iter()
+        .map(|t| (t.as_str().to_string(), tray_label(&cfg, t)))
+        .collect();
+
+    rsx! {
+        ListPicker {
+            title: "Classify as…",
+            placeholder: "Filter trays",
+            items,
+            on_pick: |key: String| {
+                if let Ok(tray) = key.parse::<Tray>() {
+                    classify_selected(tray);
+                }
+            },
+            on_close: |_| *SHOW_CLASSIFY_PICKER.write() = false,
+        }
+    }
+}
+
+/// A filterable list of `(key, label)` items; Enter or a click picks one.
+#[component]
+fn ListPicker(
+    title: &'static str,
+    placeholder: &'static str,
+    items: Vec<(String, String)>,
+    on_pick: EventHandler<String>,
+    on_close: EventHandler<()>,
+) -> Element {
     let mut query = use_signal(String::new);
     let mut index = use_signal(|| 0usize);
     let needle = query().to_lowercase();
-    let account = selected_refs().first().map(|r| r.account_id.clone());
-    let shown: Vec<_> = MAILBOXES()
+    let shown: Vec<(String, String)> = items
         .into_iter()
-        .filter(|m| Some(&m.account_id) == account.as_ref())
-        .filter(|m| m.name.to_lowercase().contains(&needle))
+        .filter(|(_, label)| label.to_lowercase().contains(&needle))
         .collect();
     let last = shown.len().saturating_sub(1);
     let active = index().min(last);
-    let enter_target = shown.get(active).map(|m| m.id.clone());
+    let enter_target = shown.get(active).map(|(key, _)| key.clone());
 
     rsx! {
         div {
             class: "overlay",
-            onclick: |_| {
-                *SHOW_MOVE_PICKER.write() = false;
+            onclick: move |_| {
+                on_close.call(());
                 focus_root();
             },
             div { class: "picker", onclick: |evt| evt.stop_propagation(),
-                div { class: "picker-title", "Move to…" }
+                div { class: "picker-title", "{title}" }
                 input {
                     r#type: "text",
-                    placeholder: "Filter mailboxes",
+                    placeholder,
                     value: "{query}",
                     onmounted: |evt| async move {
                         let _ = evt.set_focus(true).await;
@@ -108,19 +162,19 @@ pub fn MovePicker() -> Element {
                         Key::ArrowDown => index.set((active + 1).min(last)),
                         Key::ArrowUp => index.set(active.saturating_sub(1)),
                         Key::Enter => {
-                            if let Some(id) = enter_target.clone() {
-                                move_selected(id);
+                            if let Some(key) = enter_target.clone() {
+                                on_pick.call(key);
                             }
                         }
                         _ => {}
                     },
                 }
-                for (i, m) in shown.into_iter().enumerate() {
+                for (i, (key, label)) in shown.into_iter().enumerate() {
                     div {
-                        key: "{m.id}",
+                        key: "{key}",
                         class: if i == active { "picker-row active" } else { "picker-row" },
-                        onclick: move |_| move_selected(m.id.clone()),
-                        "{m.name}"
+                        onclick: move |_| on_pick.call(key.clone()),
+                        "{label}"
                     }
                 }
             }

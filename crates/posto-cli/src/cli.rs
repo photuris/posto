@@ -53,6 +53,11 @@ pub enum Noun {
     /// Output: see each verb's --help.
     #[command(subcommand)]
     Attachment(AttachmentCmd),
+    /// Jev mail classifier: file new mail into trays, review and correct it.
+    ///
+    /// Output: see each verb's --help.
+    #[command(subcommand)]
+    Classify(ClassifyCmd),
     /// Desktop theme.
     ///
     /// Output: see each verb's --help.
@@ -280,6 +285,61 @@ pub enum EmailCmd {
         /// Send from this identity address (default: the account address).
         #[arg(long)]
         from: Option<String>,
+    },
+}
+
+/// The tray names `classify correct` accepts.
+const TRAYS: [&str; 5] = ["needs_reply", "updates", "promotional", "social", "spam"];
+
+#[derive(Subcommand)]
+pub enum ClassifyCmd {
+    /// Classify queued mail. Without `--backfill` it first syncs, then drains the queue of new inbox arrivals; accounts count only where classification is enabled (`[classify] enabled`, or the account's own `classify`).
+    ///
+    /// Needs the TypeSafe key (`classify key --key-stdin` or TYPESAFE_API_KEY), except with `--dry-run`. `--dry-run` is read-only: it syncs nothing, asks Jev nothing and writes nothing; it lists the answers still to apply, the queued emails and, with `--backfill`, the emails that would be queued, each with the state block that would be sent (built from the cached body, assuming no List-Unsubscribe header).
+    ///
+    /// Output: {"sync": [sync report (see `sync run`)]|null, "reset": number, "enqueued": number, "classify": {"classified": number, "moved": number, "flagged": number, "unsure": number, "skipped": number, "errors": [string], "input_tokens": number}} or, with --dry-run, {"dry_run": true, "pending_apply": [{"account_id": string, "email_id": string, "tray": string}], "queued": [{"account_id": string, "email_id": string, "attempts": number, "state": string}], "backfill": [{"account_id": string, "email_id": string, "state": string}]}
+    Run {
+        /// Classify at most this many emails (default: `[classify] max_per_run`).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Instead of syncing, queue the newest N unclassified inbox emails per account and classify them.
+        #[arg(long)]
+        backfill: Option<usize>,
+        /// Give emails that failed three times a fresh start first.
+        #[arg(long)]
+        retry_failed: bool,
+        /// Show what would happen; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Counts per account: classified, unsure, queued, failed (three attempts used), answers not yet applied, per tray, last time.
+    ///
+    /// Output: {"accounts": [{"id": string, "classified": number, "unsure": number, "queued": number, "failed": number, "pending_apply": number, "by_tray": {tray: number}, "last_classified_at": string|null}]}
+    Status,
+    /// Show the classification of one email.
+    ///
+    /// Output: {"account_id": string, "email_id": string, "tray": string, "probs": {tray: number}, "urgency": number, "personal": number, "unsure": bool, "model": string, "input_tokens": number, "classified_at": string, "corrected_tray": string|null, "applied": bool, "apply_error": string|null}
+    Show {
+        /// Email id; an id found in several accounts needs `--account`.
+        id: String,
+    },
+    /// File an email under a tray yourself: moves it per the tray rules and records the correction. Without a token the local copy changes and the move is sent by the next `classify run`.
+    ///
+    /// Output: {"account_id": string, "id": string, "tray": string, "offline": bool}
+    Correct {
+        /// Email id; an id found in several accounts needs `--account`.
+        id: String,
+        /// Tray to file it under.
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(TRAYS))]
+        tray: String,
+    },
+    /// Read the TypeSafe API key from stdin and store it (mode 0600).
+    ///
+    /// Output: {"has_key": true}
+    Key {
+        /// Required: read the key from stdin (the CLI never prompts).
+        #[arg(long, required = true)]
+        key_stdin: bool,
     },
 }
 

@@ -89,11 +89,81 @@ one has it. `posto account list|add|remove|set|set-token|show|identities`
 manage the accounts; `posto sync run` syncs each enabled account and
 reports each outcome (a failing account does not stop the others).
 
+## Classification
+
+Posto can sort new inbox mail with Jev (TypeSafe
+System One). For each new message Jev picks a tray: needs reply, updates,
+promotional, social or spam. Posto then adds the message to the tray's
+mailbox (created at the top level when missing), takes it out of the inbox
+unless the tray is kept there, and flags urgent replies. Spam goes to the
+junk mailbox. When Jev's two best trays are too close to call, the message
+stays in the inbox and also goes into the `Unsure` mailbox. Mail is queued
+at sync time and classified afterwards; the first sync of an account
+queues nothing.
+
+```toml
+# config.toml
+[classify]
+enabled = false            # global switch; an account's `classify` overrides it
+model = "jev-latest"
+unsure_margin = 0.15       # top-two gap below which an answer is unsure
+flag_urgency_at = 4        # needs_reply with urgency >= this gets $flagged
+max_per_run = 50
+body_chars = 2000          # body text sent to Jev
+keep_in_inbox = ["needs_reply", "updates"]
+unsure_mailbox = "Unsure"
+
+[classify.trays]           # tray -> mailbox name; spam always goes to junk
+needs_reply = "Needs reply"
+updates = "Updates"
+promotional = "Promos"
+social = "Social"
+
+[[accounts]]
+id = "fastmail"
+classify = true            # per account: true, false, or absent = follow [classify].enabled
+```
+
+The TypeSafe API key lives in `secrets.toml` (`typesafe_key`; mode 0600).
+`TYPESAFE_API_KEY` in the environment overrides it. Set it in
+Settings > Classification or with
+`printf '%s' "$KEY" | posto classify key --key-stdin`.
+
+**GUI.** After each sync pass the app classifies the queue when at least
+one account has classification on and a key exists; a toast reports
+`Classified N (M unsure)`. Settings > Classification holds the switch, the
+key, the model, the thresholds, the tray mailbox names, keep-in-inbox and
+the per-account opt-in (click cycles follow global, on, off). The message
+list shows a muted chip with the tray's mailbox name and an accent
+`Unsure` chip. The sidebar's `Unsure` entry lists an account's unsure,
+uncorrected messages. `t` (or "Classify as…" in the reader and the bulk
+panel) files the selected messages under a tray by your decision; it moves
+them by the same rules and marks them corrected.
+
+**CLI.**
+
+```sh
+posto classify run                     # sync, then classify the queue
+posto classify run --backfill 100      # queue the newest 100 unclassified inbox messages, classify
+posto classify run --limit 20 --retry-failed
+posto classify run --dry-run --backfill 5   # show the state blocks; changes and sends nothing
+posto classify status                  # per account: classified, unsure, queued, failed, per tray
+posto classify show <id>
+posto classify correct <id> updates    # needs_reply updates promotional social spam
+```
+
+`classify run` needs the key (exit 3 without it) and a switched-on
+account. A message that fails three times stays in the queue as `failed`
+until `--retry-failed`. The classifier holds `classify.lock`, so the app
+and the CLI never classify the same message twice. A correction made
+without a token changes the local copy and reaches the server with the
+next `classify run` or classifying sync.
+
 ## Keyboard shortcuts (defaults)
 
 `j`/`k` next/previous, `Enter` open, `Esc` close, `Backspace` back,
 `e` archive, `#` delete, `!` junk, `r` reply, `a` reply all, `c` compose,
-`u` toggle read, `s` toggle flag, `m` move, `/` search, `g` sync,
+`u` toggle read, `s` toggle flag, `m` move, `t` classify as, `/` search, `g` sync,
 `Ctrl+Enter` send. Override any of them in Settings or in `config.toml`:
 
 ```toml
@@ -106,7 +176,7 @@ delete = "ctrl+d"
 
 `posto <noun> <verb>`; every command's `--help` ends with the JSON shape
 it prints. Nouns: `account`, `sync`, `mailbox`, `email`, `attachment`,
-`theme`, `shortcuts`. `--account <id>` is global. Exit codes: 0 ok, 2 usage, 3 not configured, 4 auth
+`classify`, `theme`, `shortcuts`. `--account <id>` is global. Exit codes: 0 ok, 2 usage, 3 not configured, 4 auth
 rejected, 5 server/transport, 6 not found, 7 sync lock held, 1 other.
 
 ```sh

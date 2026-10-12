@@ -1,16 +1,19 @@
 //! One async function per command. Each returns the JSON value to print.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use posto_core::actions::{self, Action};
 use posto_core::body::{fetch_body, save_attachment};
+use posto_core::classify::{self, JEV_BASE_URL, JevClient, Tray};
 use posto_core::compose::{self, Draft};
 use posto_core::config::{Account, Config, Secrets};
 use posto_core::jmap::Client;
 use posto_core::shortcuts::{self, Keymap};
-use posto_core::store::{EmailBody, EmailSummary, ListQuery, Mailbox, Store};
+use posto_core::store::{
+    CLASSIFY_MAX_ATTEMPTS, EmailBody, EmailSummary, ListQuery, Mailbox, Store,
+};
 use posto_core::{Error, Result, fixtures, html, sync, theme};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -246,15 +249,10 @@ pub fn account_set(
     account_show(Some(&id))
 }
 
-/// Syncs the accounts `--account` selects (default: every enabled one).
-///
-/// One target keeps typed errors (and exit codes); several report each
-/// failure in its own entry.
-pub async fn sync_run(account: Option<&str>) -> Result<Value> {
-    let cfg = Config::load()?;
-    let store = open_store()?;
+/// The accounts `--account` selects (default: every enabled one); none is an error.
+fn targets(cfg: &Config, account: Option<&str>) -> Result<Vec<Account>> {
     let targets: Vec<Account> = match account {
-        Some(_) => vec![pick_account(&cfg, account)?.clone()],
+        Some(_) => vec![pick_account(cfg, account)?.clone()],
         None => cfg.accounts_enabled().cloned().collect(),
     };
 
@@ -262,23 +260,24 @@ pub async fn sync_run(account: Option<&str>) -> Result<Value> {
         return Err(Error::NotConfigured("no enabled account".into()));
     }
 
-    if let [only] = targets.as_slice() {
-        let client = client_for(&cfg, only).await?;
+    Ok(targets)
+}
 
-        return to_json(&[
-            sync::sync_account(&sync::lock_path(), &cfg, &only.id, &store, &client).await?,
-        ]);
-    }
-
+/// Connects every target that has a token. An account that cannot connect is
+/// returned with the reason instead of failing the others.
+async fn connect_clients(
+    cfg: &Config,
+    targets: &[Account],
+) -> Result<(HashMap<String, Arc<Client>>, HashMap<String, String>)> {
     let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
     let mut unreachable: HashMap<String, String> = HashMap::new();
 
-    for a in &targets {
-        if Secrets::token_for(&cfg, &a.id)?.is_none() {
+    for a in targets {
+        if Secrets::token_for(cfg, &a.id)?.is_none() {
             continue;
         }
 
-        match client_for(&cfg, a).await {
+        match client_for(cfg, a).await {
             Ok(client) => {
                 clients.insert(a.id.clone(), Arc::new(client));
             }
@@ -288,6 +287,26 @@ pub async fn sync_run(account: Option<&str>) -> Result<Value> {
         }
     }
 
+    Ok((clients, unreachable))
+}
+
+/// Syncs `targets` and returns the reports with the connections used.
+///
+/// One target keeps typed errors (and exit codes); several report each
+/// failure in its own entry.
+async fn sync_targets(
+    cfg: &Config,
+    store: &Store,
+    targets: &[Account],
+) -> Result<(Vec<sync::SyncReport>, HashMap<String, Arc<Client>>)> {
+    if let [only] = targets {
+        let client = Arc::new(client_for(cfg, only).await?);
+        let report = sync::sync_account(&sync::lock_path(), cfg, &only.id, store, &client).await?;
+
+        return Ok((vec![report], HashMap::from([(only.id.clone(), client)])));
+    }
+
+    let (clients, mut unreachable) = connect_clients(cfg, targets).await?;
     let scoped = Config {
         accounts: targets
             .iter()
@@ -298,7 +317,7 @@ pub async fn sync_run(account: Option<&str>) -> Result<Value> {
             .collect(),
         ..cfg.clone()
     };
-    let mut reports = sync::sync_all(&scoped, &store, &clients).await?;
+    let mut reports = sync::sync_all(&scoped, store, &clients).await?;
 
     for r in &mut reports {
         if let Some(e) = unreachable.remove(&r.account_id) {
@@ -306,7 +325,16 @@ pub async fn sync_run(account: Option<&str>) -> Result<Value> {
         }
     }
 
-    to_json(&reports)
+    Ok((reports, clients))
+}
+
+/// Syncs the accounts `--account` selects (default: every enabled one).
+pub async fn sync_run(account: Option<&str>) -> Result<Value> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let targets = targets(&cfg, account)?;
+
+    to_json(&sync_targets(&cfg, &store, &targets).await?.0)
 }
 
 pub fn mailbox_list(account: Option<&str>) -> Result<Value> {
@@ -549,7 +577,7 @@ pub fn shortcuts_list() -> Result<Value> {
 
     for action in [
         Next, Prev, Open, Back, Archive, Delete, Reply, ReplyAll, Compose, ToggleRead, ToggleFlag,
-        Move, Search, Sync, Junk, Send, Escape,
+        Move, Search, Sync, Junk, Send, Escape, Classify,
     ] {
         let chords = keymap.chords_for(action);
 
@@ -567,6 +595,230 @@ pub fn shortcuts_list() -> Result<Value> {
             .map(|(action, chord)| json!({ "action": action, "chord": chord }))
             .collect(),
     ))
+}
+
+/// State block of a queued or backfill email, built from what is cached (no
+/// network: the body falls back to the preview and the List-Unsubscribe
+/// header is assumed absent).
+fn dry_state(cfg: &Config, store: &Store, account: &str, id: &str) -> Result<String> {
+    let email = store
+        .email(account, id)?
+        .ok_or_else(|| Error::NotFound(format!("email {account}/{id}")))?;
+    let body = store.body(account, id)?.unwrap_or(EmailBody {
+        email_id: id.to_string(),
+        html: None,
+        text: None,
+        attachments: Vec::new(),
+        in_reply_to: Vec::new(),
+        references: Vec::new(),
+        message_id: Vec::new(),
+    });
+    let mut own: Vec<String> = store
+        .identities(account)?
+        .into_iter()
+        .map(|i| i.email)
+        .collect();
+
+    own.extend(cfg.account(account).map(|a| a.email.clone()));
+
+    let replied = store.thread_has_reply_from(account, &email.thread_id, id, &own)?;
+
+    Ok(classify::state::state_for(
+        &email,
+        &body,
+        false,
+        replied,
+        cfg.classify.body_chars as usize,
+    ))
+}
+
+/// What `classify run` would do, from the store alone.
+fn classify_dry_run(
+    cfg: &Config,
+    store: &Store,
+    targets: &[Account],
+    account: Option<&str>,
+    limit: Option<usize>,
+    backfill: Option<usize>,
+) -> Result<Value> {
+    let wanted = |id: &str| targets.iter().any(|a| a.id == id);
+    let eligible: Vec<String> = targets
+        .iter()
+        .filter(|a| cfg.classify_enabled_for(a))
+        .map(|a| a.id.clone())
+        .collect();
+    let cap = limit.unwrap_or(cfg.classify.max_per_run as usize);
+    let pending: Vec<Value> = store
+        .pending_classifications()?
+        .iter()
+        .filter(|c| wanted(&c.account_id))
+        .map(|c| json!({ "account_id": c.account_id, "email_id": c.email_id, "tray": c.effective_tray() }))
+        .collect();
+    let mut queued = Vec::new();
+
+    for row in store.next_classify_batch(&eligible, cap)? {
+        queued.push(json!({
+            "account_id": row.account_id,
+            "email_id": row.email_id,
+            "attempts": row.attempts,
+            "state": dry_state(cfg, store, &row.account_id, &row.email_id)?,
+        }));
+    }
+
+    let mut found = Vec::new();
+
+    if let Some(n) = backfill {
+        for c in classify::backfill_ids(store, cfg, account, n)? {
+            found.push(json!({
+                "account_id": c.account_id,
+                "email_id": c.email_id,
+                "state": dry_state(cfg, store, &c.account_id, &c.email_id)?,
+            }));
+        }
+    }
+
+    Ok(json!({ "dry_run": true, "pending_apply": pending, "queued": queued, "backfill": found }))
+}
+
+pub async fn classify_run(
+    account: Option<&str>,
+    limit: Option<usize>,
+    backfill: Option<usize>,
+    retry_failed: bool,
+    dry_run: bool,
+) -> Result<Value> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let targets = targets(&cfg, account)?;
+
+    if dry_run {
+        return classify_dry_run(&cfg, &store, &targets, account, limit, backfill);
+    }
+
+    // Before any network traffic, including the sync.
+    let key =
+        Secrets::typesafe_key()?.ok_or_else(|| Error::NotConfigured("typesafe key".into()))?;
+
+    if !targets.iter().any(|a| cfg.classify_enabled_for(a)) {
+        return Err(Error::NotConfigured(
+            "classification is not enabled for the selected accounts".into(),
+        ));
+    }
+
+    let reset = if retry_failed {
+        store.reset_failed_classifications(account)?
+    } else {
+        0
+    };
+    let (sync_reports, clients, enqueued, unreachable) = match backfill {
+        Some(n) => {
+            let (clients, unreachable) = connect_clients(&cfg, &targets).await?;
+            let enqueued = classify::backfill_candidates(&store, &cfg, account, n)?;
+
+            (None, clients, enqueued, unreachable)
+        }
+        None => {
+            let (reports, clients) = sync_targets(&cfg, &store, &targets).await?;
+
+            (Some(reports), clients, 0, HashMap::new())
+        }
+    };
+    let jev = JevClient::new(
+        JEV_BASE_URL,
+        &key,
+        &cfg.classify.model,
+        cfg.classify.unsure_margin,
+    );
+    let mut report = classify::run(&cfg, &store, &clients, &jev, limit).await;
+
+    report
+        .errors
+        .extend(unreachable.into_iter().map(|(id, e)| format!("{id}: {e}")));
+
+    Ok(json!({
+        "sync": sync_reports.map(|r| to_json(&r)).transpose()?,
+        "reset": reset,
+        "enqueued": enqueued,
+        "classify": report,
+    }))
+}
+
+pub fn classify_status(account: Option<&str>) -> Result<Value> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let mut accounts = Vec::new();
+
+    for id in scope(&cfg, account)? {
+        let rows = store.classifications(Some(&id), false, 0)?;
+        let queue = store.classify_queue(Some(&id))?;
+        let mut by_tray: BTreeMap<&str, usize> = BTreeMap::new();
+
+        for c in &rows {
+            *by_tray.entry(c.effective_tray()).or_default() += 1;
+        }
+
+        accounts.push(json!({
+            "id": id,
+            "classified": rows.len(),
+            "unsure": rows.iter().filter(|c| c.unsure).count(),
+            "queued": queue.iter().filter(|r| r.attempts < CLASSIFY_MAX_ATTEMPTS).count(),
+            "failed": queue.iter().filter(|r| r.attempts >= CLASSIFY_MAX_ATTEMPTS).count(),
+            "pending_apply": rows.iter().filter(|c| !c.applied).count(),
+            "by_tray": by_tray,
+            "last_classified_at": rows.iter().map(|c| c.classified_at.as_str()).max(),
+        }));
+    }
+
+    Ok(json!({ "accounts": accounts }))
+}
+
+pub fn classify_show(account: Option<&str>, id: &str) -> Result<Value> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let email = find_email(&store, &cfg, account, id)?;
+
+    store
+        .classification(&email.account_id, &email.id)?
+        .ok_or_else(|| Error::NotFound(format!("classification of {id}")))
+        .and_then(|c| to_json(&c))
+}
+
+pub async fn classify_correct(account: Option<&str>, id: &str, tray: &str) -> Result<Value> {
+    let tray: Tray = tray.parse()?;
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let email = find_email(&store, &cfg, account, id)?;
+    let client = optional_client(&cfg, configured(&cfg, &email.account_id)?).await?;
+    let offline = client.is_none();
+    let clients: HashMap<String, Arc<Client>> = client
+        .map(|c| (email.account_id.clone(), Arc::new(c)))
+        .into_iter()
+        .collect();
+
+    classify::correct(&cfg, &store, &clients, &email.msg_ref(), tray).await?;
+
+    Ok(json!({
+        "account_id": email.account_id,
+        "id": email.id,
+        "tray": tray,
+        "offline": offline,
+    }))
+}
+
+pub fn classify_key() -> Result<Value> {
+    let mut key = String::new();
+
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut key)?;
+
+    let key = key.trim();
+
+    if key.is_empty() {
+        return Err(Error::Config("empty key on stdin".into()));
+    }
+
+    Secrets::set_typesafe_key(key)?;
+
+    Ok(json!({ "has_key": true }))
 }
 
 pub fn dev_seed() -> Result<Value> {

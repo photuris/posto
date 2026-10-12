@@ -1,10 +1,11 @@
 //! Middle pane: one row per email.
 
 use dioxus::prelude::*;
+use posto_core::classify::Tray;
 
 use crate::app::{
-    EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION, SIDEBAR_OPEN, backend,
-    click_email, load_more,
+    CLASSIFIED, EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION,
+    SIDEBAR_OPEN, backend, click_email, load_more, tray_label,
 };
 use crate::components::Icon;
 use crate::format;
@@ -18,6 +19,8 @@ pub fn MessageList() -> Element {
     let mailboxes = MAILBOXES();
     let current = SELECTED_MAILBOX();
     let selection = SELECTION();
+    let classified = CLASSIFIED();
+    let cfg = backend().read().cfg.clone();
     let picked = selection.len();
     let searching = !SEARCH_QUERY.read().trim().is_empty();
     let now = chrono::Utc::now();
@@ -29,9 +32,7 @@ pub fn MessageList() -> Element {
         _ => None,
     };
     let unified = current == Some(Folder::AllInboxes);
-    let accounts: Vec<(String, String)> = backend()
-        .read()
-        .cfg
+    let accounts: Vec<(String, String)> = cfg
         .accounts_enabled()
         .map(|a| (a.id.clone(), a.display_name().to_string()))
         .collect();
@@ -48,19 +49,33 @@ pub fn MessageList() -> Element {
         .is_some_and(|m| matches!(m.role.as_deref(), Some("sent" | "drafts")));
     let (title, counts) = match (&mailbox, searching) {
         (_, true) => ("Search".to_string(), format!("{} results", emails.len())),
-        (None, _) if unified => (
-            "All inboxes".to_string(),
-            format!(
-                "{} messages, {} unread",
-                inboxes().map(|m| m.total).sum::<i64>(),
-                inboxes().map(|m| m.unread).sum::<i64>()
+        (None, _) => match &current {
+            Some(Folder::Unsure { account_id }) => {
+                let name = accounts
+                    .iter()
+                    .find(|(id, _)| id == account_id)
+                    .filter(|_| accounts.len() > 1)
+                    .map_or(String::new(), |(_, name)| format!(" — {name}"));
+
+                (
+                    format!("Unsure{name}"),
+                    format!("{} messages to review", emails.len()),
+                )
+            }
+            _ if unified => (
+                "All inboxes".to_string(),
+                format!(
+                    "{} messages, {} unread",
+                    inboxes().map(|m| m.total).sum::<i64>(),
+                    inboxes().map(|m| m.unread).sum::<i64>()
+                ),
             ),
-        ),
+            _ => ("Posto".to_string(), String::new()),
+        },
         (Some(m), _) => (
             m.name.clone(),
             format!("{} messages, {} unread", m.total, m.unread),
         ),
-        (None, _) => ("Posto".to_string(), String::new()),
     };
     let more = HAS_MORE();
 
@@ -120,11 +135,24 @@ pub fn MessageList() -> Element {
                                         Some(Folder::AllInboxes) => {
                                             m.role.as_deref() != Some("inbox")
                                         }
-                                        None => true,
+                                        Some(Folder::Unsure { .. }) | None => true,
                                     })
                                     .map(|m| (m.name.clone(), format::avatar_hue(&m.name))),
                             )
                             .collect();
+                        // The tray's mailbox name, unless a mailbox chip or the open folder says it.
+                        let (tray_chip, unsure_chip) = match classified.get(&key) {
+                            Some((tray, unsure)) => {
+                                let name = tray.parse::<Tray>().ok().map(|t| tray_label(&cfg, t));
+                                let shown = name.filter(|n| {
+                                    !chips.iter().any(|(c, _)| c.eq_ignore_ascii_case(n))
+                                        && mailbox.as_ref().is_none_or(|m| !m.name.eq_ignore_ascii_case(n))
+                                });
+
+                                (shown, *unsure)
+                            }
+                            None => (None, false),
+                        };
                         let class = match (
                             selection.is_selected(&key),
                             selection.focus.as_deref() == Some(key.as_str()),
@@ -182,7 +210,7 @@ pub fn MessageList() -> Element {
                                     }
                                     div { class: "subject", "{e.subject}" }
                                     div { class: "preview", "{e.preview}" }
-                                    if !chips.is_empty() {
+                                    if !chips.is_empty() || tray_chip.is_some() || unsure_chip {
                                         div { class: "chips",
                                             for (i, (chip, chip_hue)) in chips.into_iter().enumerate() {
                                                 span {
@@ -191,6 +219,12 @@ pub fn MessageList() -> Element {
                                                     style: "--hue: {chip_hue}",
                                                     "{chip}"
                                                 }
+                                            }
+                                            if let Some(name) = tray_chip {
+                                                span { class: "chip muted", title: "Classified as", "{name}" }
+                                            }
+                                            if unsure_chip {
+                                                span { class: "chip unsure", title: "Jev was not sure; review it", "Unsure" }
                                             }
                                         }
                                     }

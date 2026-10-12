@@ -1185,6 +1185,60 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The classifications of the referenced emails, in no particular order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn classifications_for(&self, refs: &[MsgRef]) -> Result<Vec<Classified>> {
+        let keys: Vec<String> = refs.iter().map(MsgRef::to_string).collect();
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CLASSIFIED_COLS} FROM classified \
+             WHERE account_id || '/' || email_id IN (SELECT value FROM json_each(?1))"
+        ))?;
+        let rows = stmt.query_map([to_json(&keys)?], classified_from_row)?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Ids of the cached emails of `account` whose classification is unsure
+    /// and uncorrected, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn unsure_email_ids(&self, account: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT e.id FROM emails e \
+             JOIN classified c ON c.account_id = e.account_id AND c.email_id = e.id \
+             WHERE e.account_id = ?1 AND c.unsure = 1 AND c.corrected_tray IS NULL \
+             ORDER BY e.received_at DESC, e.id",
+        )?;
+        let rows = stmt.query_map([account], |r| r.get(0))?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The emails of `account` with these ids, newest first; unknown ids are
+    /// skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn list_emails_by_ids(&self, account: &str, ids: &[String]) -> Result<Vec<EmailSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {EMAIL_COLS} FROM emails e \
+             WHERE e.account_id = ?1 AND e.id IN (SELECT value FROM json_each(?2)) \
+             ORDER BY e.received_at DESC, e.id"
+        ))?;
+        let rows = stmt.query_map(params![account, to_json(ids)?], email_from_row)?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Classifications whose mailbox changes the server has not confirmed,
     /// oldest first.
     ///
@@ -2339,6 +2393,59 @@ mod tests {
             applied,
             apply_error: None,
         }
+    }
+
+    #[test]
+    fn unsure_ids_skip_corrected_and_list_by_ids() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .upsert_emails(&[
+                email("e1", "2026-10-01T10:00:00Z", "one", &[]),
+                email("e2", "2026-10-02T10:00:00Z", "two", &[]),
+                email("e3", "2026-10-03T10:00:00Z", "three", &[]),
+                email_in("b", "e2", "2026-10-04T10:00:00Z", "other", &[]),
+            ])
+            .unwrap();
+
+        for (account, id, unsure) in [
+            ("a", "e1", true),
+            ("a", "e2", true),
+            ("a", "e3", false),
+            ("a", "gone", true),
+            ("b", "e2", true),
+        ] {
+            store
+                .put_classification(&classified(account, id, unsure, true))
+                .unwrap();
+        }
+
+        store.set_correction("a", "e1", "social").unwrap();
+
+        // Corrected, sure, uncached and other-account rows are out.
+        assert_eq!(store.unsure_email_ids("a").unwrap(), ["e2"]);
+
+        let ids = ["e3".to_string(), "e1".to_string(), "nope".to_string()];
+        let listed: Vec<String> = store
+            .list_emails_by_ids("a", &ids)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+
+        assert_eq!(listed, ["e3", "e1"]);
+
+        let refs = [MsgRef::new("a", "e3"), MsgRef::new("b", "e2")];
+        let mut found: Vec<String> = store
+            .classifications_for(&refs)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{}/{}", c.account_id, c.email_id))
+            .collect();
+
+        found.sort();
+
+        assert_eq!(found, ["a/e3", "b/e2"]);
     }
 
     #[test]

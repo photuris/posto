@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dioxus::prelude::*;
-use posto_core::config::{Account, Config, UiConfig};
+use posto_core::classify::{self, Classifier, ClassifyReport, JEV_BASE_URL, JevClient, Tray};
+use posto_core::config::{Account, Config, Secrets, UiConfig};
 use posto_core::jmap::{Client, Identity};
 use posto_core::shortcuts::{Action, Keymap};
 use posto_core::store::{Attachment, EmailBody, EmailSummary, ListQuery, Mailbox, MsgRef};
@@ -16,10 +17,11 @@ use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::components::{
-    Composer, ConfirmDialog, MessageList, MovePicker, Reader, Settings, Sidebar, Toolbar,
+    ClassifyPicker, Composer, ConfirmDialog, MessageList, MovePicker, Reader, Settings, Sidebar,
+    Toolbar,
 };
 use crate::selection::{Click, Selection};
-use crate::state::{self, Backend, Folder, group_by_account, row_key};
+use crate::state::{self, Backend, FakeJev, Folder, group_by_account, row_key};
 use crate::{format, keys};
 
 /// A pending yes/no question; accepting runs `on_accept`.
@@ -67,6 +69,11 @@ pub static COMPOSER_TO: GlobalSignal<String> = Signal::global(String::new);
 pub static COMPOSER_CC: GlobalSignal<String> = Signal::global(String::new);
 pub static SHOW_SETTINGS: GlobalSignal<bool> = Signal::global(|| false);
 pub static SHOW_MOVE_PICKER: GlobalSignal<bool> = Signal::global(|| false);
+pub static SHOW_CLASSIFY_PICKER: GlobalSignal<bool> = Signal::global(|| false);
+/// The tray in force and whether it is unsure, for each listed message (by row key).
+pub static CLASSIFIED: GlobalSignal<HashMap<String, (String, bool)>> = Signal::global(HashMap::new);
+/// Unsure, uncorrected messages per account.
+pub static UNSURE: GlobalSignal<BTreeMap<String, usize>> = Signal::global(BTreeMap::new);
 pub static CONFIRM: GlobalSignal<Option<Confirm>> = Signal::global(|| None);
 pub static STATUS: GlobalSignal<String> = Signal::global(String::new);
 pub static KEYMAP: GlobalSignal<Keymap> = Signal::global(Keymap::defaults);
@@ -409,6 +416,9 @@ pub fn App() -> Element {
             if SHOW_MOVE_PICKER() {
                 MovePicker {}
             }
+            if SHOW_CLASSIFY_PICKER() {
+                ClassifyPicker {}
+            }
             if CONFIRM.read().is_some() {
                 ConfirmDialog {}
             }
@@ -424,6 +434,7 @@ pub fn dispatch(action: Action) {
     let modal = COMPOSER.peek().is_some()
         || *SHOW_SETTINGS.peek()
         || *SHOW_MOVE_PICKER.peek()
+        || *SHOW_CLASSIFY_PICKER.peek()
         || CONFIRM.peek().is_some();
     let selected = SELECTION.peek().len();
 
@@ -474,6 +485,11 @@ pub fn dispatch(action: Action) {
                 set_status("Select messages from one account to move them.");
             } else {
                 *SHOW_MOVE_PICKER.write() = true;
+            }
+        }
+        Action::Classify => {
+            if !selected_refs().is_empty() {
+                *SHOW_CLASSIFY_PICKER.write() = true;
             }
         }
         Action::Search => focus("search"),
@@ -535,7 +551,7 @@ fn scroll_to_row(key: &str) {
     ));
 }
 
-/// Closes the topmost of composer, settings, move picker, then leaves the search box.
+/// Closes the topmost of composer, settings, pickers, then leaves the search box.
 fn close_top() {
     if COMPOSER.peek().is_some() {
         *COMPOSER.write() = None;
@@ -543,6 +559,8 @@ fn close_top() {
         *SHOW_SETTINGS.write() = false;
     } else if *SHOW_MOVE_PICKER.peek() {
         *SHOW_MOVE_PICKER.write() = false;
+    } else if *SHOW_CLASSIFY_PICKER.peek() {
+        *SHOW_CLASSIFY_PICKER.write() = false;
     } else if CONFIRM.peek().is_some() {
         *CONFIRM.write() = None;
     }
@@ -829,6 +847,7 @@ fn folder_exists(folder: &Folder, mailboxes: &[Mailbox], accounts: usize) -> boo
         Folder::Mailbox { account_id, id } => mailboxes
             .iter()
             .any(|m| m.account_id == *account_id && m.id == *id),
+        Folder::Unsure { account_id } => mailboxes.iter().any(|m| m.account_id == *account_id),
     }
 }
 
@@ -860,6 +879,46 @@ pub fn reload_mailboxes() {
     }
 
     *MAILBOXES.write() = all;
+    reload_unsure_counts();
+}
+
+/// Re-counts each enabled account's unsure, uncorrected messages.
+fn reload_unsure_counts() {
+    let b = backend().peek().clone();
+    let mut counts = BTreeMap::new();
+
+    for a in b.cfg.accounts_enabled() {
+        match b.store.unsure_email_ids(&a.id) {
+            Ok(ids) => {
+                counts.insert(a.id.clone(), ids.len());
+            }
+            Err(e) => return set_status(format!("Could not read classifications: {e}")),
+        }
+    }
+
+    if *UNSURE.peek() != counts {
+        *UNSURE.write() = counts;
+    }
+}
+
+/// Re-reads the classification of every listed message.
+fn reload_classified() {
+    let b = backend().peek().clone();
+    let refs: Vec<MsgRef> = EMAILS.peek().iter().map(EmailSummary::msg_ref).collect();
+
+    match b.store.classifications_for(&refs) {
+        Ok(rows) => {
+            *CLASSIFIED.write() = rows
+                .into_iter()
+                .map(|c| {
+                    let key = MsgRef::new(&c.account_id, &c.email_id).to_string();
+
+                    (key, (c.effective_tray().to_string(), c.unsure))
+                })
+                .collect();
+        }
+        Err(e) => set_status(format!("Could not read classifications: {e}")),
+    }
 }
 
 /// Reloads the active query (search, else the selected folder) from the store.
@@ -893,6 +952,11 @@ pub async fn reload_list() {
                     ..Default::default()
                 },
             ),
+            Some(Folder::Unsure { account_id }) => {
+                let ids = store.unsure_email_ids(&account_id)?;
+
+                store.list_emails_by_ids(&account_id, &ids[..ids.len().min(limit as usize)])
+            }
             None => store.list_emails(
                 None,
                 &ListQuery {
@@ -928,6 +992,7 @@ pub async fn reload_list() {
                 })
                 .collect();
 
+            reload_classified();
             drop_disabled_accounts_from_selection();
         }
         Err(e) => set_status(format!("Could not load messages: {e}")),
@@ -981,6 +1046,12 @@ async fn act_on_selected(action: actions::Action) {
 /// Applies `action` to `refs`, reloads the list, and drops the ones that left it from the
 /// selection. If that empties the selection, the row at the old focus's position takes over.
 async fn act_on_emails(refs: &[MsgRef], action: actions::Action) -> Result<()> {
+    settle_selection(async { apply_local(refs, action).await.map(|_| ()) }).await
+}
+
+/// Runs `change`, then reloads the list and fixes the selection as described
+/// at [`act_on_emails`].
+async fn settle_selection(change: impl Future<Output = Result<()>>) -> Result<()> {
     let old_index = SELECTION
         .peek()
         .focus
@@ -988,7 +1059,8 @@ async fn act_on_emails(refs: &[MsgRef], action: actions::Action) -> Result<()> {
         .and_then(|f| EMAILS.peek().iter().position(|e| row_key(e) == *f));
     let had_selection = !SELECTION.peek().is_empty();
 
-    apply_local(refs, action).await?;
+    change.await?;
+    reload_unsure_counts();
     reload_list().await;
 
     let order = list_order();
@@ -1014,6 +1086,90 @@ pub fn move_selected(mailbox_id: String) {
     *SHOW_MOVE_PICKER.write() = false;
     focus_root();
     run(act_on_selected(actions::Action::Move { mailbox_id }));
+}
+
+/// Files every selected email under `tray` by the user's decision and closes
+/// the picker. Without a connection for an account, its messages change on
+/// this device only.
+pub fn classify_selected(tray: Tray) {
+    *SHOW_CLASSIFY_PICKER.write() = false;
+    focus_root();
+
+    run(async move {
+        let Some(_busy) = Flag::take(&BUSY) else {
+            return;
+        };
+        let refs = selected_refs();
+
+        if refs.is_empty() {
+            return;
+        }
+
+        let b = backend().peek().clone();
+        let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
+
+        for (account, _) in group_by_account(&refs) {
+            if let Ok(Some(client)) = get_client(&account).await {
+                clients.insert(account, client);
+            }
+        }
+
+        let (mut filed, mut first_error) = (0, None);
+        let settled = settle_selection(async {
+            for r in &refs {
+                let before = b.store.email(&r.account_id, &r.id).ok().flatten();
+
+                match classify::correct(&b.cfg, &b.store, &clients, r, tray).await {
+                    Ok(()) => filed += 1,
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                }
+
+                // Moves already made count even when a later step failed.
+                if let (Some(old), Ok(Some(new))) = (before, b.store.email(&r.account_id, &r.id)) {
+                    bump_counts(&old, &new);
+                }
+            }
+
+            Ok(())
+        })
+        .await;
+
+        if let Err(e) = settled {
+            return fail("Action failed", e);
+        }
+
+        if let Some(e) = first_error {
+            return fail("Classify failed", e);
+        }
+
+        let s = if filed == 1 { "" } else { "s" };
+        let offline = !b.ui_test && refs.iter().any(|r| !clients.contains_key(&r.account_id));
+
+        set_status(format!(
+            "Filed {filed} message{s} under {}{}",
+            tray_label(&b.cfg, tray),
+            if offline {
+                " (no connection: not yet sent to the server)"
+            } else {
+                ""
+            }
+        ));
+    });
+}
+
+/// The mailbox name of `tray` in `cfg`; spam always goes to Junk.
+pub fn tray_label(cfg: &Config, tray: Tray) -> String {
+    match tray {
+        Tray::Spam => "Junk".to_string(),
+        t => cfg
+            .classify
+            .trays
+            .get(t.as_str())
+            .cloned()
+            .unwrap_or_else(|| t.as_str().to_string()),
+    }
 }
 
 /// Marks every selected email read or unread, flagged or unflagged (`action`).
@@ -1256,6 +1412,7 @@ pub async fn run_sync(manual: bool) {
     if backend().peek().ui_test {
         if manual {
             set_status("Nothing to sync in UI test mode.");
+            classify_pass(HashMap::new(), manual).await;
         }
 
         return;
@@ -1291,6 +1448,7 @@ pub async fn run_sync(manual: bool) {
 
     let cfg = b.cfg.clone();
     let store = b.store.clone();
+    let connected = clients.clone();
     let result = tokio::spawn(async move { sync::sync_all(&cfg, &store, &clients).await })
         .await
         .map_err(|e| Error::Other(e.to_string()))
@@ -1338,6 +1496,92 @@ pub async fn run_sync(manual: bool) {
     if manual || added > 0 || failed {
         set_status(sync_summary(&b.cfg, &reports));
     }
+
+    // The sync lock is released: new inbox mail is queued and can be classified.
+    classify_pass(connected, manual).await;
+}
+
+/// Classifies what the sync queued, when any account has classification on
+/// and a TypeSafe key exists (UI test mode: always, with [`FakeJev`]). A
+/// failure becomes a toast; background passes stay quiet unless something was
+/// classified or went wrong.
+async fn classify_pass(clients: HashMap<String, Arc<Client>>, manual: bool) {
+    let b = backend().peek().clone();
+
+    if !b
+        .cfg
+        .accounts_enabled()
+        .any(|a| b.cfg.classify_enabled_for(a))
+    {
+        return;
+    }
+
+    let report = if b.ui_test {
+        run_classifier(&b, clients, FakeJev).await
+    } else {
+        match Secrets::typesafe_key() {
+            Ok(Some(key)) => {
+                let jev = JevClient::new(
+                    JEV_BASE_URL,
+                    &key,
+                    &b.cfg.classify.model,
+                    b.cfg.classify.unsure_margin,
+                );
+
+                run_classifier(&b, clients, jev).await
+            }
+            Ok(None) => {
+                if manual {
+                    set_status("Classification is on but no TypeSafe key is set — open Settings");
+                }
+
+                return;
+            }
+            Err(e) => return fail("Classification", e),
+        }
+    };
+
+    if report.classified > 0 || report.moved > 0 {
+        reload_mailboxes();
+        reload_list().await;
+    }
+
+    let errors: Vec<&String> = report
+        .errors
+        .iter()
+        .filter(|e| manual || *e != ALREADY_RUNNING)
+        .collect();
+
+    match (report.classified, errors.first()) {
+        (0, None) => {}
+        (0, Some(e)) => set_status(format!("Classification failed: {e}")),
+        (n, None) => set_status(format!("Classified {n} ({} unsure)", report.unsure)),
+        (n, Some(e)) => set_status(format!(
+            "Classified {n} ({} unsure); {} failed, first: {e}",
+            report.unsure,
+            errors.len()
+        )),
+    }
+}
+
+/// The report line of a run that found another one in progress.
+const ALREADY_RUNNING: &str = "classifier already running";
+
+/// Runs the classifier over the queue on a worker, so a panic or a slow
+/// network never blocks the UI.
+async fn run_classifier<C: Classifier + 'static>(
+    b: &Backend,
+    clients: HashMap<String, Arc<Client>>,
+    classifier: C,
+) -> ClassifyReport {
+    let (cfg, store) = (b.cfg.clone(), b.store.clone());
+
+    tokio::spawn(async move { classify::run(&cfg, &store, &clients, &classifier, None).await })
+        .await
+        .unwrap_or_else(|e| ClassifyReport {
+            errors: vec![format!("classifier: {e}")],
+            ..ClassifyReport::default()
+        })
 }
 
 /// Syncs whenever `refresh_minutes` (re-read each tick) have passed since the last sync.
@@ -1534,6 +1778,48 @@ mod tests {
         assert!(EMAILS.peek().is_empty());
         assert!(SELECTION.peek().is_empty(), "{:?}", SELECTION.peek().focus);
         assert!(BODY.peek().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsure_folder_lists_unsure_mail_until_corrected() {
+        let dom = rendered(backend_with(Config::default()));
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        assert_eq!(UNSURE.peek().get("default"), Some(&1));
+
+        *SELECTED_MAILBOX.write() = Some(Folder::Unsure {
+            account_id: "default".into(),
+        });
+        reload_list().await;
+
+        let ids: Vec<String> = EMAILS.peek().iter().map(|e| e.id.clone()).collect();
+
+        assert_eq!(ids, ["fx-05"]);
+        assert_eq!(
+            CLASSIFIED.peek().get("default/fx-05"),
+            Some(&("needs_reply".to_string(), true))
+        );
+        assert_eq!(tray_label(&b.cfg, Tray::Spam), "Junk");
+        assert_eq!(tray_label(&b.cfg, Tray::Updates), "Updates");
+
+        classify::correct(
+            &b.cfg,
+            &b.store,
+            &HashMap::new(),
+            &MsgRef::new("default", "fx-05"),
+            Tray::Updates,
+        )
+        .await
+        .unwrap();
+        reload_mailboxes();
+        reload_list().await;
+
+        assert!(EMAILS.peek().is_empty(), "{:?}", EMAILS.peek());
+        assert_eq!(UNSURE.peek().get("default"), Some(&0));
     }
 
     /// A mailbox of `account` for folder tests.

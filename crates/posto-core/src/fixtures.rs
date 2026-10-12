@@ -13,8 +13,9 @@ const ME: &str = "me@example.com";
 /// Address of the fixture account's second identity.
 const SHOP: &str = "shop@example.com";
 
-/// Mailboxes: id, name, role, sort order.
-const MAILBOXES: [(&str, &str, Option<&str>, i64); 9] = [
+/// Mailboxes: id, name, role, sort order. The last four are the classifier's
+/// tray mailboxes, present so a correction works offline.
+const MAILBOXES: [(&str, &str, Option<&str>, i64); 13] = [
     ("mb-inbox", "Inbox", Some("inbox"), 1),
     ("mb-drafts", "Drafts", Some("drafts"), 2),
     ("mb-sent", "Sent", Some("sent"), 3),
@@ -24,6 +25,10 @@ const MAILBOXES: [(&str, &str, Option<&str>, i64); 9] = [
     ("mb-newsletters", "Newsletters", None, 10),
     ("mb-receipts", "Receipts", None, 11),
     ("mb-bilag", "Bilag", None, 12),
+    ("mb-needs-reply", "Needs reply", None, 13),
+    ("mb-updates", "Updates", None, 14),
+    ("mb-promos", "Promos", None, 15),
+    ("mb-social", "Social", None, 16),
 ];
 
 /// One fixture email with its body.
@@ -396,7 +401,7 @@ mod tests {
 
         seed(&store).unwrap();
 
-        assert_eq!(store.mailboxes(ACCOUNT).unwrap().len(), 9);
+        assert_eq!(store.mailboxes(ACCOUNT).unwrap().len(), 13);
         assert_eq!(store.identities(ACCOUNT).unwrap().len(), 2);
         assert_eq!(
             store

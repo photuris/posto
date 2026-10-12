@@ -3,7 +3,7 @@
 use posto_core::shortcuts::{Action, Chord, Keymap};
 
 /// Every action, in the order Settings lists them.
-pub const ALL_ACTIONS: [Action; 21] = [
+pub const ALL_ACTIONS: [Action; 22] = [
     Action::Next,
     Action::Prev,
     Action::Open,
@@ -24,6 +24,7 @@ pub const ALL_ACTIONS: [Action; 21] = [
     Action::ExtendNext,
     Action::ExtendPrev,
     Action::SelectAll,
+    Action::Classify,
     Action::DeleteConfirmed,
 ];
 

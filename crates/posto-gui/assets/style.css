@@ -150,6 +150,8 @@ input.invalid { border-color: #d33; }
   background: hsl(var(--hue) 45% 50% / 0.2);
   color: color-mix(in srgb, hsl(var(--hue) 60% 50%) 70%, var(--fg));
 }
+.chip.muted { background: var(--hover); color: var(--posto-muted); }
+.chip.unsure { background: var(--posto-accent); color: var(--on-accent); }
 .more { display: block; margin: 8px auto; }
 
 /* Right pane */
@@ -258,6 +260,8 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 .account-item.active { background: var(--sel); color: var(--posto-accent); font-weight: 600; }
 .account-form { flex: 1; min-width: 0; }
 .setting-row.shortcut label { width: 120px; }
+.setting-row.tray > label:first-child { width: 120px; }
+.setting-row label.check { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--posto-muted); }
 .setting-row.shortcut input { flex: none; width: 140px; }
 .setting-row.blocked span { flex: 1; }
 input.number { width: 80px; }

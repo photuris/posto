@@ -4,6 +4,7 @@
 //! Save writes everything.
 
 mod appearance;
+mod classification;
 mod general;
 mod reading;
 mod shortcuts;
@@ -19,6 +20,7 @@ use crate::app::{
 use crate::components::Icon;
 use crate::keys;
 use appearance::AppearancePage;
+use classification::ClassificationPage;
 use general::GeneralPage;
 use reading::ReadingPage;
 use shortcuts::{ShortcutsPage, chord_rows, parse_rows, row_errors};
@@ -29,14 +31,16 @@ use shortcuts::{ShortcutsPage, chord_rows, parse_rows, row_errors};
 pub enum Page {
     General,
     Reading,
+    Classification,
     Shortcuts,
     Appearance,
 }
 
 impl Page {
-    pub const ALL: [Page; 4] = [
+    pub const ALL: [Page; 5] = [
         Page::General,
         Page::Reading,
+        Page::Classification,
         Page::Shortcuts,
         Page::Appearance,
     ];
@@ -45,6 +49,7 @@ impl Page {
         match self {
             Page::General => "General",
             Page::Reading => "Reading",
+            Page::Classification => "Classification",
             Page::Shortcuts => "Shortcuts",
             Page::Appearance => "Appearance",
         }
@@ -55,6 +60,7 @@ impl Page {
         match self {
             Page::General => "settings",
             Page::Reading => "book-open",
+            Page::Classification => "flag",
             Page::Shortcuts => "menu",
             Page::Appearance => "sun",
         }
@@ -97,8 +103,14 @@ pub fn Settings() -> Element {
             };
         }
 
+        classification::tidy(&mut cfg.classify);
+
         if let Err(e) = cfg.validate() {
             return save_error.set(Some(e.to_string()));
+        }
+
+        if let Some(e) = classification::problems(&cfg.classify) {
+            return save_error.set(Some(e));
         }
 
         cfg.shortcuts.clear();
@@ -199,6 +211,7 @@ pub fn Settings() -> Element {
                     match page() {
                         Page::General => rsx! { GeneralPage { draft } },
                         Page::Reading => rsx! { ReadingPage { draft } },
+                        Page::Classification => rsx! { ClassificationPage { draft } },
                         Page::Shortcuts => rsx! { ShortcutsPage { rows } },
                         Page::Appearance => rsx! { AppearancePage { draft } },
                     }
@@ -251,7 +264,7 @@ mod tests {
     fn pages_are_complete() {
         let distinct: HashSet<Page> = Page::ALL.into_iter().collect();
 
-        assert_eq!(distinct.len(), 4);
+        assert_eq!(distinct.len(), 5);
 
         for page in Page::ALL {
             assert!(!page.label().is_empty(), "{page:?} has no label");
