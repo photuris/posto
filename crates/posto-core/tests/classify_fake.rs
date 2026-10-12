@@ -2042,3 +2042,111 @@ async fn review_distinct_store_handles_keep_all_owned_trays() -> Result<()> {
     assert!(env.store.classification("a", "e1")?.unwrap().applied);
     Ok(())
 }
+
+#[tokio::test]
+async fn review_stale_confirmation_does_not_resurrect_removed_tray() -> Result<()> {
+    let mut env = env().await;
+    let path = env._dir.path().join("shared.db");
+    env.store = Store::open(&path)?;
+    let second_store = Store::open(&path)?;
+    env.store
+        .upsert_emails(&[email("a", "e1", &["mb-inbox"])])?;
+    env.store.upsert_mailboxes(&[
+        mailbox("a", "mb-inbox", "Inbox", Some("inbox")),
+        mailbox("a", "mb-junk", "Junk", Some("junk")),
+        mailbox("a", "mb-social", "Social", None),
+        mailbox("a", "mb-updates", "Updates", None),
+    ])?;
+    let msg = MsgRef::new("a", "e1");
+    env.store.set_correction("a", "e1", "social")?;
+    let _turn = env.store.lock_message("a", "e1").await;
+    let (old, revision) = env.store.classification_with_revision("a", "e1")?.unwrap();
+    // Social's HTTP operation succeeds; its local confirmation is delayed.
+    let done = classify::apply_tray(
+        &env.cfg,
+        &env.store,
+        env.clients.get("a").map(Arc::as_ref),
+        &old,
+    )
+    .await?;
+    assert!(
+        env.mailboxes_of("a", "e1")
+            .contains(&"mb-social".to_string())
+    );
+    // Another handle completes a newer correction, including Social's removal.
+    correct(&env.cfg, &second_store, &env.clients, &msg, Tray::Updates).await?;
+    assert_eq!(
+        env.mailboxes_of("a", "e1"),
+        sorted(&["mb-inbox", "mb-updates"])
+    );
+    assert_eq!(
+        env.store.owned_trays("a", "e1")?,
+        vec!["updates".to_string()]
+    );
+    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    // Resume confirmation of the already completed, older Social operation.
+    assert!(
+        !env.store
+            .confirm_classification("a", "e1", "social", &done.removed, revision)?
+    );
+    drop(_turn);
+    assert_eq!(
+        env.store.owned_trays("a", "e1")?,
+        vec!["updates".to_string()],
+        "stale confirmation resurrected ownership of Social after a completed Updates correction removed it"
+    );
+    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn superseded_confirmation_returns_false_and_changes_nothing() -> Result<()> {
+    let env = env().await;
+    env.store.put_classification(&Classified {
+        account_id: "a".into(),
+        email_id: "e1".into(),
+        tray: "promotional".into(),
+        probs: Default::default(),
+        urgency: 0,
+        personal: 0.0,
+        unsure: false,
+        model: "jev-test-1".into(),
+        input_tokens: 1,
+        classified_at: "2026-10-01T10:00:00Z".into(),
+        corrected_tray: None,
+        applied: true,
+        apply_error: None,
+    })?;
+    let (_, revision) = env.store.classification_with_revision("a", "e1")?.unwrap();
+
+    env.store.set_correction("a", "e1", "updates")?;
+
+    let before = env.store.classification("a", "e1")?.unwrap();
+    let owned = env.store.owned_trays("a", "e1")?;
+
+    assert!(!before.applied);
+    assert_eq!(owned, vec!["promotional".to_string()]);
+    assert!(!env.store.confirm_classification(
+        "a",
+        "e1",
+        "social",
+        &["promotional".to_string()],
+        revision
+    )?);
+
+    let after = env.store.classification("a", "e1")?.unwrap();
+
+    assert_eq!(after.applied, before.applied);
+    assert_eq!(after.corrected_tray, before.corrected_tray);
+    assert_eq!(after.corrected_tray.as_deref(), Some("updates"));
+    assert_eq!(env.store.owned_trays("a", "e1")?, owned);
+
+    let (_, current) = env.store.classification_with_revision("a", "e1")?.unwrap();
+
+    assert!(
+        env.store
+            .confirm_classification("a", "e1", "updates", &[], current)?
+    );
+    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    Ok(())
+}

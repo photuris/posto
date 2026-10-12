@@ -338,7 +338,7 @@ async fn settle(
 ) -> Result<()> {
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
     let _turn = store.lock_message(account, id).await;
-    let Some(row) = store.classification(account, id)? else {
+    let Some((row, revision)) = store.classification_with_revision(account, id)? else {
         return Ok(());
     };
 
@@ -347,8 +347,6 @@ async fn settle(
     if row.applied || (c.corrected_tray.is_none() && row.corrected_tray.is_some()) {
         return Ok(());
     }
-
-    let seen = row.corrected_tray.as_deref();
 
     match apply_tray(cfg, store, client, &row).await {
         Ok(done) => {
@@ -360,7 +358,7 @@ async fn settle(
                 id,
                 row.effective_tray(),
                 &done.removed,
-                seen,
+                revision,
             )? {
                 store.remove_from_classify_queue(account, id)?;
             }
@@ -714,8 +712,8 @@ pub async fn correct(
     // Intent is stored; now wait for any change in flight, then apply the
     // latest choice, which may be newer than `tray`.
     let _turn = store.lock_message(account, id).await;
-    let row = store
-        .classification(account, id)?
+    let (row, revision) = store
+        .classification_with_revision(account, id)?
         .ok_or_else(|| Error::NotFound(format!("classification {msg}")))?;
     let client = clients.get(account).map(Arc::as_ref);
 
@@ -727,7 +725,7 @@ pub async fn correct(
                 id,
                 row.effective_tray(),
                 &done.removed,
-                row.corrected_tray.as_deref(),
+                revision,
             )?;
 
             Ok(())

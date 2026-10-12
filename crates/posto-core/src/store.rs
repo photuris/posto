@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::jmap::Identity;
 
 /// Version of the table layout below; stored in `sync_state` as `schema_version`.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// Database schema; every statement is idempotent.
 const SCHEMA: &str = "
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS email_mailboxes(account_id TEXT NOT NULL, email_id TE
 CREATE INDEX IF NOT EXISTS email_mailboxes_box ON email_mailboxes(account_id, mailbox_id);
 CREATE TABLE IF NOT EXISTS bodies(account_id TEXT NOT NULL, email_id TEXT NOT NULL, html TEXT, text TEXT, attachments_json TEXT NOT NULL, in_reply_to_json TEXT NOT NULL, references_json TEXT NOT NULL, message_id_json TEXT NOT NULL, PRIMARY KEY(account_id, email_id));
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(account_id UNINDEXED, email_id UNINDEXED, subject, from_text, preview, body_text);
-CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, owned_trays TEXT NOT NULL DEFAULT '', PRIMARY KEY(account_id, email_id));
+CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, owned_trays TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id, email_id));
 CREATE TABLE IF NOT EXISTS classify_queue(account_id TEXT NOT NULL, email_id TEXT NOT NULL, added_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(account_id, email_id));
 ";
 
@@ -1122,7 +1122,8 @@ impl Store {
         Ok(false)
     }
 
-    /// Records a classification, replacing any earlier row of the same email.
+    /// Records a classification, replacing any earlier row of the same email
+    /// and starting a new revision of the intent.
     ///
     /// # Errors
     ///
@@ -1146,8 +1147,10 @@ impl Store {
     fn write_classified(&self, verb: &str, c: &Classified) -> Result<usize> {
         Ok(self.conn().execute(
             &format!(
-                "{verb} INTO classified({CLASSIFIED_COLS}, owned_trays) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                "{verb} INTO classified({CLASSIFIED_COLS}, owned_trays, revision) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                 COALESCE((SELECT revision FROM classified \
+                           WHERE account_id = ?1 AND email_id = ?2), 0) + 1)"
             ),
             params![
                 c.account_id,
@@ -1260,6 +1263,31 @@ impl Store {
                 ),
                 [account, id],
                 classified_from_row,
+            )
+            .optional()?)
+    }
+
+    /// The classification of one email together with the revision of its
+    /// intent, read in one statement so the pair is consistent. An application
+    /// of the row hands the revision back to [`Store::confirm_classification`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn classification_with_revision(
+        &self,
+        account: &str,
+        id: &str,
+    ) -> Result<Option<(Classified, i64)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT {CLASSIFIED_COLS}, revision FROM classified \
+                     WHERE account_id = ?1 AND email_id = ?2"
+                ),
+                [account, id],
+                |row| Ok((classified_from_row(row)?, row.get(13)?)),
             )
             .optional()?)
     }
@@ -1383,15 +1411,17 @@ impl Store {
     }
 
     /// Records that the server holds the mailbox changes for `tray` and
-    /// confirms the row, unless the correction changed since `seen_correction`
-    /// was read; then the row stays pending for the newer choice. Returns
-    /// whether the row was confirmed.
+    /// confirms the row, unless the intent changed since `revision` was read
+    /// (see [`Store::classification_with_revision`]): then nothing is touched
+    /// (no ownership, no applied flag), `false` comes back and the caller's
+    /// work is superseded; the newest intent's own application settles the
+    /// row. Returns whether the row was confirmed.
     ///
     /// Ownership is merged into the row as it is now, in one immediate
     /// transaction: `tray` is added and only the `removed` trays (those this
-    /// operation took the mailbox of) are dropped, so a stale confirmation,
-    /// or one from another handle on the same database, never discards
-    /// ownership another operation recorded.
+    /// operation took the mailbox of) are dropped, so a confirmation from
+    /// another handle on the same database never discards ownership another
+    /// operation recorded.
     ///
     /// # Errors
     ///
@@ -1402,20 +1432,26 @@ impl Store {
         id: &str,
         tray: &str,
         removed: &[String],
-        seen_correction: Option<&str>,
+        revision: i64,
     ) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owned: Option<String> = tx
+        let current: Option<(String, i64)> = tx
             .query_row(
-                "SELECT owned_trays FROM classified WHERE account_id = ?1 AND email_id = ?2",
+                "SELECT owned_trays, revision FROM classified \
+                 WHERE account_id = ?1 AND email_id = ?2",
                 [account, id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(owned) = owned else {
+        let Some((owned, current)) = current else {
             return Ok(false);
         };
+
+        if current != revision {
+            return Ok(false);
+        }
+
         let mut merged: Vec<&str> = owned
             .split(',')
             .filter(|t| !t.is_empty() && *t != tray && !removed.iter().any(|r| r == t))
@@ -1423,23 +1459,19 @@ impl Store {
 
         merged.push(tray);
 
-        let applied: bool = tx.query_row(
-            "UPDATE classified SET owned_trays = ?3, \
-             applied = CASE WHEN corrected_tray IS ?4 THEN 1 ELSE 0 END, \
-             apply_error = CASE WHEN corrected_tray IS ?4 THEN NULL ELSE apply_error END \
-             WHERE account_id = ?1 AND email_id = ?2 RETURNING applied",
-            params![account, id, merged.join(","), seen_correction],
-            |r| r.get(0),
+        tx.execute(
+            "UPDATE classified SET owned_trays = ?3, applied = 1, apply_error = NULL \
+             WHERE account_id = ?1 AND email_id = ?2",
+            params![account, id, merged.join(",")],
         )?;
-
         tx.commit()?;
 
-        Ok(applied)
+        Ok(true)
     }
 
     /// Records the user's choice of `tray` for an email and leaves the
-    /// classification pending (`applied = 0`), clearing `unsure`. An email
-    /// without a row gets a manual one.
+    /// classification pending (`applied = 0`), clearing `unsure` and starting
+    /// a new revision of the intent. An email without a row gets a manual one.
     ///
     /// # Errors
     ///
@@ -1451,7 +1483,7 @@ impl Store {
              VALUES (?1, ?2, ?3, '{}', 0, 0, 0, 'manual', 0, \
              strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?3, 0) \
              ON CONFLICT(account_id, email_id) DO UPDATE SET corrected_tray = ?3, \
-             unsure = 0, applied = 0, apply_error = NULL",
+             unsure = 0, applied = 0, apply_error = NULL, revision = revision + 1",
             params![account, id, tray],
         )?;
 
@@ -1924,7 +1956,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("4"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("5"));
         assert_eq!(store.account_state("a", "email_state").unwrap(), None);
         assert_eq!(store.state("email_state").unwrap(), None);
         assert_eq!(store.state("identities").unwrap(), None);
@@ -1956,7 +1988,7 @@ mod tests {
 
             conn.execute_batch(
                 "CREATE TABLE sync_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO sync_state VALUES ('schema_version', '5');",
+                 INSERT INTO sync_state VALUES ('schema_version', '6');",
             )
             .unwrap();
         }
@@ -2325,7 +2357,7 @@ mod tests {
             store.account_state("b", "email_state").unwrap().as_deref(),
             Some("s1")
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("4"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("5"));
         assert_eq!(store.search(None, "subject", 0).unwrap().len(), 1);
     }
 
