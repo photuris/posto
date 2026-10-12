@@ -4,6 +4,8 @@ mod app;
 mod components;
 mod format;
 mod keys;
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+mod menu;
 mod state;
 
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
@@ -37,9 +39,28 @@ fn main() {
     let window = window.with_decorations(want_decorations(&backend.cfg.ui.decorations));
 
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(Config::new().with_window(window).with_menu(None))
+        .with_cfg(
+            Config::new()
+                .with_window(window)
+                .with_menu(app_menu(&backend.cfg.shortcuts)),
+        )
         .with_context(backend)
         .launch(app::App);
+}
+
+/// The native menu bar on macOS and Windows; Linux (tiling sessions) gets none.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn app_menu(
+    shortcuts: &std::collections::BTreeMap<String, String>,
+) -> Option<dioxus::desktop::muda::Menu> {
+    let keymap = posto_core::shortcuts::Keymap::from_config(shortcuts)
+        .unwrap_or_else(|_| posto_core::shortcuts::Keymap::defaults());
+    Some(menu::install(&keymap))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn app_menu(_: &std::collections::BTreeMap<String, String>) -> Option<dioxus::desktop::muda::Menu> {
+    None
 }
 
 /// Whether the window should carry a title bar. Config "on"/"off" wins; "auto" keeps native

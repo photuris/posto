@@ -211,6 +211,19 @@ pub fn App() -> Element {
         signal
     });
 
+    // Menu items drive the same actions as the keys; muda shows the About panel itself.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    dioxus::desktop::use_muda_event_handler(move |event| {
+        match crate::menu::actions().get(event.id()) {
+            Some(crate::menu::MenuAction::Shortcut(action)) => dispatch(*action),
+            Some(crate::menu::MenuAction::Settings) => {
+                let open = *SHOW_SETTINGS.peek();
+                *SHOW_SETTINGS.write() = !open;
+            }
+            Some(crate::menu::MenuAction::About) | None => {}
+        }
+    });
+
     // The watcher callback runs on notify's thread; a tokio channel carries
     // the Theme to a task on the UI thread, which awaits it (no polling).
     let watch = use_hook(|| {
