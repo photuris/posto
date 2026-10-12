@@ -677,9 +677,9 @@ async fn sync_clears_account_whose_server_id_changed() -> Result<()> {
     store.upsert_emails(&[email("e-foreign", "mb-inbox")])?;
     mount_initial_sync(&server, &["e1"]).await;
 
-    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await;
 
-    assert!(report.initial);
+    assert!(report.as_ref().is_ok_and(|r| r.initial), "{report:?}");
     assert!(store.email("a", "e-foreign")?.is_none());
     assert!(store.email("a", "e1")?.is_some());
     assert_eq!(
