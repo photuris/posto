@@ -14,10 +14,26 @@ use posto_core::theme::{self, Theme, Watcher};
 use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::components::{Composer, MessageList, MovePicker, Reader, Settings, Sidebar, Toolbar};
+use crate::components::{
+    Composer, ConfirmDialog, MessageList, MovePicker, Reader, Settings, Sidebar, Toolbar,
+};
 use crate::selection::{Click, Selection};
 use crate::state::{self, Backend};
 use crate::{format, keys};
+
+/// A pending yes/no question; accepting runs `on_accept`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Confirm {
+    pub title: String,
+    pub body: String,
+    pub accept_label: String,
+    pub on_accept: Action,
+}
+
+/// True when `action` on `selected` messages must be confirmed first.
+pub fn needs_confirm(action: Action, selected: usize) -> bool {
+    action == Action::Delete && selected > 1
+}
 
 /// Rows fetched per page of a list or search.
 const PAGE: u32 = 200;
@@ -46,6 +62,7 @@ pub static COMPOSER_TO: GlobalSignal<String> = Signal::global(String::new);
 pub static COMPOSER_CC: GlobalSignal<String> = Signal::global(String::new);
 pub static SHOW_SETTINGS: GlobalSignal<bool> = Signal::global(|| false);
 pub static SHOW_MOVE_PICKER: GlobalSignal<bool> = Signal::global(|| false);
+pub static CONFIRM: GlobalSignal<Option<Confirm>> = Signal::global(|| None);
 pub static STATUS: GlobalSignal<String> = Signal::global(String::new);
 pub static KEYMAP: GlobalSignal<Keymap> = Signal::global(Keymap::defaults);
 pub static THEME_CSS: GlobalSignal<String> = Signal::global(|| {
@@ -362,6 +379,9 @@ pub fn App() -> Element {
             if SHOW_MOVE_PICKER() {
                 MovePicker {}
             }
+            if CONFIRM.read().is_some() {
+                ConfirmDialog {}
+            }
             if !STATUS.read().is_empty() {
                 div { class: "toast", {STATUS()} }
             }
@@ -371,7 +391,22 @@ pub fn App() -> Element {
 
 /// Runs a keyboard or toolbar action.
 pub fn dispatch(action: Action) {
-    let modal = COMPOSER.peek().is_some() || *SHOW_SETTINGS.peek() || *SHOW_MOVE_PICKER.peek();
+    let modal = COMPOSER.peek().is_some()
+        || *SHOW_SETTINGS.peek()
+        || *SHOW_MOVE_PICKER.peek()
+        || CONFIRM.peek().is_some();
+    let selected = SELECTION.peek().len();
+
+    if !modal && needs_confirm(action, selected) {
+        *CONFIRM.write() = Some(Confirm {
+            title: format!("Delete {selected} messages?"),
+            body: "They will be moved to Trash.".into(),
+            accept_label: "Delete".into(),
+            on_accept: Action::DeleteConfirmed,
+        });
+
+        return;
+    }
 
     match action {
         Action::Escape if !modal && !*TYPING.peek() && SELECTION.peek().len() > 1 => {
@@ -391,7 +426,9 @@ pub fn dispatch(action: Action) {
         }
         Action::Open => focus("reader-body"),
         Action::Archive => run(act_on_selected(actions::Action::Archive)),
-        Action::Delete => run(act_on_selected(actions::Action::Delete)),
+        Action::Delete | Action::DeleteConfirmed => {
+            run(act_on_selected(actions::Action::Delete));
+        }
         Action::Junk => run(act_on_selected(actions::Action::Junk)),
         Action::Reply => run(start_reply(false)),
         Action::ReplyAll => run(start_reply(true)),
@@ -470,6 +507,8 @@ fn close_top() {
         *SHOW_SETTINGS.write() = false;
     } else if *SHOW_MOVE_PICKER.peek() {
         *SHOW_MOVE_PICKER.write() = false;
+    } else if CONFIRM.peek().is_some() {
+        *CONFIRM.write() = None;
     }
 
     // Removed inputs never send focusout, so reset the flag here.
@@ -1104,6 +1143,14 @@ mod tests {
 
         dom.rebuild_in_place();
         dom
+    }
+
+    #[test]
+    fn delete_prompts_only_for_many() {
+        assert!(needs_confirm(Action::Delete, 2));
+        assert!(!needs_confirm(Action::Delete, 1));
+        assert!(!needs_confirm(Action::Archive, 5));
+        assert!(!needs_confirm(Action::DeleteConfirmed, 5));
     }
 
     #[test]

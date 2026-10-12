@@ -92,12 +92,14 @@ pub fn Settings() -> Element {
 
         let defaults = Keymap::defaults();
 
-        for ((action, _), chord) in rows().iter().zip(&parsed) {
-            if let Some(chord) = chord
-                && defaults.chord_for(*action).as_ref() != Some(chord)
+        for ((action, _), chords) in rows().iter().zip(&parsed) {
+            if let Some(chords) = chords
+                && defaults.chords_for(*action) != *chords
             {
+                let text: Vec<_> = chords.iter().map(keys::chord_text).collect();
+
                 cfg.shortcuts
-                    .insert(keys::action_name(*action), keys::chord_text(chord));
+                    .insert(keys::action_name(*action), text.join(", "));
             }
         }
 

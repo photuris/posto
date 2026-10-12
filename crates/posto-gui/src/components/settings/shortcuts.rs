@@ -1,4 +1,4 @@
-//! Shortcuts page: one editable chord per action, with validation.
+//! Shortcuts page: editable comma-separated chords per action, with validation.
 
 use std::collections::BTreeMap;
 
@@ -15,31 +15,36 @@ pub fn chord_rows(overrides: &BTreeMap<String, String>) -> Vec<(Action, String)>
     ALL_ACTIONS
         .into_iter()
         .map(|a| {
-            let text = map.chord_for(a).map(|c| keys::chord_text(&c));
+            let text: Vec<_> = map.chords_for(a).iter().map(keys::chord_text).collect();
 
-            (a, text.unwrap_or_default())
+            (a, text.join(", "))
         })
         .collect()
 }
 
-/// Parses every row's chord; `None` marks text that is not a shortcut.
-pub fn parse_rows(rows: &[(Action, String)]) -> Vec<Option<Chord>> {
+/// Parses every row's comma-separated chords; `None` marks text that is not a shortcut.
+pub fn parse_rows(rows: &[(Action, String)]) -> Vec<Option<Vec<Chord>>> {
     rows.iter()
-        .map(|(_, text)| Keymap::parse_chord(text).ok())
+        .map(|(_, text)| Keymap::parse_chords(text).ok())
         .collect()
 }
 
 /// A message per row that is invalid or shares its chord with another action.
-pub fn row_errors(rows: &[(Action, String)], parsed: &[Option<Chord>]) -> Vec<Option<String>> {
+pub fn row_errors(rows: &[(Action, String)], parsed: &[Option<Vec<Chord>>]) -> Vec<Option<String>> {
     parsed
         .iter()
         .enumerate()
         .map(|(i, chord)| match chord {
             None => Some("Not a valid shortcut, e.g. ctrl+k".to_string()),
-            Some(chord) => parsed
+            Some(chords) => parsed
                 .iter()
                 .enumerate()
-                .find(|(j, other)| *j != i && other.as_ref() == Some(chord))
+                .find(|(j, other)| {
+                    *j != i
+                        && other
+                            .as_ref()
+                            .is_some_and(|o| o.iter().any(|c| chords.contains(c)))
+                })
                 .map(|(j, _)| format!("Also used by {}", keys::action_label(rows[j].0))),
         })
         .collect()

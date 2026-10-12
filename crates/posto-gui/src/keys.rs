@@ -3,7 +3,7 @@
 use posto_core::shortcuts::{Action, Chord, Keymap};
 
 /// Every action, in the order Settings lists them.
-pub const ALL_ACTIONS: [Action; 20] = [
+pub const ALL_ACTIONS: [Action; 21] = [
     Action::Next,
     Action::Prev,
     Action::Open,
@@ -24,6 +24,7 @@ pub const ALL_ACTIONS: [Action; 20] = [
     Action::ExtendNext,
     Action::ExtendPrev,
     Action::SelectAll,
+    Action::DeleteConfirmed,
 ];
 
 /// Normalises a Dioxus `Key` display string and modifier state.
@@ -129,6 +130,11 @@ mod tests {
         let delete = Keymap::defaults().lookup(&chord_from_event("#", false, true, false, false));
         assert_eq!(delete, Some(Action::Delete));
         assert_eq!(chord_text(&enter), "ctrl+enter");
+
+        let del = chord_from_event("Delete", false, false, false, false);
+        assert_eq!(del.key, "delete");
+        let back = chord_from_event("Backspace", false, false, false, false);
+        assert_eq!(back.key, "backspace");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Keyboard shortcut map.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,8 @@ pub enum Action {
     ExtendNext,
     ExtendPrev,
     SelectAll,
+    /// Deletes the selection without asking; what the Delete confirmation runs.
+    DeleteConfirmed,
 }
 
 /// A key plus modifiers.
@@ -58,6 +60,8 @@ impl fmt::Display for Chord {
         }
         match self.key.as_str() {
             "escape" => f.write_str("Esc"),
+            "delete" => f.write_str("Del"),
+
             key => {
                 let mut chars = key.chars();
                 if let Some(first) = chars.next() {
@@ -69,12 +73,12 @@ impl fmt::Display for Chord {
     }
 }
 
-/// Chord to action bindings.
+/// Chord to action bindings, in config order (an action may have several chords).
 pub struct Keymap {
-    bindings: HashMap<Chord, Action>,
+    bindings: Vec<(Chord, Action)>,
 }
 
-/// Default bindings, as chord strings.
+/// Default bindings, as comma-separated chord strings.
 const DEFAULTS: &[(Action, &str)] = &[
     (Action::Next, "j"),
     (Action::Prev, "k"),
@@ -82,7 +86,7 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::Escape, "escape"),
     (Action::Back, "backspace"),
     (Action::Archive, "e"),
-    (Action::Delete, "#"),
+    (Action::Delete, "#, delete"),
     (Action::Reply, "r"),
     (Action::ReplyAll, "a"),
     (Action::Compose, "c"),
@@ -96,33 +100,50 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::ExtendNext, "shift+j"),
     (Action::ExtendPrev, "shift+k"),
     (Action::SelectAll, "ctrl+a"),
+    (Action::DeleteConfirmed, "ctrl+shift+delete"),
 ];
 
 impl Keymap {
     /// The built-in bindings.
     pub fn defaults() -> Keymap {
-        let bindings = DEFAULTS
-            .iter()
-            .map(|(action, chord)| {
-                let chord = Keymap::parse_chord(chord).expect("default chords are valid");
-                (chord, *action)
-            })
-            .collect();
-        Keymap { bindings }
+        let mut map = Keymap {
+            bindings: Vec::new(),
+        };
+
+        for (action, chords) in DEFAULTS {
+            map.bind(
+                *action,
+                Keymap::parse_chords(chords).expect("default chords are valid"),
+            );
+        }
+
+        map
     }
 
-    /// Defaults with each `action name -> chord` override replacing that
-    /// action's binding. A chord already bound to another action is taken over.
+    /// Defaults with each `action name -> chords` override replacing that
+    /// action's bindings; chords are comma-separated. A chord already bound to
+    /// another action is taken over.
     pub fn from_config(overrides: &BTreeMap<String, String>) -> Result<Keymap> {
         let mut map = Keymap::defaults();
-        for (name, chord) in overrides {
+        for (name, chords) in overrides {
             let action: Action = serde_json::from_value(serde_json::json!(name))
                 .map_err(|_| Error::Config(format!("unknown action {name}")))?;
-            let chord = Keymap::parse_chord(chord)?;
-            map.bindings.retain(|_, bound| *bound != action);
-            map.bindings.insert(chord, action);
+            map.bind(action, Keymap::parse_chords(chords)?);
         }
         Ok(map)
+    }
+
+    /// Replaces `action`'s chords with `chords`, unbinding them from any other action.
+    fn bind(&mut self, action: Action, chords: Vec<Chord>) {
+        self.bindings
+            .retain(|(c, bound)| *bound != action && !chords.contains(c));
+        self.bindings
+            .extend(chords.into_iter().map(|c| (c, action)));
+    }
+
+    /// Parses a comma-separated list such as `"#, delete"`.
+    pub fn parse_chords(s: &str) -> Result<Vec<Chord>> {
+        s.split(',').map(Keymap::parse_chord).collect()
     }
 
     /// Parses `"ctrl+shift+k"`, `"#"`, `"enter"`; modifiers in any order.
@@ -157,15 +178,24 @@ impl Keymap {
 
     /// The action bound to `c`, if any.
     pub fn lookup(&self, c: &Chord) -> Option<Action> {
-        self.bindings.get(c).copied()
-    }
-
-    /// The chord bound to `a`, if any.
-    pub fn chord_for(&self, a: Action) -> Option<Chord> {
         self.bindings
             .iter()
-            .find(|(_, bound)| **bound == a)
+            .find(|(chord, _)| chord == c)
+            .map(|(_, a)| *a)
+    }
+
+    /// The first chord bound to `a`, if any.
+    pub fn chord_for(&self, a: Action) -> Option<Chord> {
+        self.chords_for(a).into_iter().next()
+    }
+
+    /// Every chord bound to `a`, in config order.
+    pub fn chords_for(&self, a: Action) -> Vec<Chord> {
+        self.bindings
+            .iter()
+            .filter(|(_, bound)| *bound == a)
             .map(|(chord, _)| chord.clone())
+            .collect()
     }
 }
 
@@ -202,6 +232,7 @@ mod tests {
             Action::ExtendNext,
             Action::ExtendPrev,
             Action::SelectAll,
+            Action::DeleteConfirmed,
         ];
         for action in all {
             match action {
@@ -224,7 +255,8 @@ mod tests {
                 | Action::Escape
                 | Action::ExtendNext
                 | Action::ExtendPrev
-                | Action::SelectAll => {}
+                | Action::SelectAll
+                | Action::DeleteConfirmed => {}
             }
             assert!(map.chord_for(action).is_some(), "{action:?} unbound");
         }
@@ -234,6 +266,30 @@ mod tests {
         assert_eq!(map.lookup(&chord("shift+j")), Some(Action::ExtendNext));
         assert_eq!(map.lookup(&chord("shift+k")), Some(Action::ExtendPrev));
         assert_eq!(map.lookup(&chord("ctrl+a")), Some(Action::SelectAll));
+        assert_eq!(map.lookup(&chord("#")), Some(Action::Delete));
+        assert_eq!(map.lookup(&chord("delete")), Some(Action::Delete));
+        assert_eq!(map.lookup(&chord("backspace")), Some(Action::Back));
+    }
+
+    #[test]
+    fn multiple_chords() {
+        let over =
+            |name: &str, chord: &str| BTreeMap::from([(name.to_string(), chord.to_string())]);
+
+        let map = Keymap::from_config(&over("delete", "#, delete")).unwrap();
+        assert_eq!(map.lookup(&chord("#")), Some(Action::Delete));
+        assert_eq!(map.lookup(&chord("delete")), Some(Action::Delete));
+        assert_eq!(map.chords_for(Action::Delete).len(), 2);
+        assert_eq!(map.chord_for(Action::Delete), Some(chord("#")));
+
+        let map = Keymap::from_config(&over("archive", "e, y")).unwrap();
+        assert_eq!(map.lookup(&chord("y")), Some(Action::Archive));
+        assert_eq!(map.lookup(&chord("#")), Some(Action::Delete));
+
+        assert!(matches!(
+            Keymap::from_config(&over("archive", "e, ctrl+")),
+            Err(Error::Config(_))
+        ));
     }
 
     #[test]
@@ -278,5 +334,6 @@ mod tests {
         assert_eq!(chord("escape").to_string(), "Esc");
         assert_eq!(chord("enter").to_string(), "Enter");
         assert_eq!(chord("#").to_string(), "#");
+        assert_eq!(chord("delete").to_string(), "Del");
     }
 }

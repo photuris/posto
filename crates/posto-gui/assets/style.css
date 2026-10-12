@@ -260,6 +260,9 @@ input.number { width: 80px; }
 
 .picker { width: 320px; max-height: 60vh; padding: 12px; gap: 8px; overflow: auto; }
 .picker-title { font-weight: 600; }
+.picker.confirm { width: 340px; outline: none; }
+.confirm-body { color: var(--posto-muted); }
+.confirm-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .picker-row { padding: 6px 10px; border-radius: 6px; cursor: pointer; }
 .picker-row:hover, .picker-row.active { background: var(--sel); }
 

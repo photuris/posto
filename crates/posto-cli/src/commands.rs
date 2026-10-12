@@ -271,8 +271,12 @@ pub fn shortcuts_list() -> Result<Value> {
         Next, Prev, Open, Back, Archive, Delete, Reply, ReplyAll, Compose, ToggleRead, ToggleFlag,
         Move, Search, Sync, Junk, Send, Escape,
     ] {
-        if let Some(chord) = keymap.chord_for(action) {
-            rows.push((to_json(&action)?, chord.to_string()));
+        let chords = keymap.chords_for(action);
+
+        if !chords.is_empty() {
+            let text: Vec<_> = chords.iter().map(|c| c.to_string()).collect();
+
+            rows.push((to_json(&action)?, text.join(", ")));
         }
     }
 
