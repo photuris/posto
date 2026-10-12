@@ -1,21 +1,28 @@
-//! `posto-gui`: Dioxus desktop client.
+//! `posto-gui`: Dioxus desktop client over `posto_core`.
 
-use dioxus::prelude::*;
+mod app;
+mod components;
+mod format;
+mod keys;
+mod state;
+
+use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 
 fn main() {
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus::desktop::Config::new()
-                .with_window(dioxus::desktop::WindowBuilder::new().with_title("Posto")),
-        )
-        .launch(App);
-}
+    let backend = match state::Backend::from_env() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("posto-gui: {e}");
+            std::process::exit(1);
+        }
+    };
+    let window = WindowBuilder::new()
+        .with_title("Posto")
+        .with_inner_size(LogicalSize::new(1400.0, 900.0))
+        .with_min_inner_size(LogicalSize::new(900.0, 600.0));
 
-/// Root component.
-#[component]
-fn App() -> Element {
-    rsx! {
-        document::Style { {include_str!("../assets/style.css")} }
-        div { class: "app", "Posto" }
-    }
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(Config::new().with_window(window).with_menu(None))
+        .with_context(backend)
+        .launch(app::App);
 }
