@@ -32,9 +32,13 @@ fn main() {
     };
     let window = WindowBuilder::new()
         .with_title("Posto")
-        .with_decorations(false)
         .with_inner_size(LogicalSize::new(1400.0, 900.0))
         .with_min_inner_size(LogicalSize::new(900.0, 600.0));
+    // On Linux, tao's GTK backend draws its own title bar (client-side decorations) even on
+    // compositors like Hyprland that frame windows themselves, so turn it off there.
+    // macOS and Windows keep the native title bar and its buttons.
+    #[cfg(target_os = "linux")]
+    let window = window.with_decorations(false);
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(Config::new().with_window(window).with_menu(None))
