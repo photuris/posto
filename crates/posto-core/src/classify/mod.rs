@@ -13,6 +13,13 @@
 //! Billing is not exactly-once: if the process dies between Jev answering
 //! and that row being written, the answer is lost and the next run asks
 //! again.
+//!
+//! A user's correction always wins over an automatic answer: an answer never
+//! replaces an existing row, is not applied once the row carries a correction,
+//! and a pending correction is retried on every run, outside the queue's
+//! attempt budget. A correction that lands while an automatic move is already
+//! on its way to the server can be overtaken there; the stored row still says
+//! what the user chose.
 
 pub mod jev;
 pub mod state;
@@ -223,9 +230,14 @@ async fn drain<C: Classifier>(
 
             let answer = ask(cfg, store, client, classifier, account, id).await?;
 
-            store.put_classification(&answer)?;
             report.classified += 1;
             report.input_tokens += answer.input_tokens;
+
+            // A correction made while Jev was answering wins.
+            if !store.insert_answer(&answer)? {
+                return Ok(());
+            }
+
             report.unsure += usize::from(answer.unsure);
 
             settle(cfg, store, Some(client), &answer, report).await
@@ -241,8 +253,8 @@ async fn drain<C: Classifier>(
 }
 
 /// Applies every answer whose moves are unconfirmed, without asking Jev.
-/// Rows tied to a queue entry share its attempt budget; correction rows have
-/// none and are tried on every run.
+/// Automatic answers of enabled accounts tied to a queue entry share its
+/// attempt budget; corrections have none and are tried on every run.
 async fn apply_pending(
     cfg: &Config,
     store: &Store,
@@ -261,16 +273,23 @@ async fn apply_pending(
             continue;
         };
 
-        if !cfg.account(account).is_some_and(|a| a.enabled) {
-            continue;
-        }
-
-        if let Some(queued) = queue.get(&(row.account_id.clone(), row.email_id.clone())) {
-            if queued.attempts >= CLASSIFY_MAX_ATTEMPTS {
+        // A correction is the user's request: it needs only a connection.
+        // An automatic answer also needs the classifier to be enabled still.
+        if row.corrected_tray.is_none() {
+            if !cfg
+                .account(account)
+                .is_some_and(|a| cfg.classify_enabled_for(a))
+            {
                 continue;
             }
 
-            store.begin_classify_attempt(account, id)?;
+            if let Some(queued) = queue.get(&(row.account_id.clone(), row.email_id.clone())) {
+                if queued.attempts >= CLASSIFY_MAX_ATTEMPTS {
+                    continue;
+                }
+
+                store.begin_classify_attempt(account, id)?;
+            }
         }
 
         if let Err(e) = settle(cfg, store, Some(client), &row, report).await {
@@ -300,13 +319,25 @@ async fn settle(
     report: &mut ClassifyReport,
 ) -> Result<()> {
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
+    let seen = c.corrected_tray.as_deref();
 
-    match apply_row(cfg, store, client, c).await {
+    // An automatic answer gives way to a correction made since it was read.
+    if seen.is_none()
+        && store
+            .classification(account, id)?
+            .is_none_or(|now| now.corrected_tray.is_some())
+    {
+        return Ok(());
+    }
+
+    match apply_tray(cfg, store, client, c).await {
         Ok(flagged) => {
-            store.set_classification_applied(account, id, None)?;
-            store.remove_from_classify_queue(account, id)?;
             report.moved += 1;
             report.flagged += usize::from(flagged);
+
+            if store.confirm_classification(account, id, c.effective_tray(), seen)? {
+                store.remove_from_classify_queue(account, id)?;
+            }
 
             Ok(())
         }
@@ -462,10 +493,16 @@ fn unique(ids: Vec<String>) -> Vec<String> {
 /// - spam: sure goes to the junk mailbox and leaves the inbox; unsure stays
 ///   in the inbox and goes to the unsure mailbox only.
 ///
-/// A corrected row also leaves every other tray mailbox and the unsure
-/// mailbox, leaves junk unless it is spam, and returns to the inbox when the
-/// tray keeps mail there.
-async fn apply_row(
+/// A corrected row also leaves the mailbox of each tray it was in before (the
+/// last confirmed one and Jev's own answer), the junk mailbox when that was
+/// spam, and the unsure mailbox, and returns to the inbox when the new tray
+/// keeps mail there. Without a connection only the local copy changes.
+///
+/// # Errors
+///
+/// Returns an error when a needed mailbox is missing and cannot be created,
+/// when the server refuses the change, and on database failure.
+pub async fn apply_tray(
     cfg: &Config,
     store: &Store,
     client: Option<&Client>,
@@ -474,7 +511,7 @@ async fn apply_row(
     let tray: Tray = c.effective_tray().parse()?;
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
     let settings = &cfg.classify;
-    let tidy = c.corrected_tray.is_some();
+    let corrected = c.corrected_tray.is_some();
     let keeps = settings.keep_in_inbox.iter().any(|k| k == tray.as_str());
     let inbox = || {
         store
@@ -511,16 +548,8 @@ async fn apply_row(
         add.push(ensure_mailbox(store, client, account, &settings.unsure_mailbox).await?);
     }
 
-    if tidy {
-        for other in Tray::ALL.into_iter().filter(|t| *t != tray) {
-            let name = settings.trays.get(other.as_str());
-
-            if let Some(m) =
-                name.and_then(|n| store.top_level_mailbox_by_name(account, n).transpose())
-            {
-                remove.push(m?.id);
-            }
-        }
+    if corrected {
+        remove.extend(previous_mailboxes(cfg, store, c, tray)?);
 
         if !c.unsure
             && let Some(m) = store.top_level_mailbox_by_name(account, &settings.unsure_mailbox)?
@@ -528,14 +557,8 @@ async fn apply_row(
             remove.push(m.id);
         }
 
-        if tray != Tray::Spam {
-            if let Some(junk) = store.mailbox_by_role(account, "junk")? {
-                remove.push(junk.id);
-            }
-
-            if keeps {
-                add.push(inbox()?);
-            }
+        if tray != Tray::Spam && keeps {
+            add.push(inbox()?);
         }
     }
 
@@ -556,7 +579,7 @@ async fn apply_row(
         .await?;
     }
 
-    let flag = !tidy && tray == Tray::NeedsReply && c.urgency >= settings.flag_urgency_at;
+    let flag = !corrected && tray == Tray::NeedsReply && c.urgency >= settings.flag_urgency_at;
 
     if flag {
         accepted(store, client, account, id, Action::Flag).await?;
@@ -565,11 +588,51 @@ async fn apply_row(
     Ok(flag)
 }
 
+/// The mailboxes a correction to `new` undoes: those of the tray the server
+/// last confirmed and of Jev's own answer (unless the row is a manual one),
+/// whichever differ from `new`. Spam undoes the junk mailbox. Mailboxes that
+/// do not exist locally are skipped.
+fn previous_mailboxes(
+    cfg: &Config,
+    store: &Store,
+    c: &Classified,
+    new: Tray,
+) -> Result<Vec<String>> {
+    let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
+    let mut before: Vec<Tray> = Vec::new();
+
+    if let Some(confirmed) = store.confirmed_tray(account, id)? {
+        before.extend(confirmed.parse::<Tray>());
+    }
+
+    if c.model != "manual" {
+        before.extend(c.tray.parse::<Tray>());
+    }
+
+    let mut found = Vec::new();
+
+    for tray in before.into_iter().filter(|t| *t != new) {
+        let mailbox = if tray == Tray::Spam {
+            store.mailbox_by_role(account, "junk")?
+        } else {
+            match cfg.classify.trays.get(tray.as_str()) {
+                Some(name) => store.top_level_mailbox_by_name(account, name)?,
+                None => None,
+            }
+        };
+
+        found.extend(mailbox.map(|m| m.id));
+    }
+
+    Ok(found)
+}
+
 /// Files an email under `tray` by the user's decision. The choice is
-/// recorded first (inserting a manual row for an email Jev never saw), so
-/// when the server cannot be reached the correction stays pending and the
-/// next [`run`] retries it; without a connection for the account only the
-/// local copy changes. A correction never flags.
+/// recorded first (inserting a manual row for an email Jev never saw) and
+/// takes the email out of the classification queue, so when the server cannot
+/// be reached the correction stays pending and every later [`run`] retries it
+/// outside the queue's attempt budget; without a connection for the account
+/// only the local copy changes. A correction never flags.
 ///
 /// # Errors
 ///
@@ -585,17 +648,24 @@ pub async fn correct(
     let (account, id) = (msg.account_id.as_str(), msg.id.as_str());
 
     store.set_correction(account, id, tray.as_str())?;
+    store.remove_from_classify_queue(account, id)?;
 
     let row = store
         .classification(account, id)?
         .ok_or_else(|| Error::NotFound(format!("classification {msg}")))?;
     let client = clients.get(account).map(Arc::as_ref);
 
-    match apply_row(cfg, store, client, &row).await {
+    match apply_tray(cfg, store, client, &row).await {
         Ok(_) if client.is_none() => Ok(()),
         Ok(_) => {
-            store.set_classification_applied(account, id, None)?;
-            store.remove_from_classify_queue(account, id)
+            store.confirm_classification(
+                account,
+                id,
+                row.effective_tray(),
+                row.corrected_tray.as_deref(),
+            )?;
+
+            Ok(())
         }
         Err(e) => {
             store.set_classification_applied(account, id, Some(&e.to_string()))?;
@@ -661,4 +731,95 @@ pub fn backfill_candidates(
     }
 
     Ok(found.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Account;
+    use crate::store::{EmailSummary, Mailbox};
+
+    fn mailbox(id: &str, name: &str, role: Option<&str>) -> Mailbox {
+        Mailbox {
+            account_id: "a".into(),
+            id: id.into(),
+            name: name.into(),
+            role: role.map(String::from),
+            parent_id: None,
+            sort_order: 1,
+            total: 0,
+            unread: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_gives_way_to_a_correction_made_since_the_answer_was_read() {
+        let store = Store::open_memory().unwrap();
+        let cfg = Config {
+            accounts: vec![Account::new("a", "me@example.com")],
+            ..Config::default()
+        };
+
+        store
+            .upsert_mailboxes(&[
+                mailbox("inbox", "Inbox", Some("inbox")),
+                mailbox("up", "Updates", None),
+                mailbox("soc", "Social", None),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[EmailSummary {
+                account_id: "a".into(),
+                id: "e1".into(),
+                thread_id: "t".into(),
+                received_at: "2026-10-01T10:00:00Z".into(),
+                from: vec![],
+                to: vec![],
+                cc: vec![],
+                subject: "s".into(),
+                preview: "p".into(),
+                size: 1,
+                has_attachment: false,
+                mailbox_ids: vec!["inbox".into()],
+                keywords: vec![],
+            }])
+            .unwrap();
+
+        let answer = Classified {
+            account_id: "a".into(),
+            email_id: "e1".into(),
+            tray: "updates".into(),
+            probs: Default::default(),
+            urgency: 1,
+            personal: 0.0,
+            unsure: false,
+            model: "m".into(),
+            input_tokens: 0,
+            classified_at: "2026-10-01T10:00:00Z".into(),
+            corrected_tray: None,
+            applied: false,
+            apply_error: None,
+        };
+
+        store.put_classification(&answer).unwrap();
+
+        // The user corrects after `answer` was read but before it is applied.
+        store.set_correction("a", "e1", "social").unwrap();
+
+        let mut report = ClassifyReport::default();
+
+        settle(&cfg, &store, None, &answer, &mut report)
+            .await
+            .unwrap();
+
+        let mailboxes = store.email("a", "e1").unwrap().unwrap().mailbox_ids;
+
+        assert_eq!(mailboxes, ["inbox"]);
+        assert_eq!(report.moved, 0);
+
+        let row = store.classification("a", "e1").unwrap().unwrap();
+
+        assert!(!row.applied);
+        assert_eq!(row.corrected_tray.as_deref(), Some("social"));
+    }
 }

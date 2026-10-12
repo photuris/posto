@@ -522,6 +522,26 @@ async fn undecodable_and_incomplete_answers_are_errors() {
     }
 }
 
+#[tokio::test]
+async fn unknown_choice_error_does_not_echo_the_server() {
+    let jev = FakeJev::start(ResponseTemplate::new(200).set_body_json(json!({
+        "model": "m",
+        "answers": {
+            "category": { "choice": KEY },
+            "urgency": { "score": 1.0 },
+            "is_personal": { "noul": 0.1 },
+        },
+    })))
+    .await;
+    let err = classify::Classifier::classify(&jev.client(), "s")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("unknown choice"), "{err}");
+    assert!(!err.contains(KEY), "{err}");
+}
+
 // ── Mailbox creation ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1137,7 +1157,6 @@ async fn correct_classified_and_unclassified() -> Result<()> {
         [json!({
             "mailboxIds/mb-promos": null,
             "mailboxIds/mb-unsure": null,
-            "mailboxIds/mb-junk": null,
             "mailboxIds/mb-updates": true,
             "mailboxIds/mb-inbox": true,
         })]
@@ -1236,6 +1255,292 @@ async fn correct_classified_and_unclassified() -> Result<()> {
         p3.last(),
         p3.get(p3.len() - 2),
         "the repeat sends the same patch"
+    );
+
+    // An urgent paid row corrected into needs_reply is never flagged, neither
+    // by the correction itself nor by its retry.
+    for id in ["e4", "e5"] {
+        env.store
+            .upsert_emails(&[email("a", id, &["mb-inbox", "mb-promos"])])?;
+        env.store.put_classification(&Classified {
+            account_id: "a".into(),
+            email_id: id.into(),
+            tray: "promotional".into(),
+            probs: Default::default(),
+            urgency: 5,
+            personal: 0.9,
+            unsure: false,
+            model: "jev-test-1".into(),
+            input_tokens: 10,
+            classified_at: "2026-10-01T10:00:00Z".into(),
+            corrected_tray: None,
+            applied: true,
+            apply_error: None,
+        })?;
+    }
+
+    let m5 = MsgRef::new("a", "e5");
+
+    correct(&env.cfg, &env.store, &env.clients, &m5, Tray::NeedsReply).await?;
+
+    env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
+
+    let m4 = MsgRef::new("a", "e4");
+
+    assert!(
+        correct(&env.cfg, &env.store, &env.clients, &m4, Tray::NeedsReply)
+            .await
+            .is_err()
+    );
+
+    env.jmap_state.refuse_moves.store(false, Ordering::SeqCst);
+
+    let report = env.run(None).await;
+
+    assert_eq!((report.moved, report.flagged), (1, 0));
+
+    for id in ["e4", "e5"] {
+        assert!(env.store.classification("a", id)?.unwrap().applied, "{id}");
+        assert!(
+            env.mailboxes_of("a", id)
+                .contains(&"mb-needs-reply".to_string()),
+            "{id}"
+        );
+        assert!(!env.store.email("a", id)?.unwrap().is_flagged(), "{id}");
+        assert!(
+            patches(&env.jmap, id)
+                .await
+                .iter()
+                .all(|p| p.get("keywords/$flagged").is_none()),
+            "{id}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Classifies as `answer`, but the user corrects the email to `tray` while
+/// Jev is still thinking.
+struct CorrectsMidFlight<'a> {
+    env: &'a Env,
+    msg: MsgRef,
+    tray: Tray,
+    answer: Tray,
+}
+
+impl classify::Classifier for CorrectsMidFlight<'_> {
+    async fn classify(&self, _state: &str) -> Result<classify::Classification> {
+        correct(
+            &self.env.cfg,
+            &self.env.store,
+            &self.env.clients,
+            &self.msg,
+            self.tray,
+        )
+        .await?;
+
+        Ok(classify::Classification {
+            tray: self.answer,
+            probs: Default::default(),
+            urgency: 5,
+            personal: 0.9,
+            unsure: false,
+            model: "jev-test-1".into(),
+            input_tokens: 7,
+        })
+    }
+}
+
+#[tokio::test]
+async fn correction_wins_over_inflight_answer() -> Result<()> {
+    let env = env().await;
+
+    env.queue("a", "e1", &["mb-inbox"]);
+
+    let mid = CorrectsMidFlight {
+        env: &env,
+        msg: MsgRef::new("a", "e1"),
+        tray: Tray::Social,
+        answer: Tray::NeedsReply,
+    };
+    let report = run_with_lock(&env.lock, &env.cfg, &env.store, &env.clients, &mid, None).await;
+    let row = env.store.classification("a", "e1")?.unwrap();
+
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(row.corrected_tray.as_deref(), Some("social"));
+    assert!(row.applied);
+    assert!(
+        env.mailboxes_of("a", "e1")
+            .contains(&"mb-social".to_string())
+    );
+    assert!(
+        !env.mailboxes_of("a", "e1")
+            .contains(&"mb-needs-reply".to_string())
+    );
+    assert!(!env.store.email("a", "e1")?.unwrap().is_flagged());
+    assert_eq!(env.store.classify_queue_len("a")?, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_correction_retries_after_exhausted_queue() -> Result<()> {
+    let env = env().await;
+
+    env.queue("a", "e1", &["mb-inbox"]);
+
+    for _ in 0..3 {
+        env.store.begin_classify_attempt("a", "e1")?;
+    }
+
+    env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
+
+    assert!(
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &MsgRef::new("a", "e1"),
+            Tray::Social,
+        )
+        .await
+        .is_err()
+    );
+
+    env.jmap_state.refuse_moves.store(false, Ordering::SeqCst);
+
+    let report = env.run(None).await;
+
+    assert_eq!((report.moved, report.errors.len()), (1, 0));
+    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    assert!(
+        env.mailboxes_of("a", "e1")
+            .contains(&"mb-social".to_string())
+    );
+    assert_eq!(env.jev.bodies().await.len(), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn correction_preserves_unrelated_memberships() -> Result<()> {
+    let env = env().await;
+
+    env.store.upsert_mailboxes(&[
+        mailbox("a", "mb-social", "Social", None),
+        mailbox("a", "mb-updates", "Updates", None),
+    ])?;
+    env.queue(
+        "a",
+        "e1",
+        &["mb-inbox", "mb-projects", "mb-social", "mb-junk"],
+    );
+    env.run(None).await;
+
+    let m1 = MsgRef::new("a", "e1");
+
+    assert_eq!(
+        env.mailboxes_of("a", "e1"),
+        sorted(&[
+            "mb-inbox",
+            "mb-projects",
+            "mb-social",
+            "mb-junk",
+            "mb-updates"
+        ])
+    );
+
+    // Updates -> needs_reply drops only the updates folder.
+    correct(&env.cfg, &env.store, &env.clients, &m1, Tray::NeedsReply).await?;
+
+    assert_eq!(
+        env.mailboxes_of("a", "e1"),
+        sorted(&[
+            "mb-inbox",
+            "mb-projects",
+            "mb-social",
+            "mb-junk",
+            "mb-needs-reply"
+        ])
+    );
+
+    // A failed second correction is retried; the retry still knows the folder
+    // the server holds (needs_reply), not only Jev's original answer.
+    env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
+
+    assert!(
+        correct(&env.cfg, &env.store, &env.clients, &m1, Tray::Promotional)
+            .await
+            .is_err()
+    );
+
+    env.jmap_state.refuse_moves.store(false, Ordering::SeqCst);
+    env.run(None).await;
+
+    assert_eq!(
+        env.mailboxes_of("a", "e1"),
+        sorted(&["mb-projects", "mb-social", "mb-junk", "mb-promos"])
+    );
+
+    // Junk goes only when the previous tray was spam.
+    env.queue("a", "e2", &["mb-inbox"]);
+    env.run(None).await;
+
+    let m2 = MsgRef::new("a", "e2");
+
+    correct(&env.cfg, &env.store, &env.clients, &m2, Tray::Spam).await?;
+
+    assert_eq!(env.mailboxes_of("a", "e2"), ["mb-junk"]);
+
+    correct(&env.cfg, &env.store, &env.clients, &m2, Tray::Updates).await?;
+
+    assert_eq!(
+        env.mailboxes_of("a", "e2"),
+        sorted(&["mb-inbox", "mb-updates"])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_automatic_answer_respects_opt_out_but_corrections_do_not() -> Result<()> {
+    let mut env = env().await;
+
+    env.queue("a", "e1", &["mb-inbox"]);
+    env.queue("a", "e2", &["mb-inbox"]);
+    env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
+    env.run(None).await;
+
+    // Both answers are saved, unapplied. The user corrects e2 (refused too).
+    assert!(!env.store.classification("a", "e1")?.unwrap().applied);
+    assert!(
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &MsgRef::new("a", "e2"),
+            Tray::Social,
+        )
+        .await
+        .is_err()
+    );
+
+    env.cfg.accounts[0].classify = Some(false);
+    env.jmap_state.refuse_moves.store(false, Ordering::SeqCst);
+    env.run(None).await;
+
+    assert!(
+        !env.store.classification("a", "e1")?.unwrap().applied,
+        "an opted-out account gets no automatic moves"
+    );
+    assert!(
+        patches(&env.jmap, "e1").await.len() == 1,
+        "only the refused try"
+    );
+    assert!(env.store.classification("a", "e2")?.unwrap().applied);
+    assert!(
+        env.mailboxes_of("a", "e2")
+            .contains(&"mb-social".to_string())
     );
 
     Ok(())

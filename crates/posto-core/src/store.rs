@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::jmap::Identity;
 
 /// Version of the table layout below; stored in `sync_state` as `schema_version`.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// Database schema; every statement is idempotent.
 const SCHEMA: &str = "
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS email_mailboxes(account_id TEXT NOT NULL, email_id TE
 CREATE INDEX IF NOT EXISTS email_mailboxes_box ON email_mailboxes(account_id, mailbox_id);
 CREATE TABLE IF NOT EXISTS bodies(account_id TEXT NOT NULL, email_id TEXT NOT NULL, html TEXT, text TEXT, attachments_json TEXT NOT NULL, in_reply_to_json TEXT NOT NULL, references_json TEXT NOT NULL, message_id_json TEXT NOT NULL, PRIMARY KEY(account_id, email_id));
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(account_id UNINDEXED, email_id UNINDEXED, subject, from_text, preview, body_text);
-CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, PRIMARY KEY(account_id, email_id));
+CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, applied_tray TEXT, PRIMARY KEY(account_id, email_id));
 CREATE TABLE IF NOT EXISTS classify_queue(account_id TEXT NOT NULL, email_id TEXT NOT NULL, added_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(account_id, email_id));
 ";
 
@@ -1083,10 +1083,26 @@ impl Store {
     ///
     /// Returns an error on database failure.
     pub fn put_classification(&self, c: &Classified) -> Result<()> {
-        self.conn().execute(
+        self.write_classified("INSERT OR REPLACE", c).map(drop)
+    }
+
+    /// Records a classifier answer unless the email already has a row (a
+    /// correction got there first); returns whether the answer was stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn insert_answer(&self, c: &Classified) -> Result<bool> {
+        self.write_classified("INSERT OR IGNORE", c).map(|n| n > 0)
+    }
+
+    /// Writes one `classified` row with the given SQL insert verb; returns the
+    /// number of rows written.
+    fn write_classified(&self, verb: &str, c: &Classified) -> Result<usize> {
+        Ok(self.conn().execute(
             &format!(
-                "INSERT OR REPLACE INTO classified({CLASSIFIED_COLS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                "{verb} INTO classified({CLASSIFIED_COLS}, applied_tray) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ),
             params![
                 c.account_id,
@@ -1102,10 +1118,27 @@ impl Store {
                 c.corrected_tray,
                 c.applied,
                 c.apply_error,
+                c.applied.then(|| c.effective_tray()),
             ],
-        )?;
+        )?)
+    }
 
-        Ok(())
+    /// The tray whose mailbox changes the server last confirmed for an email,
+    /// if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn confirmed_tray(&self, account: &str, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT applied_tray FROM classified WHERE account_id = ?1 AND email_id = ?2",
+                [account, id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// The classification of one email.
@@ -1182,12 +1215,48 @@ impl Store {
         error: Option<&str>,
     ) -> Result<()> {
         self.conn().execute(
-            "UPDATE classified SET applied = ?3, apply_error = ?4 \
+            "UPDATE classified SET applied = ?3, apply_error = ?4, \
+             applied_tray = CASE WHEN ?3 THEN COALESCE(corrected_tray, tray) ELSE applied_tray END \
              WHERE account_id = ?1 AND email_id = ?2",
             params![account, id, error.is_none(), error],
         )?;
 
         Ok(())
+    }
+
+    /// Records that the server holds the mailbox changes for `tray` and
+    /// confirms the row, unless the correction changed since `seen_correction`
+    /// was read; then the row stays pending for the newer choice. Returns
+    /// whether the row was confirmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn confirm_classification(
+        &self,
+        account: &str,
+        id: &str,
+        tray: &str,
+        seen_correction: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn();
+
+        conn.execute(
+            "UPDATE classified SET applied_tray = ?3, \
+             applied = CASE WHEN corrected_tray IS ?4 THEN 1 ELSE 0 END, \
+             apply_error = CASE WHEN corrected_tray IS ?4 THEN NULL ELSE apply_error END \
+             WHERE account_id = ?1 AND email_id = ?2",
+            params![account, id, tray, seen_correction],
+        )?;
+
+        Ok(conn
+            .query_row(
+                "SELECT applied FROM classified WHERE account_id = ?1 AND email_id = ?2",
+                [account, id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
     }
 
     /// Records the user's choice of `tray` for an email and leaves the
@@ -1677,7 +1746,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("3"));
         assert_eq!(store.account_state("a", "email_state").unwrap(), None);
         assert_eq!(store.state("email_state").unwrap(), None);
         assert_eq!(store.state("identities").unwrap(), None);
@@ -1709,7 +1778,7 @@ mod tests {
 
             conn.execute_batch(
                 "CREATE TABLE sync_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO sync_state VALUES ('schema_version', '3');",
+                 INSERT INTO sync_state VALUES ('schema_version', '4');",
             )
             .unwrap();
         }
@@ -2078,7 +2147,7 @@ mod tests {
             store.account_state("b", "email_state").unwrap().as_deref(),
             Some("s1")
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("3"));
         assert_eq!(store.search(None, "subject", 0).unwrap().len(), 1);
     }
 

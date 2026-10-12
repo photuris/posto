@@ -1,5 +1,7 @@
 //! The state block sent to Jev, ported from jevmail's `internal/message`.
 
+use html2text::render::TextDecorator;
+
 use crate::store::{EmailBody, EmailSummary};
 
 /// Everything the state block shows.
@@ -89,11 +91,90 @@ fn utc(s: &str) -> String {
         .unwrap_or_else(|_| s.to_string())
 }
 
-/// HTML as plain text without link markers or footnotes (jevmail's
-/// `OmitLinks`).
+/// Decorator matching jaytaylor/html2text with `OmitLinks`: bold and strong
+/// text is wrapped in `*`, list items start with `* `, quotes with `> `; links,
+/// emphasis, code and images add nothing.
+#[derive(Clone, Debug)]
+struct JevDecorator;
+
+impl TextDecorator for JevDecorator {
+    type Annotation = ();
+
+    fn decorate_link_start(&mut self, _url: &str) -> (String, ()) {
+        (String::new(), ())
+    }
+
+    fn decorate_link_end(&mut self) -> String {
+        String::new()
+    }
+
+    fn decorate_em_start(&self) -> (String, ()) {
+        (String::new(), ())
+    }
+
+    fn decorate_em_end(&self) -> String {
+        String::new()
+    }
+
+    fn decorate_strong_start(&self) -> (String, ()) {
+        ("*".into(), ())
+    }
+
+    fn decorate_strong_end(&self) -> String {
+        "*".into()
+    }
+
+    fn decorate_strikeout_start(&self) -> (String, ()) {
+        (String::new(), ())
+    }
+
+    fn decorate_strikeout_end(&self) -> String {
+        String::new()
+    }
+
+    fn decorate_code_start(&self) -> (String, ()) {
+        (String::new(), ())
+    }
+
+    fn decorate_code_end(&self) -> String {
+        String::new()
+    }
+
+    fn decorate_preformat_first(&self) {}
+
+    fn decorate_preformat_cont(&self) {}
+
+    fn decorate_image(&mut self, _src: &str, _title: &str) -> (String, ()) {
+        (String::new(), ())
+    }
+
+    fn header_prefix(&self, _level: usize) -> String {
+        String::new()
+    }
+
+    fn quote_prefix(&self) -> String {
+        "> ".into()
+    }
+
+    fn unordered_item_prefix(&self) -> String {
+        "* ".into()
+    }
+
+    fn ordered_item_prefix(&self, _i: i64) -> String {
+        "* ".into()
+    }
+
+    fn make_subblock_decorator(&self) -> Self {
+        JevDecorator
+    }
+}
+
+/// HTML as text the way jevmail's `message.HTMLToText` renders it. Headings
+/// carry no divider lines, which jevmail adds.
 fn html_to_text(html: &str) -> String {
-    html2text::config::with_decorator(html2text::render::TrivialDecorator::new())
+    html2text::config::with_decorator(JevDecorator)
         .string_from_read(html.as_bytes(), 10_000)
+        .map(|t| t.trim().to_string())
         .unwrap_or_else(|_| crate::html::to_text(html))
 }
 
@@ -325,11 +406,30 @@ mod tests {
     }
 
     #[test]
+    fn html_to_text_matches_jevmail() {
+        // jevmail's TestHTMLToText.
+        assert_eq!(html_to_text("<p>Hi <b>there</b></p>"), "Hi *there*");
+        assert_eq!(html_to_text("<p>Hi <strong>you</strong></p>"), "Hi *you*");
+        // Emphasis and links add nothing.
+        assert_eq!(
+            html_to_text("<p>a <i>b</i> <a href=\"https://x.example\">c</a></p>"),
+            "a b c"
+        );
+        assert_eq!(
+            html_to_text("<ul><li>one</li><li>two</li></ul>"),
+            "* one\n* two"
+        );
+    }
+
+    #[test]
     fn clean_body_matches_jevmail() {
         let raw = "Hi\r\n\r\n\r\n\r\nsee ![logo](cid:1) <https://a.example/x?y=1> https://b.example/p \
                    and www.c.example/q now\t\t\tgo  on\n\n\n\nbye  ";
 
         assert_eq!(clean_body(raw, 2000), "Hi\n\nsee and now go on\n\nbye");
+        // Exactly three newlines collapse to two; two stay.
+        assert_eq!(clean_body("a\n\n\nb", 2000), "a\n\nb");
+        assert_eq!(clean_body("a\n\nb", 2000), "a\n\nb");
         // A bare scheme with nothing after it is not a URL.
         assert_eq!(clean_body("http:// x", 2000), "http:// x");
         // Exactly max_chars stays whole; one more is cut.

@@ -138,7 +138,8 @@ fn decide(a: &Answers, margin: f64) -> Result<Classification> {
     let tray: Tray = category
         .choice
         .parse()
-        .map_err(|_| Error::Other(format!("jev: unknown choice {:?}", category.choice)))?;
+        // Static message: the choice is server-controlled text.
+        .map_err(|_| Error::Other("jev: unknown choice".into()))?;
     let mut probs = BTreeMap::new();
     let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
 
@@ -284,7 +285,8 @@ impl Classifier for JevClient {
             // Static message: serde errors can quote the response.
             let resp: Response = serde_json::from_str(&body)
                 .map_err(|_| Error::Other("jev: decode response".into()))?;
-            let mut c = decide(&resp.answers, self.margin)?;
+            let mut c = decide(&resp.answers, self.margin)
+                .map_err(|e| Error::Other(self.scrub(&e.to_string())))?;
 
             c.model = resp.model;
             c.input_tokens = resp.usage.input_tokens;
