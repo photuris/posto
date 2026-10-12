@@ -159,6 +159,14 @@ fn email_search() {
 }
 
 #[test]
+fn jsonl_empty_list_prints_nothing() {
+    let out = Sandbox::seeded().run_with(&["email", "search", "zzzz", "--jsonl"], None);
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"", "stdout was {:?}", out.stdout);
+}
+
+#[test]
 fn archive_offline_mirrors() {
     let sb = Sandbox::seeded();
     let v = sb.json(&["email", "archive", "fx-01"]);

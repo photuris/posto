@@ -11,14 +11,18 @@ use serde_json::Value;
 pub fn emit<T: Serialize>(value: &T, plain: bool, jsonl: bool) {
     let value = serde_json::to_value(value).expect("command output is serializable");
     let text = if jsonl {
-        match &value {
-            Value::Array(items) => items
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            other => other.to_string(),
+        if let Value::Array(items) = &value {
+            // One line per element; an empty list writes nothing at all.
+            let mut out = std::io::stdout().lock();
+
+            for item in items {
+                let _ = writeln!(out, "{item}");
+            }
+
+            return;
         }
+
+        value.to_string()
     } else if plain {
         plain_text(&value)
     } else {

@@ -268,5 +268,7 @@ pub enum ShortcutsCmd {
 #[derive(Subcommand)]
 pub enum DevCmd {
     /// Fill the store with fixture data.
+    ///
+    /// Output: {"seeded": true}
     Seed,
 }
