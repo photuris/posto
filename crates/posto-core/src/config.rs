@@ -419,16 +419,18 @@ struct SecretsFile {
     typesafe_key: Option<String>,
 }
 
-/// Writes `text` to `path` through a temporary file created with mode 0600
-/// (unix), so secret bytes are never readable by others, then renames it over
-/// `path`.
+/// Writes `text` to `path` through a fresh, uniquely named temporary file
+/// created with mode 0600 (unix), then renames it over `path` and sets 0600
+/// on the result.
+///
+/// The temporary file is created with `create_new`, so a leftover file with
+/// looser permissions is never reused. A name collision is retried once.
 fn write_private(path: &std::path::Path, text: &str) -> Result<()> {
     use std::io::Write;
 
-    let tmp = path.with_extension("toml.tmp");
     let mut options = std::fs::OpenOptions::new();
 
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
 
     #[cfg(unix)]
     {
@@ -437,8 +439,43 @@ fn write_private(path: &std::path::Path, text: &str) -> Result<()> {
         options.mode(0o600);
     }
 
-    options.open(&tmp)?.write_all(text.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
+    let tmp_name = || {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+        path.with_file_name(format!("{name}.{}.{nanos}.tmp", std::process::id()))
+    };
+
+    let mut tmp = tmp_name();
+    let mut file = match options.open(&tmp) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tmp = tmp_name();
+
+            options.open(&tmp)?
+        }
+        other => other?,
+    };
+
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+
+    if let Err(e) = written {
+        // Best effort: the original error is the one worth reporting.
+        std::fs::remove_file(&tmp).ok();
+
+        return Err(e.into());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
 
     Ok(())
 }
@@ -891,13 +928,14 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = isolate();
 
-        // A pre-existing loose file must come out 0600 too.
-        std::fs::write(dir.path().join("secrets.toml"), "").unwrap();
-        std::fs::set_permissions(
-            dir.path().join("secrets.toml"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        // A pre-existing loose file must come out 0600 too, and a loose
+        // leftover temporary file must not be reused for the new bytes.
+        let stale = dir.path().join("secrets.toml.tmp");
+
+        for path in [dir.path().join("secrets.toml"), stale.clone()] {
+            std::fs::write(&path, "").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
 
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observer = {
@@ -938,6 +976,11 @@ mod tests {
                 & 0o777,
             0o600
         );
+
+        let stale_meta = std::fs::metadata(&stale).unwrap();
+
+        assert_eq!(stale_meta.len(), 0, "stale temporary file was written");
+        assert_eq!(stale_meta.permissions().mode() & 0o777, 0o644);
     }
 
     #[test]
