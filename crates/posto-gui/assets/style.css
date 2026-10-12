@@ -112,6 +112,7 @@ input.invalid { border-color: #d33; }
 .list-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .list-title { font-weight: 600; }
 .list-counts { font-size: 12px; color: var(--posto-muted); }
+.sel-count { color: var(--posto-accent); font-weight: 600; }
 .rows { flex: 1; overflow-y: auto; padding: 6px; }
 .empty { padding: 24px; text-align: center; color: var(--posto-muted); }
 .row {
@@ -120,6 +121,7 @@ input.invalid { border-color: #d33; }
 }
 .row:hover { background: var(--hover); }
 .row.selected { background: var(--sel); }
+.row.focused { outline: 2px solid var(--posto-accent); outline-offset: -2px; }
 .avatar {
   flex: none; width: 36px; height: 36px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
@@ -247,3 +249,7 @@ input.number { width: 80px; }
   background: var(--posto-lighter-background); border: 1px solid var(--border);
   box-shadow: 0 4px 16px rgb(0 0 0 / 0.25);
 }
+
+.bulk-panel { display: flex; flex-direction: column; align-items: center; gap: 14px; color: var(--fg); }
+.bulk-panel h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.bulk-buttons { display: grid; grid-template-columns: repeat(4, auto); gap: 8px; }

@@ -28,6 +28,9 @@ pub enum Action {
     Junk,
     Send,
     Escape,
+    ExtendNext,
+    ExtendPrev,
+    SelectAll,
 }
 
 /// A key plus modifiers.
@@ -90,6 +93,9 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::Sync, "g"),
     (Action::Junk, "!"),
     (Action::Send, "ctrl+enter"),
+    (Action::ExtendNext, "shift+j"),
+    (Action::ExtendPrev, "shift+k"),
+    (Action::SelectAll, "ctrl+a"),
 ];
 
 impl Keymap {
@@ -193,6 +199,9 @@ mod tests {
             Action::Junk,
             Action::Send,
             Action::Escape,
+            Action::ExtendNext,
+            Action::ExtendPrev,
+            Action::SelectAll,
         ];
         for action in all {
             match action {
@@ -212,13 +221,19 @@ mod tests {
                 | Action::Sync
                 | Action::Junk
                 | Action::Send
-                | Action::Escape => {}
+                | Action::Escape
+                | Action::ExtendNext
+                | Action::ExtendPrev
+                | Action::SelectAll => {}
             }
             assert!(map.chord_for(action).is_some(), "{action:?} unbound");
         }
         assert_eq!(map.chord_for(Action::Back), Some(chord("backspace")));
         assert_eq!(map.chord_for(Action::Escape), Some(chord("escape")));
         assert_eq!(map.lookup(&chord("e")), Some(Action::Archive));
+        assert_eq!(map.lookup(&chord("shift+j")), Some(Action::ExtendNext));
+        assert_eq!(map.lookup(&chord("shift+k")), Some(Action::ExtendPrev));
+        assert_eq!(map.lookup(&chord("ctrl+a")), Some(Action::SelectAll));
     }
 
     #[test]

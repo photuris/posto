@@ -15,6 +15,7 @@ use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::components::{Composer, MessageList, MovePicker, Reader, Settings, Sidebar, Toolbar};
+use crate::selection::{Click, Selection};
 use crate::state::{self, Backend};
 use crate::{format, keys};
 
@@ -28,7 +29,8 @@ const TOAST: Duration = Duration::from_secs(6);
 pub static SELECTED_MAILBOX: GlobalSignal<Option<String>> = Signal::global(|| None);
 pub static MAILBOXES: GlobalSignal<Vec<Mailbox>> = Signal::global(Vec::new);
 pub static EMAILS: GlobalSignal<Vec<EmailSummary>> = Signal::global(Vec::new);
-pub static SELECTED_EMAIL: GlobalSignal<Option<String>> = Signal::global(|| None);
+/// The selected messages; the focused one is shown in the reader.
+pub static SELECTION: GlobalSignal<Selection> = Signal::global(Selection::default);
 pub static BODY: GlobalSignal<Option<EmailBody>> = Signal::global(|| None);
 pub static BODY_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
 pub static ALLOW_REMOTE: GlobalSignal<bool> = Signal::global(|| false);
@@ -65,6 +67,11 @@ static LAST_SYNC: GlobalSignal<Option<Instant>> = Signal::global(|| None);
 thread_local! {
     /// The `Signal<Backend>` provided to the tree, reachable from detached tasks.
     static BACKEND: Cell<Option<Signal<Backend>>> = const { Cell::new(None) };
+}
+
+/// The focused message: the one the reader shows and replies go to.
+pub fn selected_email() -> Option<String> {
+    SELECTION.read().focus.clone()
 }
 
 /// The shared backend (see [`Backend`]).
@@ -300,7 +307,7 @@ pub fn App() -> Element {
                     return;
                 }
 
-                let action = KEYMAP.read().lookup(&chord);
+                let action = keys::lookup_with_meta_fallback(&KEYMAP.read(), &chord);
 
                 if let Some(action) = action {
                     evt.prevent_default();
@@ -364,11 +371,21 @@ pub fn dispatch(action: Action) {
     let modal = COMPOSER.peek().is_some() || *SHOW_SETTINGS.peek() || *SHOW_MOVE_PICKER.peek();
 
     match action {
+        Action::Escape if !modal && !*TYPING.peek() && SELECTION.peek().len() > 1 => {
+            change_selection(Selection::collapse);
+        }
         Action::Back | Action::Escape => close_top(),
         Action::Send if COMPOSER.peek().is_some() => send(false),
         _ if modal => {}
-        Action::Next => step(1),
-        Action::Prev => step(-1),
+        Action::Next => move_focus(1, false),
+        Action::Prev => move_focus(-1, false),
+        Action::ExtendNext => move_focus(1, true),
+        Action::ExtendPrev => move_focus(-1, true),
+        Action::SelectAll => {
+            let order = list_order();
+
+            change_selection(|s| s.all(&order));
+        }
         Action::Open => focus("reader-body"),
         Action::Archive => run(act_on_selected(actions::Action::Archive)),
         Action::Delete => run(act_on_selected(actions::Action::Delete)),
@@ -376,10 +393,10 @@ pub fn dispatch(action: Action) {
         Action::Reply => run(start_reply(false)),
         Action::ReplyAll => run(start_reply(true)),
         Action::Compose => open_composer(compose::Draft::default()),
-        Action::ToggleRead => run(toggle(true)),
-        Action::ToggleFlag => run(toggle(false)),
+        Action::ToggleRead => toggle(true),
+        Action::ToggleFlag => toggle(false),
         Action::Move => {
-            if SELECTED_EMAIL.peek().is_some() {
+            if !SELECTION.peek().is_empty() {
                 *SHOW_MOVE_PICKER.write() = true;
             }
         }
@@ -456,29 +473,20 @@ fn close_top() {
     focus_root();
 }
 
-/// Moves the selection `delta` rows.
-fn step(delta: isize) {
-    let next = {
-        let list = EMAILS.peek();
-        let Some(last) = list.len().checked_sub(1) else {
-            return;
-        };
-        let current = SELECTED_EMAIL
-            .peek()
-            .as_ref()
-            .and_then(|id| list.iter().position(|e| &e.id == id));
-        let index = match current {
-            Some(i) => i.saturating_add_signed(delta).min(last),
-            None if delta > 0 => 0,
-            None => last,
-        };
+/// Moves the focus `delta` rows; `extend` grows the selection instead of replacing it.
+fn move_focus(delta: i32, extend: bool) {
+    let order = list_order();
 
-        list[index].id.clone()
-    };
+    change_selection(|s| {
+        if extend {
+            s.extend(&order, delta);
+        } else {
+            s.step(&order, delta);
+        }
+    });
 
-    if SELECTED_EMAIL.peek().as_deref() != Some(next.as_str()) {
-        scroll_to_row(&next);
-        select_email(Some(next));
+    if let Some(id) = SELECTION.peek().focus.clone() {
+        scroll_to_row(&id);
     }
 }
 
@@ -487,7 +495,7 @@ pub fn select_mailbox(id: String) {
     *SELECTED_MAILBOX.write() = Some(id);
     SEARCH_QUERY.write().clear();
     *LIST_LIMIT.write() = PAGE;
-    select_email(None);
+    change_selection(|s| *s = Selection::default());
     run(reload_list());
 }
 
@@ -511,14 +519,36 @@ pub fn search_input(query: String) {
     });
 }
 
-/// Selects `id` (or nothing), loads its body and marks it read after a second.
-pub fn select_email(id: Option<String>) {
-    *ALLOW_REMOTE.write() = id.as_deref().is_some_and(remote_trusted);
+/// The ids of the rows on screen, in order.
+fn list_order() -> Vec<String> {
+    EMAILS.peek().iter().map(|e| e.id.clone()).collect()
+}
+
+/// A click on the row `id`.
+pub fn click_email(id: &str, kind: Click) {
+    let order = list_order();
+
+    change_selection(|s| s.click(&order, id, kind));
+}
+
+/// Applies `edit` to the selection. When the focused message changes, loads its
+/// body and marks it read after a second.
+fn change_selection(edit: impl FnOnce(&mut Selection)) {
+    let before = SELECTION.peek().focus.clone();
+
+    edit(&mut SELECTION.write());
+
+    let after = SELECTION.peek().focus.clone();
+
+    if before == after {
+        return;
+    }
+
+    *ALLOW_REMOTE.write() = after.as_deref().is_some_and(remote_trusted);
     *BODY.write() = None;
     *BODY_ERROR.write() = None;
-    *SELECTED_EMAIL.write() = id.clone();
 
-    if let Some(id) = id {
+    if let Some(id) = after {
         run(load_body(id.clone()));
         run(mark_read_later(id));
     }
@@ -576,7 +606,7 @@ async fn body_for(id: &str) -> Result<EmailBody> {
 async fn load_body(id: String) {
     let result = body_for(&id).await;
 
-    if SELECTED_EMAIL.peek().as_deref() != Some(id.as_str()) {
+    if SELECTION.peek().focus.as_deref() != Some(id.as_str()) {
         return;
     }
 
@@ -592,7 +622,7 @@ async fn load_body(id: String) {
 async fn mark_read_later(id: String) {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    if SELECTED_EMAIL.peek().as_deref() != Some(id.as_str()) {
+    if SELECTION.peek().focus.as_deref() != Some(id.as_str()) {
         return;
     }
 
@@ -731,91 +761,111 @@ pub async fn reload_list() {
     }
 }
 
-/// Applies `action` to the selected email.
+/// Applies `action` to every selected email.
 async fn act_on_selected(action: actions::Action) {
     let Some(_busy) = Flag::take(&BUSY) else {
         return;
     };
-    let Some(id) = SELECTED_EMAIL.peek().clone() else {
+    let ids = SELECTION.peek().ids.clone();
+
+    if ids.is_empty() {
         return;
-    };
+    }
+
+    let n = ids.len();
+    let s = if n == 1 { "" } else { "s" };
     let done = match &action {
-        actions::Action::Archive => "Archived",
-        actions::Action::Delete => "Moved to Trash",
-        actions::Action::Junk => "Marked as junk",
-        _ => "Moved",
+        actions::Action::Archive => format!("Archived {n} message{s}"),
+        actions::Action::Delete => format!("Moved {n} message{s} to Trash"),
+        actions::Action::Junk => format!("Marked {n} message{s} as junk"),
+        _ => format!("Moved {n} message{s}"),
     };
 
-    match act_on_email(&id, action).await {
+    match act_on_emails(&ids, action).await {
         Ok(()) => set_status(done),
         Err(e) => fail("Action failed", e),
     }
 }
 
-/// Applies `action` to `id`, reloads the list, and moves the selection on if `id`
-/// was selected and left the list.
-async fn act_on_email(id: &str, action: actions::Action) -> Result<()> {
-    let old_index = EMAILS.peek().iter().position(|e| e.id == id);
+/// Applies `action` to `ids`, reloads the list, and drops the ones that left it from the
+/// selection. If that empties the selection, the row at the old focus's position takes over.
+async fn act_on_emails(ids: &[String], action: actions::Action) -> Result<()> {
+    let old_index = SELECTION
+        .peek()
+        .focus
+        .as_ref()
+        .and_then(|f| EMAILS.peek().iter().position(|e| &e.id == f));
+    let had_selection = !SELECTION.peek().is_empty();
 
-    apply_local(&[id.to_string()], action).await?;
+    apply_local(ids, action).await?;
     reload_list().await;
 
-    let selected = SELECTED_EMAIL.peek().as_deref() == Some(id);
-    let still_listed = EMAILS.peek().iter().any(|e| e.id == id);
+    let order = list_order();
 
-    if selected && !still_listed {
-        let next = {
-            let list = EMAILS.peek();
+    change_selection(|s| s.retain(&order));
 
-            old_index
-                .and_then(|i| list.get(i).or(list.last()))
-                .map(|e| e.id.clone())
-        };
+    if had_selection && SELECTION.peek().is_empty() {
+        let next = old_index
+            .and_then(|i| order.get(i).or(order.last()))
+            .cloned();
 
-        if let Some(next) = &next {
-            scroll_to_row(next);
+        if let Some(next) = next {
+            scroll_to_row(&next);
+            click_email(&next, Click::Plain);
         }
-
-        select_email(next);
     }
 
     Ok(())
 }
 
-/// Moves the selected email to `mailbox_id` and closes the picker.
+/// Moves the selected emails to `mailbox_id` and closes the picker.
 pub fn move_selected(mailbox_id: String) {
     *SHOW_MOVE_PICKER.write() = false;
     focus_root();
     run(act_on_selected(actions::Action::Move { mailbox_id }));
 }
 
-/// Toggles the selected email's read (`read`) or flagged state.
-async fn toggle(read: bool) {
-    let Some(_busy) = Flag::take(&BUSY) else {
-        return;
-    };
-    let Some(id) = SELECTED_EMAIL.peek().clone() else {
-        return;
-    };
-    let Ok(Some(email)) = backend().peek().store.email(&id) else {
-        return;
-    };
-    let action = match (read, email.is_unread(), email.is_flagged()) {
-        (true, true, _) => actions::Action::MarkRead,
-        (true, false, _) => actions::Action::MarkUnread,
-        (false, _, true) => actions::Action::Unflag,
-        (false, _, false) => actions::Action::Flag,
-    };
+/// Marks every selected email read or unread, flagged or unflagged (`action`).
+pub fn mark_selected(action: actions::Action) {
+    run(async move {
+        let Some(_busy) = Flag::take(&BUSY) else {
+            return;
+        };
+        let ids = SELECTION.peek().ids.clone();
 
-    match apply_local(std::slice::from_ref(&id), action).await {
-        Ok(_) => refresh_row(&id),
-        Err(e) => fail("Action failed", e),
+        match apply_local(&ids, action).await {
+            Ok(_) => ids.iter().for_each(|id| refresh_row(id)),
+            Err(e) => fail("Action failed", e),
+        }
+    });
+}
+
+/// Toggles the selected emails' read (`read`) or flagged state: if any is unread
+/// (unflagged) they all become read (flagged), else all become unread (unflagged).
+fn toggle(read: bool) {
+    let store = backend().peek().store.clone();
+    let emails: Vec<EmailSummary> = SELECTION
+        .peek()
+        .ids
+        .iter()
+        .filter_map(|id| store.email(id).ok().flatten())
+        .collect();
+
+    if emails.is_empty() {
+        return;
     }
+
+    mark_selected(match read {
+        true if emails.iter().any(|e| e.is_unread()) => actions::Action::MarkRead,
+        true => actions::Action::MarkUnread,
+        false if emails.iter().any(|e| !e.is_flagged()) => actions::Action::Flag,
+        false => actions::Action::Unflag,
+    });
 }
 
 /// Opens the composer on a reply to the selected email.
 async fn start_reply(all: bool) {
-    let Some(id) = SELECTED_EMAIL.peek().clone() else {
+    let Some(id) = SELECTION.peek().focus.clone() else {
         return;
     };
     let b = backend().peek().clone();
@@ -891,7 +941,8 @@ async fn send_draft(archive: bool) {
 
     match draft.reply_to_email_id.clone().filter(|_| archive) {
         Some(id) => {
-            if let Err(e) = act_on_email(&id, actions::Action::Archive).await {
+            if let Err(e) = act_on_emails(std::slice::from_ref(&id), actions::Action::Archive).await
+            {
                 fail("Sent, but archiving failed", e);
             }
         }

@@ -3,11 +3,12 @@
 use dioxus::prelude::*;
 
 use crate::app::{
-    EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_EMAIL, SELECTED_MAILBOX, SIDEBAR_OPEN,
-    load_more, select_email,
+    EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION, SIDEBAR_OPEN,
+    click_email, load_more,
 };
 use crate::components::Icon;
 use crate::format;
+use crate::selection::Click;
 
 /// Avatar, sender, date, subject, preview and mailbox chips for every email in view.
 #[component]
@@ -15,7 +16,8 @@ pub fn MessageList() -> Element {
     let emails = EMAILS();
     let mailboxes = MAILBOXES();
     let current = SELECTED_MAILBOX();
-    let selected = SELECTED_EMAIL();
+    let selection = SELECTION();
+    let picked = selection.len();
     let searching = !SEARCH_QUERY.read().trim().is_empty();
     let now = chrono::Utc::now();
     let mailbox = mailboxes
@@ -52,7 +54,12 @@ pub fn MessageList() -> Element {
                 }
                 div {
                     div { class: "list-title", "{title}" }
-                    div { class: "list-counts", "{counts}" }
+                    div { class: "list-counts",
+                        "{counts}"
+                        if picked > 1 {
+                            span { class: "sel-count", " · {picked} selected" }
+                        }
+                    }
                 }
             }
             div { class: "rows",
@@ -73,10 +80,15 @@ pub fn MessageList() -> Element {
                             .filter_map(|id| mailboxes.iter().find(|m| &m.id == id))
                             .map(|m| (m.name.clone(), format::avatar_hue(&m.name)))
                             .collect();
-                        let class = match (selected.as_ref() == Some(&e.id), e.is_unread()) {
-                            (true, _) => "row selected",
-                            (false, true) => "row unread",
-                            (false, false) => "row",
+                        let class = match (
+                            selection.is_selected(&e.id),
+                            selection.focus.as_ref() == Some(&e.id),
+                            e.is_unread(),
+                        ) {
+                            (true, true, _) => "row selected focused",
+                            (true, false, _) => "row selected",
+                            (false, _, true) => "row unread",
+                            (false, _, false) => "row",
                         };
                         let id = e.id.clone();
 
@@ -86,7 +98,20 @@ pub fn MessageList() -> Element {
                                 id: "row-{e.id}",
                                 class,
                                 onmousedown: |evt| evt.prevent_default(),
-                                onclick: move |_| select_email(Some(id.clone())),
+                                onclick: move |evt| {
+                                    let m = evt.modifiers();
+                                    let kind = if m.intersects(Modifiers::META | Modifiers::CONTROL) {
+                                        Click::Toggle
+                                    } else if m.contains(Modifiers::SHIFT) {
+                                        // Keeps the webview from starting a text selection.
+                                        evt.prevent_default();
+                                        Click::Range
+                                    } else {
+                                        Click::Plain
+                                    };
+
+                                    click_email(&id, kind);
+                                },
                                 div {
                                     class: "avatar",
                                     style: "background: hsl({hue} 55% 45%)",

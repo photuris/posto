@@ -1,9 +1,9 @@
 //! Keyboard handling: browser key names to [`Chord`]s, and shortcut text.
 
-use posto_core::shortcuts::{Action, Chord};
+use posto_core::shortcuts::{Action, Chord, Keymap};
 
 /// Every action, in the order Settings lists them.
-pub const ALL_ACTIONS: [Action; 17] = [
+pub const ALL_ACTIONS: [Action; 20] = [
     Action::Next,
     Action::Prev,
     Action::Open,
@@ -21,6 +21,9 @@ pub const ALL_ACTIONS: [Action; 17] = [
     Action::Search,
     Action::Sync,
     Action::Send,
+    Action::ExtendNext,
+    Action::ExtendPrev,
+    Action::SelectAll,
 ];
 
 /// Normalises a Dioxus `Key` display string and modifier state.
@@ -44,6 +47,20 @@ pub fn chord_from_event(key: &str, ctrl: bool, shift: bool, alt: bool, meta: boo
         alt,
         meta,
     }
+}
+
+/// The action for `chord`; a chord with Cmd held also matches its Ctrl binding,
+/// since the shortcut map spells the platform modifier `ctrl`.
+pub fn lookup_with_meta_fallback(keymap: &Keymap, chord: &Chord) -> Option<Action> {
+    keymap.lookup(chord).or_else(|| {
+        chord.meta.then(|| {
+            keymap.lookup(&Chord {
+                ctrl: true,
+                meta: false,
+                ..chord.clone()
+            })
+        })?
+    })
 }
 
 /// True when a key press should be left to the focused text field.
@@ -112,6 +129,19 @@ mod tests {
         let delete = Keymap::defaults().lookup(&chord_from_event("#", false, true, false, false));
         assert_eq!(delete, Some(Action::Delete));
         assert_eq!(chord_text(&enter), "ctrl+enter");
+    }
+
+    #[test]
+    fn meta_fallback() {
+        let keymap = Keymap::defaults();
+        let lookup = |key, ctrl, alt, meta| {
+            lookup_with_meta_fallback(&keymap, &chord_from_event(key, ctrl, false, alt, meta))
+        };
+
+        assert_eq!(lookup("a", false, false, true), Some(Action::SelectAll));
+        assert_eq!(lookup("a", true, false, false), Some(Action::SelectAll));
+        assert_eq!(lookup("a", false, true, false), None);
+        assert_eq!(lookup("a", false, false, false), Some(Action::ReplyAll));
     }
 
     #[test]

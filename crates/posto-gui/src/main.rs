@@ -6,6 +6,7 @@ mod format;
 mod keys;
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 mod menu;
+mod selection;
 mod state;
 
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};

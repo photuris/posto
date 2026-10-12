@@ -3,16 +3,23 @@
 use dioxus::prelude::*;
 use posto_core::shortcuts::Action;
 
-use crate::app::{KEYMAP, SEARCH_QUERY, SHOW_SETTINGS, dispatch, search_input};
+use crate::app::{KEYMAP, SEARCH_QUERY, SELECTION, SHOW_SETTINGS, dispatch, search_input};
 use crate::components::{Icon, focus_in, focus_out};
 use crate::keys;
 
 /// Tooltip such as `Archive (e)`.
 fn title(label: &str, action: Action) -> String {
-    match KEYMAP.read().chord_for(action) {
+    let mut text = match KEYMAP.read().chord_for(action) {
         Some(chord) => format!("{label} ({})", keys::chord_text(&chord)),
         None => label.to_string(),
+    };
+    let picked = SELECTION.read().len();
+
+    if picked > 1 && matches!(action, Action::Archive | Action::Junk | Action::Delete) {
+        text.push_str(&format!(" ({picked} selected)"));
     }
+
+    text
 }
 
 /// Toolbar above the reader.

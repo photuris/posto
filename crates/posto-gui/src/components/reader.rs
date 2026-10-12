@@ -1,12 +1,14 @@
 //! Right pane: the selected message.
 
 use dioxus::prelude::*;
+use posto_core::actions;
 use posto_core::html;
+use posto_core::shortcuts::Action;
 use posto_core::store::{Address, EmailSummary};
 
 use crate::app::{
-    ALLOW_REMOTE, BODY, BODY_ERROR, EMAILS, MAILBOXES, READER_MODE, SELECTED_EMAIL, backend,
-    save_attachment, trust_domain,
+    ALLOW_REMOTE, BODY, BODY_ERROR, EMAILS, MAILBOXES, READER_MODE, SELECTION, backend, dispatch,
+    mark_selected, save_attachment, selected_email, trust_domain,
 };
 use crate::components::{Icon, frame_doc, reader_frame_doc};
 use crate::format;
@@ -25,7 +27,67 @@ pub fn Reader() -> Element {
             .map(|h| html::sanitize(&h, ALLOW_REMOTE()))
             .map(|s| (s.html, s.had_remote))
     });
-    let Some(id) = SELECTED_EMAIL() else {
+    let picked = SELECTION.read().len();
+
+    if picked > 1 {
+        return rsx! {
+            div { class: "reader empty",
+                div { class: "bulk-panel",
+                    h2 { "{picked} messages selected" }
+                    div { class: "bulk-buttons",
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Archive),
+                            "Archive"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Delete),
+                            "Delete"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Junk),
+                            "Junk"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Move),
+                            "Move…"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| mark_selected(actions::Action::MarkRead),
+                            "Mark read"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| mark_selected(actions::Action::MarkUnread),
+                            "Mark unread"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| mark_selected(actions::Action::Flag),
+                            "Flag"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| mark_selected(actions::Action::Unflag),
+                            "Unflag"
+                        }
+                    }
+                    button {
+                        class: "link",
+                        onmousedown: |evt| evt.prevent_default(),
+                        onclick: |_| dispatch(Action::Escape),
+                        "Clear selection"
+                    }
+                }
+            }
+        };
+    }
+
+    let Some(id) = selected_email() else {
         return rsx! {
             div { class: "reader empty", "Select a message" }
         };
