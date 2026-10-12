@@ -8,7 +8,7 @@ use crate::app::{
     ALLOW_REMOTE, BODY, BODY_ERROR, EMAILS, MAILBOXES, READER_MODE, SELECTED_EMAIL, backend,
     save_attachment, trust_domain,
 };
-use crate::components::{Icon, frame_doc};
+use crate::components::{Icon, frame_doc, reader_frame_doc};
 use crate::format;
 
 fn people(list: &[Address]) -> String {
@@ -61,6 +61,13 @@ pub fn Reader() -> Element {
         Some((h, remote)) => (Some(frame_doc(&h)), remote),
         None => (None, false),
     };
+    // Reader mode re-renders the HTML with the sender's presentation stripped and our own
+    // serif stylesheet, so tables and rules keep their layout instead of being flattened
+    // to wrapped text. Plain-text mail still shows as text.
+    let reader_doc = body
+        .as_ref()
+        .and_then(|b| b.html.as_deref())
+        .map(|h| reader_frame_doc(&html::reader(h, allow_remote).html));
     let text = body.as_ref().and_then(|b| {
         b.text
             .clone()
@@ -136,6 +143,8 @@ pub fn Reader() -> Element {
             div { id: "reader-body", class: "reader-body", tabindex: "-1",
                 if let Some(error) = BODY_ERROR() {
                     div { class: "empty", "{error}" }
+                } else if let Some(doc) = reader_doc.filter(|_| reader_mode) {
+                    iframe { class: "mail", "sandbox": "", srcdoc: "{doc}" }
                 } else if reader_mode || html_doc.is_none() {
                     match text {
                         Some(text) => rsx! {

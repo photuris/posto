@@ -41,6 +41,28 @@ pub fn frame_doc(inner: &str) -> String {
     )
 }
 
+/// Reader-mode wrapper: a serif, single-column stylesheet over structure-only
+/// HTML (see `posto_core::html::reader`). Tables keep their cell layout and
+/// scroll sideways instead of wrapping.
+pub fn reader_frame_doc(inner: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><base target=\"_blank\">\
+         <style>:root{{color-scheme:light dark}}\
+         body{{max-width:680px;margin:0 auto;padding:28px 24px;\
+         font-family:Georgia,\"Noto Serif\",serif;font-size:17px;line-height:1.6;overflow-wrap:anywhere}}\
+         h1,h2,h3,h4{{line-height:1.25;margin:1.2em 0 .5em}}\
+         img{{max-width:100%;height:auto}}\
+         pre,code{{font-family:ui-monospace,monospace;font-size:14px}}\
+         pre{{white-space:pre;overflow-x:auto}}\
+         table{{border-collapse:collapse;margin:1em 0;max-width:100%;display:block;overflow-x:auto;font-size:15px}}\
+         td,th{{padding:6px 10px;border-bottom:1px solid color-mix(in srgb,currentColor 25%,transparent);text-align:left;vertical-align:top;white-space:nowrap}}\
+         th{{font-weight:600}}\
+         hr{{border:0;border-top:1px solid color-mix(in srgb,currentColor 25%,transparent);margin:1.5em 0}}\
+         blockquote{{margin:1em 0;padding-left:1em;border-left:3px solid color-mix(in srgb,currentColor 30%,transparent)}}\
+         </style></head><body>{inner}</body></html>"
+    )
+}
+
 /// Small filterable list of mailboxes to move the selected email to.
 #[component]
 pub fn MovePicker() -> Element {

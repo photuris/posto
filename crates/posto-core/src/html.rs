@@ -138,6 +138,42 @@ pub fn sanitize(html: &str, allow_remote: bool) -> Sanitised {
     }
 }
 
+/// Reader-mode variant: `sanitize`, then strip the sender's presentation
+/// (inline styles, classes, colours, sizes, alignment, `font`/`center`) so
+/// the viewer's own stylesheet governs typography while the document
+/// structure (headings, lists, tables, links, images) survives intact.
+pub fn reader(html: &str, allow_remote: bool) -> Sanitised {
+    let safe = sanitize(html, allow_remote);
+    let mut builder = ammonia::Builder::default();
+    builder
+        .tags(
+            TAGS.iter()
+                .copied()
+                .filter(|t| !matches!(*t, "font" | "center"))
+                .collect(),
+        )
+        .generic_attributes(
+            ["colspan", "rowspan", "title", "alt", "dir"]
+                .into_iter()
+                .collect(),
+        )
+        .tag_attributes(HashMap::from([
+            ("a", HashSet::from(["href", "target"])),
+            ("img", HashSet::from(["src"])),
+            ("input", HashSet::from(["type", "checked", "disabled"])),
+        ]))
+        .url_schemes(
+            ["http", "https", "mailto", "cid", "data"]
+                .into_iter()
+                .collect(),
+        )
+        .link_rel(Some("noopener noreferrer"));
+    Sanitised {
+        html: builder.clean(&safe.html).to_string(),
+        had_remote: safe.had_remote,
+    }
+}
+
 /// True when a tag in `html` has a resource attribute whose value is not
 /// `cid:` or `data:image/`.
 ///
@@ -333,6 +369,26 @@ pub fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_strips_presentation_keeps_structure() {
+        let src = r##"<table style="width:600px" bgcolor="#fff" cellpadding="4"><tr><td align="left" style="color:red"><font color="blue">Electricity</font></td><td colspan="2">$18</td></tr></table><center><h3 class="x">Hi</h3></center><script>x()</script>"##;
+        let out = reader(src, false).html;
+        assert!(
+            out.contains("<table><tbody><tr><td>Electricity</td><td colspan=\"2\">$18</td></tr></tbody></table>"),
+            "{out}"
+        );
+        assert!(out.contains("<h3>Hi</h3>"), "{out}");
+        assert!(
+            !out.contains("style=")
+                && !out.contains("bgcolor")
+                && !out.contains("<font")
+                && !out.contains("<script"),
+            "{out}"
+        );
+        let img = reader(r#"<img src="https://x/y.png" width="1">"#, false);
+        assert!(img.had_remote && !img.html.contains("src="), "{}", img.html);
+    }
 
     #[test]
     fn sanitize_strips_script_and_handlers() {
