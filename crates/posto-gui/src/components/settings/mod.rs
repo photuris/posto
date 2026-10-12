@@ -72,6 +72,32 @@ fn close() {
     focus_root();
 }
 
+/// Cleans up the draft and checks everything Save depends on, apart from the
+/// shortcuts: account fields, the classification numbers as typed, names.
+fn prepare(mut cfg: Config, margin: &str, urgency: &str) -> std::result::Result<Config, String> {
+    for a in &mut cfg.accounts {
+        let url = a.session_url.trim().to_string();
+
+        a.id = a.id.trim().to_string();
+        a.name = a.name.trim().to_string();
+        a.email = a.email.trim().to_string();
+        a.session_url = if url.is_empty() {
+            Account::default().session_url
+        } else {
+            url
+        };
+    }
+
+    classification::tidy(&mut cfg.classify);
+    cfg.validate().map_err(|e| e.to_string())?;
+    classification::apply_numbers(&mut cfg.classify, margin, urgency)?;
+
+    match classification::problems(&cfg.classify) {
+        Some(e) => Err(e),
+        None => Ok(cfg),
+    }
+}
+
 /// Account, token, refresh, blocked senders, remote content, shortcuts and appearance.
 #[component]
 pub fn Settings() -> Element {
@@ -81,37 +107,22 @@ pub fn Settings() -> Element {
     let mut page = use_signal(|| Page::General);
     let mut save_error = use_signal(|| None::<String>);
     let mut confirm_reset = use_signal(|| false);
+    // The classification numbers as typed, so Save can refuse text that is not a number.
+    let margin_text = use_signal(|| draft.peek().classify.unsure_margin.to_string());
+    let urgency_text = use_signal(|| draft.peek().classify.flag_urgency_at.to_string());
 
     // A chord shared with another action is an error too.
     let current = rows();
     let parsed = parse_rows(&current);
-    let valid = row_errors(&current, &parsed).iter().all(Option::is_none);
+    let valid = row_errors(&current, &parsed).iter().all(Option::is_none)
+        && classification::apply_numbers(&mut Default::default(), &margin_text(), &urgency_text())
+            .is_ok();
 
     let save = move |_| {
-        let mut cfg: Config = draft();
-
-        for a in &mut cfg.accounts {
-            let url = a.session_url.trim().to_string();
-
-            a.id = a.id.trim().to_string();
-            a.name = a.name.trim().to_string();
-            a.email = a.email.trim().to_string();
-            a.session_url = if url.is_empty() {
-                Account::default().session_url
-            } else {
-                url
-            };
-        }
-
-        classification::tidy(&mut cfg.classify);
-
-        if let Err(e) = cfg.validate() {
-            return save_error.set(Some(e.to_string()));
-        }
-
-        if let Some(e) = classification::problems(&cfg.classify) {
-            return save_error.set(Some(e));
-        }
+        let mut cfg = match prepare(draft(), &margin_text(), &urgency_text()) {
+            Ok(cfg) => cfg,
+            Err(e) => return save_error.set(Some(e)),
+        };
 
         cfg.shortcuts.clear();
 
@@ -211,7 +222,7 @@ pub fn Settings() -> Element {
                     match page() {
                         Page::General => rsx! { GeneralPage { draft } },
                         Page::Reading => rsx! { ReadingPage { draft } },
-                        Page::Classification => rsx! { ClassificationPage { draft } },
+                        Page::Classification => rsx! { ClassificationPage { draft, margin_text, urgency_text } },
                         Page::Shortcuts => rsx! { ShortcutsPage { rows } },
                         Page::Appearance => rsx! { AppearancePage { draft } },
                     }
@@ -259,6 +270,25 @@ mod tests {
 
     use super::*;
     use crate::components::icons::NAMES;
+
+    #[test]
+    fn save_refuses_numbers_that_are_not_numbers() {
+        let cfg = Config::default();
+        let kept = cfg.classify.unsure_margin;
+
+        assert_eq!(
+            prepare(cfg.clone(), "0.25", "3")
+                .unwrap()
+                .classify
+                .unsure_margin,
+            0.25
+        );
+        assert!(prepare(cfg.clone(), "nonsense", "3").is_err());
+        assert!(prepare(cfg.clone(), "", "3").is_err());
+        assert!(prepare(cfg.clone(), "0.25", "").is_err());
+        assert!(prepare(cfg.clone(), "2", "3").is_err());
+        assert_eq!(cfg.classify.unsure_margin, kept);
+    }
 
     #[test]
     fn pages_are_complete() {

@@ -645,11 +645,22 @@ fn classify_dry_run_writes_nothing() {
     let sb = Sandbox::seeded();
 
     enable_classifier(&sb, "http://127.0.0.1:9/session");
+    // A pending correction, so the dry run has an entry of each kind.
+    sb.json(&["classify", "correct", "fx-01", "updates"]);
 
     let before = sb.json(&["classify", "status"]);
+    let db = sb.0.join("posto.db");
+    let bytes = std::fs::read(&db).unwrap();
     let dry = sb.json(&["classify", "run", "--dry-run", "--backfill", "3"]);
 
     assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["pending_apply"][0]["email_id"], "fx-01");
+    assert!(
+        dry["pending_apply"][0]["state"]
+            .as_str()
+            .is_some_and(|s| s.contains("Subject:")),
+        "{dry}"
+    );
     assert_eq!(dry["queued"][0]["email_id"], "fx-11");
     assert!(
         dry["queued"][0]["state"]
@@ -658,7 +669,62 @@ fn classify_dry_run_writes_nothing() {
             .contains("Subject: Q3 VAT")
     );
     assert_eq!(dry["backfill"].as_array().unwrap().len(), 3);
+    assert!(
+        std::fs::read(&db).unwrap() == bytes,
+        "the dry run changed the database file"
+    );
     assert_eq!(sb.json(&["classify", "status"]), before);
     assert_eq!(before["accounts"][0]["queued"], 1);
     assert_eq!(before["accounts"][0]["classified"], 2);
+}
+
+#[test]
+fn classify_dry_run_does_not_create_or_rebuild_the_cache() {
+    let fresh = Sandbox::new();
+
+    enable_classifier(&fresh, "http://127.0.0.1:9/session");
+
+    let out = fresh.run_with(&["classify", "run", "--dry-run"], None);
+
+    assert_eq!(out.status.code(), Some(6), "{out:?}");
+    assert!(
+        !fresh.0.join("posto.db").exists(),
+        "dry run created the cache"
+    );
+
+    let old = Sandbox::seeded();
+
+    enable_classifier(&old, "http://127.0.0.1:9/session");
+    Store::open(&old.0.join("posto.db"))
+        .unwrap()
+        .set_state("schema_version", "2")
+        .unwrap();
+
+    let bytes = std::fs::read(old.0.join("posto.db")).unwrap();
+    let out = old.run_with(&["classify", "run", "--dry-run"], None);
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err["error"].as_str().unwrap().contains("schema 2"), "{err}");
+    assert!(
+        std::fs::read(old.0.join("posto.db")).unwrap() == bytes,
+        "the dry run rebuilt an old cache"
+    );
+}
+
+#[test]
+fn classify_correct_keeps_intent_when_the_server_is_unreachable() {
+    let sb = Sandbox::seeded();
+
+    enable_classifier(&sb, "http://127.0.0.1:9/session");
+    sb.run_with(&["account", "set-token", "--token-stdin"], Some("dummy"));
+
+    let done = sb.json(&["classify", "correct", "fx-01", "updates"]);
+
+    assert_eq!(done["applied"], false, "{done}");
+    assert_eq!(done["pending"], true, "{done}");
+    assert_eq!(
+        sb.json(&["classify", "show", "fx-01"])["corrected_tray"],
+        "updates"
+    );
 }

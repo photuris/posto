@@ -21,7 +21,7 @@ use crate::components::{
     Toolbar,
 };
 use crate::selection::{Click, Selection};
-use crate::state::{self, Backend, FakeJev, Folder, group_by_account, row_key};
+use crate::state::{self, Backend, Folder, group_by_account, row_key};
 use crate::{format, keys};
 
 /// A pending yes/no question; accepting runs `on_accept`.
@@ -1116,21 +1116,7 @@ pub fn classify_selected(tray: Tray) {
 
         let (mut filed, mut first_error) = (0, None);
         let settled = settle_selection(async {
-            for r in &refs {
-                let before = b.store.email(&r.account_id, &r.id).ok().flatten();
-
-                match classify::correct(&b.cfg, &b.store, &clients, r, tray).await {
-                    Ok(()) => filed += 1,
-                    Err(e) => {
-                        first_error.get_or_insert(e);
-                    }
-                }
-
-                // Moves already made count even when a later step failed.
-                if let (Some(old), Ok(Some(new))) = (before, b.store.email(&r.account_id, &r.id)) {
-                    bump_counts(&old, &new);
-                }
-            }
+            (filed, first_error) = correct_refs(&b, &clients, &refs, tray).await;
 
             Ok(())
         })
@@ -1157,6 +1143,61 @@ pub fn classify_selected(tray: Tray) {
             }
         ));
     });
+}
+
+/// Files each of `refs` under `tray` with [`classify::correct`] and keeps the
+/// sidebar in step: the badges follow the moves and a tray folder the
+/// correction created shows up, even when a later step failed. Returns how
+/// many were filed and the first error.
+async fn correct_refs(
+    b: &Backend,
+    clients: &HashMap<String, Arc<Client>>,
+    refs: &[MsgRef],
+    tray: Tray,
+) -> (usize, Option<Error>) {
+    let (mut filed, mut first_error) = (0, None);
+
+    for r in refs {
+        let before = b.store.email(&r.account_id, &r.id).ok().flatten();
+
+        match classify::correct(&b.cfg, &b.store, clients, r, tray).await {
+            Ok(()) => filed += 1,
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+
+        adopt_new_mailboxes(&r.account_id);
+
+        // Moves already made count even when a later step failed.
+        if let (Some(old), Ok(Some(new))) = (before, b.store.email(&r.account_id, &r.id)) {
+            bump_counts(&old, &new);
+        }
+    }
+
+    (filed, first_error)
+}
+
+/// Adds the mailboxes of `account` that the store has and the sidebar lacks
+/// (a correction can create the tray folder), leaving the other badges alone.
+fn adopt_new_mailboxes(account: &str) {
+    let Ok(stored) = backend().peek().store.mailboxes(account) else {
+        return;
+    };
+    let mut all = MAILBOXES.write();
+
+    for m in stored {
+        if all.iter().any(|x| x.account_id == account && x.id == m.id) {
+            continue;
+        }
+
+        let at = all
+            .iter()
+            .rposition(|x| x.account_id == account)
+            .map_or(all.len(), |i| i + 1);
+
+        all.insert(at, m);
+    }
 }
 
 /// The mailbox name of `tray` in `cfg`; spam always goes to Junk.
@@ -1508,16 +1549,20 @@ pub async fn run_sync(manual: bool) {
 async fn classify_pass(clients: HashMap<String, Arc<Client>>, manual: bool) {
     let b = backend().peek().clone();
 
-    if !b
-        .cfg
-        .accounts_enabled()
-        .any(|a| b.cfg.classify_enabled_for(a))
+    if !b.ui_test
+        && !b
+            .cfg
+            .accounts_enabled()
+            .any(|a| b.cfg.classify_enabled_for(a))
     {
         return;
     }
 
     let report = if b.ui_test {
-        run_classifier(&b, clients, FakeJev).await
+        match state::fake_classify_pass(&b.cfg, &b.store).await {
+            Ok(report) => report,
+            Err(e) => return fail("Classification", e),
+        }
     } else {
         match Secrets::typesafe_key() {
             Ok(Some(key)) => {
@@ -1820,6 +1865,143 @@ mod tests {
 
         assert!(EMAILS.peek().is_empty(), "{:?}", EMAILS.peek());
         assert_eq!(UNSURE.peek().get("default"), Some(&0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_sync_in_ui_test_mode_classifies_the_queue_offline() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        // Classification is off in the default config; UI test mode runs the fake anyway.
+        assert!(!b.cfg.classify.enabled);
+        assert_eq!(b.store.classify_queue_len("default").unwrap(), 1);
+
+        run_sync(true).await;
+
+        let row = b.store.classification("default", "fx-11").unwrap().unwrap();
+        let updates = b
+            .store
+            .top_level_mailbox_by_name("default", "Updates")
+            .unwrap()
+            .unwrap();
+
+        assert!(row.applied, "{row:?}");
+        assert_eq!(b.store.classify_queue_len("default").unwrap(), 0);
+        assert!(
+            b.store
+                .email("default", "fx-11")
+                .unwrap()
+                .unwrap()
+                .mailbox_ids
+                .contains(&updates.id)
+        );
+        assert!(STATUS.peek().contains("Classified 1"), "{}", STATUS.peek());
+    }
+
+    /// Answers the calls a correction makes: creating a mailbox and patching mail.
+    struct FakeJmap;
+
+    impl wiremock::Respond for FakeJmap {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let call = &body["methodCalls"][0];
+            let name = call[0].as_str().unwrap();
+            let result = match name {
+                "Mailbox/set" => {
+                    serde_json::json!({ "created": { "c": { "id": "mb-statements" } } })
+                }
+                "Email/set" => {
+                    let done: serde_json::Map<String, serde_json::Value> = call[1]["update"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(|id| (id.clone(), serde_json::Value::Null))
+                        .collect();
+
+                    serde_json::json!({ "updated": done })
+                }
+                other => panic!("unexpected JMAP call {other}"),
+            };
+
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "methodResponses": [[name, result, "0"]] }))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn correcting_into_a_new_tray_folder_adds_it_to_the_sidebar() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session = include_str!("../../posto-core/tests/fixtures/session.json")
+            .replace("{{base}}", &server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/session"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(session)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(FakeJmap)
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::default();
+
+        // The fixture has no such folder, so the correction has to create it.
+        cfg.classify
+            .trays
+            .insert("updates".into(), "Statements".into());
+
+        let dom = rendered(backend_with(cfg));
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        assert!(!MAILBOXES.peek().iter().any(|m| m.name == "Statements"));
+
+        let client = Client::connect(&format!("{}/session", server.uri()), "tok")
+            .await
+            .unwrap();
+        let clients = HashMap::from([("default".to_string(), Arc::new(client))]);
+        let (filed, error) = correct_refs(
+            &b,
+            &clients,
+            &[MsgRef::new("default", "fx-01")],
+            Tray::Updates,
+        )
+        .await;
+
+        assert_eq!(filed, 1, "{error:?}");
+
+        let added: Vec<Mailbox> = MAILBOXES
+            .peek()
+            .iter()
+            .filter(|m| m.name == "Statements")
+            .cloned()
+            .collect();
+
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(
+            added[0].total, 1,
+            "the new folder's badge counts the message"
+        );
     }
 
     /// A mailbox of `account` for folder tests.

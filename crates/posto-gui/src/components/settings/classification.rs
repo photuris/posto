@@ -64,6 +64,23 @@ pub fn problems(c: &ClassifyConfig) -> Option<String> {
     None
 }
 
+/// Parses the two numeric fields as typed and stores them in `c`.
+///
+/// The page keeps the raw text of both inputs, so text that is not a number
+/// is an error here instead of being dropped and leaving the old value.
+pub fn apply_numbers(c: &mut ClassifyConfig, margin: &str, urgency: &str) -> Result<(), String> {
+    c.unsure_margin = margin
+        .trim()
+        .parse()
+        .map_err(|_| "The unsure margin must be a number between 0 and 1.".to_string())?;
+    c.flag_urgency_at = urgency
+        .trim()
+        .parse()
+        .map_err(|_| "The flag threshold must be a whole number between 1 and 5.".to_string())?;
+
+    Ok(())
+}
+
 /// Strips stray spaces from the names the user typed.
 pub fn tidy(c: &mut ClassifyConfig) {
     c.model = c.model.trim().to_string();
@@ -85,13 +102,16 @@ fn cycle(state: Option<bool>) -> Option<bool> {
 }
 
 #[component]
-pub fn ClassificationPage(mut draft: Signal<Config>) -> Element {
+pub fn ClassificationPage(
+    mut draft: Signal<Config>,
+    mut margin_text: Signal<String>,
+    mut urgency_text: Signal<String>,
+) -> Element {
     let ui_test = backend().peek().ui_test;
     let mut key_open = use_signal(|| false);
     let mut key_value = use_signal(String::new);
     let mut key_rev = use_signal(|| 0u32);
     let mut key_error = use_signal(|| None::<String>);
-    let mut margin_text = use_signal(|| draft.peek().classify.unsure_margin.to_string());
 
     // Re-read the key state after a save.
     let _ = key_rev();
@@ -99,7 +119,10 @@ pub fn ClassificationPage(mut draft: Signal<Config>) -> Element {
     let cfg = draft();
     let c = &cfg.classify;
     let key_set = !ui_test && Secrets::typesafe_key().ok().flatten().is_some();
-    let error = problems(c);
+    let mut typed = c.clone();
+    let error = apply_numbers(&mut typed, &margin_text(), &urgency_text())
+        .err()
+        .or_else(|| problems(&typed));
 
     rsx! {
         h3 { "Jev" }
@@ -190,13 +213,7 @@ pub fn ClassificationPage(mut draft: Signal<Config>) -> Element {
                 value: "{margin_text}",
                 onfocusin: focus_in,
                 onfocusout: focus_out,
-                oninput: move |evt| {
-                    margin_text.set(evt.value());
-
-                    if let Ok(v) = evt.value().trim().parse::<f64>() {
-                        draft.write().classify.unsure_margin = v;
-                    }
-                },
+                oninput: move |evt| margin_text.set(evt.value()),
             }
             span { class: "muted", "0 to 1" }
         }
@@ -210,14 +227,10 @@ pub fn ClassificationPage(mut draft: Signal<Config>) -> Element {
                 r#type: "number",
                 min: "1",
                 max: "5",
-                value: "{c.flag_urgency_at}",
+                value: "{urgency_text}",
                 onfocusin: focus_in,
                 onfocusout: focus_out,
-                oninput: move |evt| {
-                    if let Ok(n) = evt.value().trim().parse::<u8>() {
-                        draft.write().classify.flag_urgency_at = n;
-                    }
-                },
+                oninput: move |evt| urgency_text.set(evt.value()),
             }
             span { class: "muted", "urgency 1 to 5" }
         }
@@ -347,6 +360,29 @@ mod tests {
 
         urgency.flag_urgency_at = 0;
         assert!(problems(&urgency).is_some());
+    }
+
+    #[test]
+    fn typed_numbers_must_parse() {
+        let mut c = ClassifyConfig::default();
+
+        assert_eq!(apply_numbers(&mut c, " 0.3 ", "4"), Ok(()));
+        assert_eq!((c.unsure_margin, c.flag_urgency_at), (0.3, 4));
+
+        for (margin, urgency) in [
+            ("nonsense", "4"),
+            ("", "4"),
+            ("0.3", ""),
+            ("0.3", "x"),
+            ("0.3", "300"),
+        ] {
+            let mut c = ClassifyConfig::default();
+
+            assert!(
+                apply_numbers(&mut c, margin, urgency).is_err(),
+                "{margin:?} {urgency:?}"
+            );
+        }
     }
 
     #[test]

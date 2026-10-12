@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dioxus::prelude::*;
-use posto_core::classify::{Classification, Classifier, Tray};
+use posto_core::actions::{self, Action};
+use posto_core::classify::state::state_for;
+use posto_core::classify::{Classification, Classifier, ClassifyReport, Tray};
 use posto_core::config::{Config, Secrets};
 use posto_core::jmap::Client;
-use posto_core::store::{EmailSummary, MsgRef, Store};
+use posto_core::store::{Classified, EmailBody, EmailSummary, MsgRef, Store};
 use posto_core::{Error, Result, fixtures};
 
 /// What the message list shows when no search is active.
@@ -58,6 +60,108 @@ impl Classifier for FakeJev {
             model: "fake-jev".into(),
             input_tokens: 0,
         })
+    }
+}
+
+/// UI test mode's classifier pass, with no client and no network: drains the
+/// queue of every enabled account through [`FakeJev`], stores each answer as
+/// applied, and mirrors the tray move on the local copy only.
+pub async fn fake_classify_pass(cfg: &Config, store: &Store) -> Result<ClassifyReport> {
+    let accounts: Vec<String> = cfg.accounts_enabled().map(|a| a.id.clone()).collect();
+    let mut report = ClassifyReport::default();
+
+    for row in store.next_classify_batch(&accounts, cfg.classify.max_per_run as usize)? {
+        let (account, id) = (row.account_id.as_str(), row.email_id.as_str());
+        let Some(email) = store.email(account, id)? else {
+            store.remove_from_classify_queue(account, id)?;
+
+            continue;
+        };
+        let body = store.body(account, id)?.unwrap_or(EmailBody {
+            email_id: id.to_string(),
+            html: None,
+            text: None,
+            attachments: Vec::new(),
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
+            message_id: Vec::new(),
+        });
+        let state = state_for(
+            &email,
+            &body,
+            false,
+            false,
+            cfg.classify.body_chars as usize,
+        );
+        let c = FakeJev.classify(&state).await?;
+
+        store.put_classification(&Classified {
+            account_id: account.to_string(),
+            email_id: id.to_string(),
+            tray: c.tray.as_str().to_string(),
+            probs: c.probs,
+            urgency: c.urgency,
+            personal: c.personal,
+            unsure: c.unsure,
+            model: c.model,
+            input_tokens: c.input_tokens,
+            classified_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            corrected_tray: None,
+            applied: true,
+            apply_error: None,
+        })?;
+        store.remove_from_classify_queue(account, id)?;
+        report.classified += 1;
+
+        match mirror_tray_move(cfg, store, account, id, c.tray).await {
+            Ok(()) => report.moved += 1,
+            Err(e) => report.errors.push(format!("{account}/{id}: {e}")),
+        }
+    }
+
+    Ok(report)
+}
+
+/// Files `id` under the mailbox of `tray` on the local copy: adds the tray
+/// mailbox and, unless the tray stays in the inbox, removes the inbox.
+async fn mirror_tray_move(
+    cfg: &Config,
+    store: &Store,
+    account: &str,
+    id: &str,
+    tray: Tray,
+) -> Result<()> {
+    let name = cfg
+        .classify
+        .trays
+        .get(tray.as_str())
+        .map_or(tray.as_str(), String::as_str);
+    let target = store
+        .top_level_mailbox_by_name(account, name)?
+        .ok_or_else(|| Error::NotFound(format!("mailbox {name}")))?;
+    let remove = if cfg
+        .classify
+        .keep_in_inbox
+        .iter()
+        .any(|t| t == tray.as_str())
+    {
+        Vec::new()
+    } else {
+        store
+            .mailboxes(account)?
+            .into_iter()
+            .filter(|m| m.role.as_deref() == Some("inbox"))
+            .map(|m| m.id)
+            .collect()
+    };
+    let action = Action::PatchMailboxes {
+        add: vec![target.id],
+        remove,
+    };
+
+    match actions::apply(store, None, account, &[id.to_string()], action).await? {
+        0 => Err(Error::Other("no email changed".into())),
+        _ => Ok(()),
     }
 }
 
@@ -356,6 +460,46 @@ mod tests {
 
         assert!(connected.is_err(), "stale client was returned");
         assert!(backend.peek().clients.is_empty(), "stale client was cached");
+    }
+
+    #[tokio::test]
+    async fn fake_pass_classifies_the_queue_and_files_it_locally() {
+        let store = Store::open_memory().unwrap();
+
+        fixtures::seed(&store).unwrap();
+
+        let cfg = Config::default();
+        let report = fake_classify_pass(&cfg, &store).await.unwrap();
+        let row = store.classification("default", "fx-11").unwrap().unwrap();
+        let updates = store
+            .top_level_mailbox_by_name("default", "Updates")
+            .unwrap()
+            .unwrap();
+        let email = store.email("default", "fx-11").unwrap().unwrap();
+        let inbox = store
+            .mailbox_by_role("default", "inbox")
+            .unwrap()
+            .unwrap()
+            .id;
+
+        assert_eq!((report.classified, report.moved), (1, 1), "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!((row.tray.as_str(), row.applied), ("updates", true));
+        assert_eq!(store.classify_queue_len("default").unwrap(), 0);
+        assert!(email.mailbox_ids.contains(&updates.id), "{email:?}");
+        assert!(email.mailbox_ids.contains(&inbox), "{email:?}");
+
+        // A tray that does not stay in the inbox leaves it.
+        let store = Store::open_memory().unwrap();
+        let mut cfg = Config::default();
+
+        fixtures::seed(&store).unwrap();
+        cfg.classify.keep_in_inbox.clear();
+        fake_classify_pass(&cfg, &store).await.unwrap();
+
+        let email = store.email("default", "fx-11").unwrap().unwrap();
+
+        assert!(!email.mailbox_ids.contains(&inbox), "{email:?}");
     }
 
     #[tokio::test]

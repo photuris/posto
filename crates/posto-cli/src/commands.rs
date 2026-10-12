@@ -648,12 +648,21 @@ fn classify_dry_run(
         .map(|a| a.id.clone())
         .collect();
     let cap = limit.unwrap_or(cfg.classify.max_per_run as usize);
-    let pending: Vec<Value> = store
+    let mut pending = Vec::new();
+
+    for c in store
         .pending_classifications()?
         .iter()
         .filter(|c| wanted(&c.account_id))
-        .map(|c| json!({ "account_id": c.account_id, "email_id": c.email_id, "tray": c.effective_tray() }))
-        .collect();
+    {
+        pending.push(json!({
+            "account_id": c.account_id,
+            "email_id": c.email_id,
+            "tray": c.effective_tray(),
+            "state": dry_state(cfg, store, &c.account_id, &c.email_id)?,
+        }));
+    }
+
     let mut queued = Vec::new();
 
     for row in store.next_classify_batch(&eligible, cap)? {
@@ -688,12 +697,16 @@ pub async fn classify_run(
     dry_run: bool,
 ) -> Result<Value> {
     let cfg = Config::load()?;
-    let store = open_store()?;
     let targets = targets(&cfg, account)?;
 
     if dry_run {
+        // Read-only: no cache is created, rebuilt or written.
+        let store = Store::open_read_only(&Config::db_path())?;
+
         return classify_dry_run(&cfg, &store, &targets, account, limit, backfill);
     }
+
+    let store = open_store()?;
 
     // Before any network traffic, including the sync.
     let key =
@@ -788,7 +801,16 @@ pub async fn classify_correct(account: Option<&str>, id: &str, tray: &str) -> Re
     let cfg = Config::load()?;
     let store = open_store()?;
     let email = find_email(&store, &cfg, account, id)?;
-    let client = optional_client(&cfg, configured(&cfg, &email.account_id)?).await?;
+
+    // Intent first: whatever happens to the connection, the choice is kept.
+    store.set_correction(&email.account_id, &email.id, tray.as_str())?;
+
+    let (client, unreachable) =
+        match optional_client(&cfg, configured(&cfg, &email.account_id)?).await {
+            Ok(client) => (client, None),
+            Err(e @ (Error::Http(_) | Error::Auth | Error::Jmap(_))) => (None, Some(e.to_string())),
+            Err(e) => return Err(e),
+        };
     let offline = client.is_none();
     let clients: HashMap<String, Arc<Client>> = client
         .map(|c| (email.account_id.clone(), Arc::new(c)))
@@ -802,6 +824,9 @@ pub async fn classify_correct(account: Option<&str>, id: &str, tray: &str) -> Re
         "id": email.id,
         "tray": tray,
         "offline": offline,
+        "applied": !offline,
+        "pending": offline,
+        "error": unreachable,
     }))
 }
 
