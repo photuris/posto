@@ -142,6 +142,7 @@ pub fn end_drag() {
     let ui = UiConfig {
         sidebar_width: *SIDEBAR_WIDTH.peek(),
         list_width: *LIST_WIDTH.peek(),
+        ..backend().peek().cfg.ui.clone()
     };
 
     if backend().peek().cfg.ui == ui {

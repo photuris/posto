@@ -54,6 +54,8 @@ pub struct UiConfig {
     pub sidebar_width: u32,
     /// Width of the message-list column.
     pub list_width: u32,
+    /// Window decorations: "auto" (off under tiling compositors, on elsewhere), "on", or "off".
+    pub decorations: String,
 }
 
 impl Default for UiConfig {
@@ -61,6 +63,7 @@ impl Default for UiConfig {
         UiConfig {
             sidebar_width: 220,
             list_width: 360,
+            decorations: "auto".into(),
         }
     }
 }

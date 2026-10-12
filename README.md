@@ -79,6 +79,15 @@ fixture mail and never touches the network or your config. Add
 `POSTO_EXIT_AFTER_MS=4000` to exit after first render (used by the smoke
 test).
 
+## Window decorations
+
+`[ui] decorations` in `config.toml` is `"auto"` (default), `"on"`, or
+`"off"`. Auto keeps the native title bar on macOS and Windows; on Linux
+it turns decorations off when the session looks like a tiling window
+manager (Hyprland, sway, i3, river, niri and friends, detected from
+`XDG_CURRENT_DESKTOP` or their sockets) and keeps them on for desktops
+like GNOME, KDE, and COSMIC.
+
 ## Theming
 
 The GUI uses `color-scheme: light dark`, `light-dark()`, system colours

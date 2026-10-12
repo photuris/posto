@@ -34,14 +34,80 @@ fn main() {
         .with_title("Posto")
         .with_inner_size(LogicalSize::new(1400.0, 900.0))
         .with_min_inner_size(LogicalSize::new(900.0, 600.0));
-    // On Linux, tao's GTK backend draws its own title bar (client-side decorations) even on
-    // compositors like Hyprland that frame windows themselves, so turn it off there.
-    // macOS and Windows keep the native title bar and its buttons.
-    #[cfg(target_os = "linux")]
-    let window = window.with_decorations(false);
+    let window = window.with_decorations(want_decorations(&backend.cfg.ui.decorations));
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(Config::new().with_window(window).with_menu(None))
         .with_context(backend)
         .launch(app::App);
+}
+
+/// Whether the window should carry a title bar. Config "on"/"off" wins; "auto" keeps native
+/// decorations on macOS and Windows, and on Linux turns them off only under a tiling
+/// compositor (tao's GTK backend otherwise paints its own header bar there).
+fn want_decorations(setting: &str) -> bool {
+    match setting {
+        "on" => true,
+        "off" => false,
+        _ => {
+            if !cfg!(target_os = "linux") {
+                return true;
+            }
+            let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+            let socket = |k: &str| std::env::var_os(k).is_some();
+            !is_tiling_session(
+                &desktop,
+                socket("HYPRLAND_INSTANCE_SIGNATURE") || socket("SWAYSOCK") || socket("I3SOCK"),
+            )
+        }
+    }
+}
+
+/// Heuristic: the session is a tiling window manager when a known tiler socket is set or
+/// `XDG_CURRENT_DESKTOP` names one. Unknown desktops count as a DE (decorations stay on).
+fn is_tiling_session(xdg_current_desktop: &str, tiler_socket: bool) -> bool {
+    const TILERS: &[&str] = &[
+        "hyprland",
+        "sway",
+        "i3",
+        "river",
+        "niri",
+        "bspwm",
+        "dwm",
+        "qtile",
+        "xmonad",
+        "awesome",
+        "herbstluftwm",
+        "leftwm",
+        "mango",
+        "wayfire",
+    ];
+    tiler_socket
+        || xdg_current_desktop
+            .split(':')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .any(|s| TILERS.contains(&s.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiling_detection() {
+        assert!(is_tiling_session("Hyprland", false));
+        assert!(is_tiling_session("sway", false));
+        assert!(is_tiling_session("", true));
+        assert!(!is_tiling_session("GNOME", false));
+        assert!(!is_tiling_session("KDE", false));
+        assert!(!is_tiling_session("COSMIC", false));
+        assert!(!is_tiling_session("", false));
+        assert!(is_tiling_session("ubuntu:GNOME:i3", false));
+    }
+
+    #[test]
+    fn explicit_setting_wins() {
+        assert!(want_decorations("on"));
+        assert!(!want_decorations("off"));
+    }
 }
