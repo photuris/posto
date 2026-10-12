@@ -9,7 +9,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -1382,10 +1382,16 @@ impl Store {
         Ok(())
     }
 
-    /// Records that the server holds the mailbox changes for `tray` (and no
-    /// other tray's) and confirms the row, unless the correction changed since `seen_correction`
+    /// Records that the server holds the mailbox changes for `tray` and
+    /// confirms the row, unless the correction changed since `seen_correction`
     /// was read; then the row stays pending for the newer choice. Returns
     /// whether the row was confirmed.
+    ///
+    /// Ownership is merged into the row as it is now, in one immediate
+    /// transaction: `tray` is added and only the `removed` trays (those this
+    /// operation took the mailbox of) are dropped, so a stale confirmation,
+    /// or one from another handle on the same database, never discards
+    /// ownership another operation recorded.
     ///
     /// # Errors
     ///
@@ -1395,26 +1401,40 @@ impl Store {
         account: &str,
         id: &str,
         tray: &str,
+        removed: &[String],
         seen_correction: Option<&str>,
     ) -> Result<bool> {
-        let conn = self.conn();
-
-        conn.execute(
-            "UPDATE classified SET owned_trays = ?3, \
-             applied = CASE WHEN corrected_tray IS ?4 THEN 1 ELSE 0 END, \
-             apply_error = CASE WHEN corrected_tray IS ?4 THEN NULL ELSE apply_error END \
-             WHERE account_id = ?1 AND email_id = ?2",
-            params![account, id, tray, seen_correction],
-        )?;
-
-        Ok(conn
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owned: Option<String> = tx
             .query_row(
-                "SELECT applied FROM classified WHERE account_id = ?1 AND email_id = ?2",
+                "SELECT owned_trays FROM classified WHERE account_id = ?1 AND email_id = ?2",
                 [account, id],
                 |r| r.get(0),
             )
-            .optional()?
-            .unwrap_or(false))
+            .optional()?;
+        let Some(owned) = owned else {
+            return Ok(false);
+        };
+        let mut merged: Vec<&str> = owned
+            .split(',')
+            .filter(|t| !t.is_empty() && *t != tray && !removed.iter().any(|r| r == t))
+            .collect();
+
+        merged.push(tray);
+
+        let applied: bool = tx.query_row(
+            "UPDATE classified SET owned_trays = ?3, \
+             applied = CASE WHEN corrected_tray IS ?4 THEN 1 ELSE 0 END, \
+             apply_error = CASE WHEN corrected_tray IS ?4 THEN NULL ELSE apply_error END \
+             WHERE account_id = ?1 AND email_id = ?2 RETURNING applied",
+            params![account, id, merged.join(","), seen_correction],
+            |r| r.get(0),
+        )?;
+
+        tx.commit()?;
+
+        Ok(applied)
     }
 
     /// Records the user's choice of `tray` for an email and leaves the

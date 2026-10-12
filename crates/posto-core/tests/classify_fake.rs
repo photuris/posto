@@ -1975,3 +1975,70 @@ async fn correction_waits_for_the_move_in_flight_then_undoes_it() -> Result<()> 
 
     Ok(())
 }
+#[tokio::test]
+async fn review_distinct_store_handles_keep_all_owned_trays() -> Result<()> {
+    let mut env = env().await;
+    let path = env._dir.path().join("shared.db");
+    env.store = Store::open(&path)?;
+    let second_store = Store::open(&path)?;
+    env.store
+        .upsert_emails(&[email("a", "e1", &["mb-inbox"])])?;
+    env.store.upsert_mailboxes(&[
+        mailbox("a", "mb-inbox", "Inbox", Some("inbox")),
+        mailbox("a", "mb-junk", "Junk", Some("junk")),
+        mailbox("a", "mb-social", "Social", None),
+        mailbox("a", "mb-promos", "Promos", None),
+        mailbox("a", "mb-updates", "Updates", None),
+    ])?;
+    delay_mailbox_patch(&env, "mailboxIds/mb-social", 600).await;
+    delay_mailbox_patch(&env, "mailboxIds/mb-promos", 300).await;
+    let msg = MsgRef::new("a", "e1");
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        let (first, second, latest) = tokio::join!(
+            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social),
+            async {
+                wait_for_mailbox_patch(&env, "mailboxIds/mb-social").await;
+                correct(
+                    &env.cfg,
+                    &second_store,
+                    &env.clients,
+                    &msg,
+                    Tray::Promotional,
+                )
+                .await
+            },
+            async {
+                wait_for_mailbox_patch(&env, "mailboxIds/mb-promos").await;
+                correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Updates).await
+            },
+        );
+        first?;
+        second?;
+        latest?;
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect("corrections deadlocked")?;
+    assert_eq!(
+        env.store
+            .classification("a", "e1")?
+            .unwrap()
+            .corrected_tray
+            .as_deref(),
+        Some("updates")
+    );
+    let report = env.run(None).await;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    assert_eq!(
+        env.store.owned_trays("a", "e1")?,
+        vec!["updates".to_string()]
+    );
+    assert_eq!(
+        env.mailboxes_of("a", "e1"),
+        sorted(&["mb-inbox", "mb-updates"]),
+        "cleanup was lost between independent Store handles to the shared cache"
+    );
+    assert!(env.store.classification("a", "e1")?.unwrap().applied);
+    Ok(())
+}

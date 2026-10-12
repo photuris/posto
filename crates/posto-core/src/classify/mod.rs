@@ -19,13 +19,16 @@
 //! and a pending correction is retried on every run, outside the queue's
 //! attempt budget.
 //!
-//! Mailbox changes to one message are serialised inside the process
+//! Mailbox changes to one message are serialised per [`Store`] handle
 //! ([`Store::lock_message`]): each application re-reads the row once it has its
 //! turn, so it acts on the latest choice, and an automatic answer never flags
 //! mail once a correction exists. The mailboxes the classifier may have added
-//! are kept in the row (`owned_trays`) until a change is confirmed, so
-//! successive corrections remove every earlier one. Separate processes (the
-//! CLI beside the GUI) are not ordered against each other.
+//! are kept in the row (`owned_trays`); a confirmation merges into the row as
+//! it is then (adds its tray, drops only the trays it removed), so successive
+//! corrections remove every earlier one even when another handle on the same
+//! database (the CLI beside the GUI) changed the message in between. Handles
+//! are not ordered against each other, but none can discard another's
+//! ownership.
 
 pub mod jev;
 pub mod state;
@@ -348,11 +351,17 @@ async fn settle(
     let seen = row.corrected_tray.as_deref();
 
     match apply_tray(cfg, store, client, &row).await {
-        Ok(flagged) => {
+        Ok(done) => {
             report.moved += 1;
-            report.flagged += usize::from(flagged);
+            report.flagged += usize::from(done.flagged);
 
-            if store.confirm_classification(account, id, row.effective_tray(), seen)? {
+            if store.confirm_classification(
+                account,
+                id,
+                row.effective_tray(),
+                &done.removed,
+                seen,
+            )? {
                 store.remove_from_classify_queue(account, id)?;
             }
 
@@ -508,8 +517,17 @@ fn unique(ids: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// What [`apply_tray`] did to the server's copy of one email.
+pub struct Applied {
+    /// Whether the email was flagged.
+    pub flagged: bool,
+    /// The trays whose mailboxes the change took the email out of.
+    pub removed: Vec<String>,
+}
+
 /// Files the email per its effective tray and flags it when it is an urgent
-/// uncorrected needs-reply; returns whether it was flagged. Mailbox changes
+/// uncorrected needs-reply; returns whether it was flagged and which trays
+/// it left (what the caller must drop from the row's ownership). Mailbox changes
 /// are patches, so memberships the classifier does not own are untouched:
 ///
 /// - add the tray's mailbox, and the unsure mailbox when unsure;
@@ -531,7 +549,7 @@ pub async fn apply_tray(
     store: &Store,
     client: Option<&Client>,
     c: &Classified,
-) -> Result<bool> {
+) -> Result<Applied> {
     let tray: Tray = c.effective_tray().parse()?;
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
     let settings = &cfg.classify;
@@ -544,6 +562,7 @@ pub async fn apply_tray(
             .ok_or_else(|| Error::NotFound("inbox mailbox".into()))
     };
     let (mut add, mut remove) = (Vec::new(), Vec::new());
+    let mut removed_trays = Vec::new();
 
     if tray == Tray::Spam {
         if !c.unsure {
@@ -573,7 +592,10 @@ pub async fn apply_tray(
     }
 
     if corrected {
-        remove.extend(previous_mailboxes(cfg, store, c, tray)?);
+        for (previous, mailbox) in previous_mailboxes(cfg, store, c, tray)? {
+            removed_trays.push(previous.as_str().to_string());
+            remove.push(mailbox);
+        }
 
         if !c.unsure
             && let Some(m) = store.top_level_mailbox_by_name(account, &settings.unsure_mailbox)?
@@ -620,19 +642,23 @@ pub async fn apply_tray(
         accepted(store, client, account, id, Action::Flag).await?;
     }
 
-    Ok(flag)
+    Ok(Applied {
+        flagged: flag,
+        removed: removed_trays,
+    })
 }
 
 /// The mailboxes a correction to `new` undoes: those of every tray the
 /// classifier may have added (the row's `owned_trays`) and of Jev's own answer
-/// (unless the row is a manual one), whichever differ from `new`. Spam undoes the junk mailbox. Mailboxes that
-/// do not exist locally are skipped.
+/// (unless the row is a manual one), whichever differ from `new`, each with
+/// the mailbox it undoes. Spam undoes the junk mailbox. Mailboxes that do not
+/// exist locally are skipped.
 fn previous_mailboxes(
     cfg: &Config,
     store: &Store,
     c: &Classified,
     new: Tray,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(Tray, String)>> {
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
     let mut before: Vec<Tray> = store
         .owned_trays(account, id)?
@@ -656,7 +682,7 @@ fn previous_mailboxes(
             }
         };
 
-        found.extend(mailbox.map(|m| m.id));
+        found.extend(mailbox.map(|m| (tray, m.id)));
     }
 
     Ok(found)
@@ -695,11 +721,12 @@ pub async fn correct(
 
     match apply_tray(cfg, store, client, &row).await {
         Ok(_) if client.is_none() => Ok(()),
-        Ok(_) => {
+        Ok(done) => {
             store.confirm_classification(
                 account,
                 id,
                 row.effective_tray(),
+                &done.removed,
                 row.corrected_tray.as_deref(),
             )?;
 

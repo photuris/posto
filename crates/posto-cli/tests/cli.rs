@@ -676,6 +676,27 @@ fn classify_dry_run_writes_nothing() {
     assert_eq!(sb.json(&["classify", "status"]), before);
     assert_eq!(before["accounts"][0]["queued"], 1);
     assert_eq!(before["accounts"][0]["classified"], 2);
+
+    // A writable open would rebuild an old cache, which the comparison above
+    // cannot see on a current one (the open rewrites the same bytes).
+    let old = Sandbox::seeded();
+
+    enable_classifier(&old, "http://127.0.0.1:9/session");
+    Store::open(&old.0.join("posto.db"))
+        .unwrap()
+        .set_state("schema_version", "1")
+        .unwrap();
+
+    let old_bytes = std::fs::read(old.0.join("posto.db")).unwrap();
+    let out = old.run_with(&["classify", "run", "--dry-run"], None);
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err["error"].as_str().unwrap().contains("schema 1"), "{err}");
+    assert!(
+        std::fs::read(old.0.join("posto.db")).unwrap() == old_bytes,
+        "the dry run rebuilt an old cache"
+    );
 }
 
 #[test]
