@@ -1625,3 +1625,353 @@ async fn backfill_queues_newest_unclassified_inbox_mail() -> Result<()> {
 
     Ok(())
 }
+// Round 2 concurrency probes, appended only in the disposable worktree.
+async fn wait_for_mailbox_patch(env: &Env, key: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if patches(&env.jmap, "e1")
+                .await
+                .iter()
+                .any(|p| p[key] == true)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("request never reached fake JMAP");
+}
+
+async fn delay_mailbox_patch(env: &Env, key: &'static str, delay: u64) {
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(move |r: &Request| {
+            let b: Value = serde_json::from_slice(&r.body).unwrap();
+            b["methodCalls"][0][0] == "Email/set"
+                && b["methodCalls"][0][1]["update"]["e1"][key] == true
+        })
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(
+                    json!({"methodResponses": [["Email/set", {"updated": {"e1": null}}, "0"]]}),
+                )
+                .set_delay(std::time::Duration::from_millis(delay)),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&env.jmap)
+        .await;
+}
+
+#[tokio::test]
+async fn review_correction_during_move_does_not_flag() -> Result<()> {
+    let env = env_with(&[("a", Some(true))], answer("needs_reply", false, 4.0)).await;
+    env.queue("a", "e1", &["mb-inbox"]);
+    delay_mailbox_patch(&env, "mailboxIds/mb-needs-reply", 300).await;
+    let (report, correction) = tokio::join!(env.run(None), async {
+        wait_for_mailbox_patch(&env, "mailboxIds/mb-needs-reply").await;
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &MsgRef::new("a", "e1"),
+            Tray::Social,
+        )
+        .await
+    });
+    correction?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        env.store
+            .classification("a", "e1")?
+            .unwrap()
+            .corrected_tray
+            .as_deref(),
+        Some("social")
+    );
+    env.run(None).await;
+    assert!(
+        !env.store.email("a", "e1")?.unwrap().is_flagged(),
+        "stale automatic move flagged corrected Social mail, and retry never cleared it"
+    );
+    Ok(())
+}
+
+struct CorrectAnotherQueued<'a> {
+    env: &'a Env,
+    first: AtomicBool,
+}
+impl classify::Classifier for CorrectAnotherQueued<'_> {
+    async fn classify(&self, state: &str) -> Result<classify::Classification> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            correct(
+                &self.env.cfg,
+                &self.env.store,
+                &self.env.clients,
+                &MsgRef::new("a", "e2"),
+                Tray::Social,
+            )
+            .await?;
+        }
+        classify::Classifier::classify(&self.env.jev.client(), state).await
+    }
+}
+
+#[tokio::test]
+async fn review_batch_rechecks_corrected_candidates() -> Result<()> {
+    let env = env().await;
+    env.queue("a", "e1", &["mb-inbox"]);
+    env.queue("a", "e2", &["mb-inbox"]);
+    let classifier = CorrectAnotherQueued {
+        env: &env,
+        first: AtomicBool::new(true),
+    };
+    let report = run_with_lock(
+        &env.lock,
+        &env.cfg,
+        &env.store,
+        &env.clients,
+        &classifier,
+        None,
+    )
+    .await;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        env.jev.bodies().await.len(),
+        1,
+        "asked Jev about e2 after it was manually classified and removed from the queue"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_concurrent_corrections_remove_all_owned_trays() -> Result<()> {
+    let env = env().await;
+    env.store
+        .upsert_emails(&[email("a", "e1", &["mb-inbox"])])?;
+    env.store.upsert_mailboxes(&[
+        mailbox("a", "mb-social", "Social", None),
+        mailbox("a", "mb-promos", "Promos", None),
+        mailbox("a", "mb-updates", "Updates", None),
+    ])?;
+    delay_mailbox_patch(&env, "mailboxIds/mb-social", 300).await;
+    delay_mailbox_patch(&env, "mailboxIds/mb-promos", 600).await;
+    let msg = MsgRef::new("a", "e1");
+    let (first, second, latest) = tokio::join!(
+        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social),
+        async {
+            wait_for_mailbox_patch(&env, "mailboxIds/mb-social").await;
+            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Promotional).await
+        },
+        async {
+            wait_for_mailbox_patch(&env, "mailboxIds/mb-promos").await;
+            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Updates).await
+        },
+    );
+    first?;
+    second?;
+    latest?;
+    assert_eq!(
+        env.store
+            .classification("a", "e1")?
+            .unwrap()
+            .corrected_tray
+            .as_deref(),
+        Some("updates")
+    );
+    env.run(None).await;
+    assert_eq!(
+        env.mailboxes_of("a", "e1"),
+        sorted(&["mb-inbox", "mb-updates"]),
+        "a stale correction's mailbox survived even after retry"
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn review_html_heading_keeps_jevmail_dividers() -> Result<()> {
+    let e = email("a", "e1", &["mb-inbox"]);
+    let b = posto_core::store::EmailBody {
+        email_id: "e1".into(),
+        html: Some("<h1>Heading</h1>".into()),
+        text: None,
+        attachments: vec![],
+        in_reply_to: vec![],
+        references: vec![],
+        message_id: vec![],
+    };
+    let state = classify::state::state_for(&e, &b, false, false, 2000);
+    let body = state.split_once("Body:\n").unwrap().1;
+    // Pinned html2text 1a4bdc82ecec emits asterisks around an H1 heading.
+    assert!(
+        body.lines()
+            .any(|line| line.len() > 1 && line.chars().all(|c| c == '*')),
+        "Go's H1 divider is missing: {body:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_batch_rechecks_after_the_body_fetches() -> Result<()> {
+    let env = env().await;
+
+    env.queue("a", "e1", &["mb-inbox"]);
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(|r: &Request| {
+            let b: Value = serde_json::from_slice(&r.body).unwrap();
+
+            b["methodCalls"][0][1]["properties"][0] == "header:List-Unsubscribe:asText"
+        })
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"methodResponses": [[
+                    "Email/get",
+                    {"list": [{"id": "e1", "header:List-Unsubscribe:asText": null}]},
+                    "0"
+                ]]}))
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .with_priority(1)
+        .mount(&env.jmap)
+        .await;
+
+    let msg = MsgRef::new("a", "e1");
+    let (report, correction) = tokio::join!(env.run(None), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !calls(&env.jmap)
+                .await
+                .iter()
+                .any(|(_, a)| a["properties"][0] == "header:List-Unsubscribe:asText")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("header fetch never started");
+        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social).await
+    });
+
+    correction?;
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.classified, 0);
+    assert_eq!(
+        env.jev.bodies().await.len(),
+        0,
+        "asked Jev after the email was corrected during the fetches"
+    );
+    assert_eq!(
+        env.store
+            .classification("a", "e1")?
+            .unwrap()
+            .corrected_tray
+            .as_deref(),
+        Some("social")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_skips_the_body_fetch_for_corrected_candidates() -> Result<()> {
+    let env = env().await;
+
+    env.queue("a", "e1", &["mb-inbox"]);
+    env.queue("a", "e2", &["mb-inbox"]);
+
+    let classifier = CorrectAnotherQueued {
+        env: &env,
+        first: AtomicBool::new(true),
+    };
+    let report = run_with_lock(
+        &env.lock,
+        &env.cfg,
+        &env.store,
+        &env.clients,
+        &classifier,
+        None,
+    )
+    .await;
+
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        calls(&env.jmap)
+            .await
+            .iter()
+            .all(|(_, args)| args["ids"][0] != "e2"),
+        "fetched the body of an email that was corrected and dequeued"
+    );
+    assert_eq!(
+        env.store.classify_queue(Some("a"))?.len(),
+        0,
+        "the corrected email's queue row must stay gone"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn correction_after_a_refused_one_removes_the_tray_it_may_have_added() -> Result<()> {
+    let env = env().await;
+
+    env.store
+        .upsert_emails(&[email("a", "e1", &["mb-inbox"])])?;
+    env.store.upsert_mailboxes(&[
+        mailbox("a", "mb-social", "Social", None),
+        mailbox("a", "mb-promos", "Promos", None),
+    ])?;
+
+    let msg = MsgRef::new("a", "e1");
+
+    env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
+    assert!(
+        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social)
+            .await
+            .is_err()
+    );
+    env.jmap_state.refuse_moves.store(false, Ordering::SeqCst);
+    correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Promotional).await?;
+
+    let last = patches(&env.jmap, "e1").await.pop().unwrap();
+
+    assert!(
+        last.as_object().unwrap().get("mailboxIds/mb-social") == Some(&Value::Null),
+        "the refused Social change may have reached the server: {last}"
+    );
+    assert_eq!(env.mailboxes_of("a", "e1"), sorted(&["mb-promos"]));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn correction_waits_for_the_move_in_flight_then_undoes_it() -> Result<()> {
+    let env = env_with(&[("a", Some(true))], answer("needs_reply", false, 4.0)).await;
+
+    env.queue("a", "e1", &["mb-inbox"]);
+    delay_mailbox_patch(&env, "mailboxIds/mb-needs-reply", 300).await;
+
+    let msg = MsgRef::new("a", "e1");
+    let (_, waited) = tokio::join!(env.run(None), async {
+        wait_for_mailbox_patch(&env, "mailboxIds/mb-needs-reply").await;
+
+        let since = std::time::Instant::now();
+
+        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social)
+            .await
+            .map(|()| since.elapsed())
+    });
+
+    assert!(
+        waited? >= std::time::Duration::from_millis(200),
+        "the correction was sent while the automatic move was still in flight"
+    );
+
+    let sent = patches(&env.jmap, "e1").await;
+
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["mailboxIds/mb-needs-reply"], Value::Null);
+    assert_eq!(sent[1]["mailboxIds/mb-social"], true);
+
+    Ok(())
+}

@@ -4,10 +4,10 @@
 //! config (not the server's account id). The database is a cache: when the
 //! schema version is not [`SCHEMA_VERSION`], the cache tables are rebuilt.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::de::DeserializeOwned;
@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::jmap::Identity;
 
 /// Version of the table layout below; stored in `sync_state` as `schema_version`.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Database schema; every statement is idempotent.
 const SCHEMA: &str = "
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS email_mailboxes(account_id TEXT NOT NULL, email_id TE
 CREATE INDEX IF NOT EXISTS email_mailboxes_box ON email_mailboxes(account_id, mailbox_id);
 CREATE TABLE IF NOT EXISTS bodies(account_id TEXT NOT NULL, email_id TEXT NOT NULL, html TEXT, text TEXT, attachments_json TEXT NOT NULL, in_reply_to_json TEXT NOT NULL, references_json TEXT NOT NULL, message_id_json TEXT NOT NULL, PRIMARY KEY(account_id, email_id));
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(account_id UNINDEXED, email_id UNINDEXED, subject, from_text, preview, body_text);
-CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, applied_tray TEXT, PRIMARY KEY(account_id, email_id));
+CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, owned_trays TEXT NOT NULL DEFAULT '', PRIMARY KEY(account_id, email_id));
 CREATE TABLE IF NOT EXISTS classify_queue(account_id TEXT NOT NULL, email_id TEXT NOT NULL, added_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(account_id, email_id));
 ";
 
@@ -287,10 +287,15 @@ pub struct ListQuery {
     pub unread_only: bool,
 }
 
+/// One async lock per `(account, email)` being changed.
+type MessageLocks = HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
+
 /// Handle to the local database; safe to share between threads.
 pub struct Store {
     /// The single connection, serialised by a mutex.
     conn: Mutex<Connection>,
+    /// Locks that keep the mailbox changes of one message in order.
+    message_locks: Mutex<MessageLocks>,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -642,7 +647,46 @@ impl Store {
 
         Ok(Store {
             conn: Mutex::new(conn),
+            message_locks: Mutex::default(),
         })
+    }
+
+    /// Opens the existing database at `path` read-only: nothing is created,
+    /// migrated, rebuilt or written, so a command that must not change the
+    /// cache can use it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when there is no database yet and
+    /// [`Error::Config`] when its schema version is not [`SCHEMA_VERSION`]
+    /// (a normal open would rebuild or refuse it).
+    pub fn open_read_only(path: &Path) -> Result<Store> {
+        if !path.exists() {
+            return Err(Error::NotFound(format!(
+                "cache {} (sync once first)",
+                path.display()
+            )));
+        }
+
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let store = Store {
+            conn: Mutex::new(conn),
+            message_locks: Mutex::default(),
+        };
+        let version = store.state("schema_version").unwrap_or(None);
+
+        if version.as_deref() != Some(&SCHEMA_VERSION.to_string()) {
+            return Err(Error::Config(format!(
+                "the cache has schema {} but posto needs {SCHEMA_VERSION}; \
+                 run a command that opens it for writing to rebuild it",
+                version.as_deref().unwrap_or("none")
+            )));
+        }
+
+        Ok(store)
     }
 
     /// Opens a private in-memory database (tests and UI test mode).
@@ -657,6 +701,7 @@ impl Store {
 
         Ok(Store {
             conn: Mutex::new(conn),
+            message_locks: Mutex::default(),
         })
     }
 
@@ -1101,7 +1146,7 @@ impl Store {
     fn write_classified(&self, verb: &str, c: &Classified) -> Result<usize> {
         Ok(self.conn().execute(
             &format!(
-                "{verb} INTO classified({CLASSIFIED_COLS}, applied_tray) \
+                "{verb} INTO classified({CLASSIFIED_COLS}, owned_trays) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ),
             params![
@@ -1118,27 +1163,86 @@ impl Store {
                 c.corrected_tray,
                 c.applied,
                 c.apply_error,
-                c.applied.then(|| c.effective_tray()),
+                if c.applied { c.effective_tray() } else { "" },
             ],
         )?)
     }
 
-    /// The tray whose mailbox changes the server last confirmed for an email,
-    /// if any.
+    /// The trays whose mailboxes the classifier may have put an email in and
+    /// not yet taken it out of: the confirmed one and any it has since tried
+    /// to add.
     ///
     /// # Errors
     ///
     /// Returns an error on database failure.
-    pub fn confirmed_tray(&self, account: &str, id: &str) -> Result<Option<String>> {
-        Ok(self
+    pub fn owned_trays(&self, account: &str, id: &str) -> Result<Vec<String>> {
+        let owned: Option<String> = self
             .conn()
             .query_row(
-                "SELECT applied_tray FROM classified WHERE account_id = ?1 AND email_id = ?2",
+                "SELECT owned_trays FROM classified WHERE account_id = ?1 AND email_id = ?2",
                 [account, id],
                 |r| r.get(0),
             )
-            .optional()?
-            .flatten())
+            .optional()?;
+
+        Ok(owned
+            .unwrap_or_default()
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect())
+    }
+
+    /// Records that `tray`'s mailbox is about to be added to an email, so a
+    /// later correction removes it even if this change fails half way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn own_tray(&self, account: &str, id: &str, tray: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE classified SET owned_trays = CASE \
+             WHEN ',' || owned_trays || ',' LIKE '%,' || ?3 || ',%' THEN owned_trays \
+             WHEN owned_trays = '' THEN ?3 ELSE owned_trays || ',' || ?3 END \
+             WHERE account_id = ?1 AND email_id = ?2",
+            [account, id, tray],
+        )?;
+
+        Ok(())
+    }
+
+    /// Waits for, then holds, the lock that orders the classifier's mailbox
+    /// changes for one message within this process.
+    pub async fn lock_message(&self, account: &str, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.message_locks.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Idle locks (nobody else holds a handle) are forgotten.
+            locks.retain(|_, l| Arc::strong_count(l) > 1);
+            locks
+                .entry((account.to_string(), id.to_string()))
+                .or_default()
+                .clone()
+        };
+
+        lock.lock_owned().await
+    }
+
+    /// Whether the email is still queued and has no classification yet, i.e.
+    /// whether asking Jev about it is still wanted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn awaits_classification(&self, account: &str, id: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM classify_queue q \
+                 WHERE q.account_id = ?1 AND q.email_id = ?2) \
+             AND NOT EXISTS (SELECT 1 FROM classified c \
+                 WHERE c.account_id = ?1 AND c.email_id = ?2)",
+            [account, id],
+            |r| r.get(0),
+        )?)
     }
 
     /// The classification of one email.
@@ -1270,7 +1374,7 @@ impl Store {
     ) -> Result<()> {
         self.conn().execute(
             "UPDATE classified SET applied = ?3, apply_error = ?4, \
-             applied_tray = CASE WHEN ?3 THEN COALESCE(corrected_tray, tray) ELSE applied_tray END \
+             owned_trays = CASE WHEN ?3 THEN COALESCE(corrected_tray, tray) ELSE owned_trays END \
              WHERE account_id = ?1 AND email_id = ?2",
             params![account, id, error.is_none(), error],
         )?;
@@ -1278,8 +1382,8 @@ impl Store {
         Ok(())
     }
 
-    /// Records that the server holds the mailbox changes for `tray` and
-    /// confirms the row, unless the correction changed since `seen_correction`
+    /// Records that the server holds the mailbox changes for `tray` (and no
+    /// other tray's) and confirms the row, unless the correction changed since `seen_correction`
     /// was read; then the row stays pending for the newer choice. Returns
     /// whether the row was confirmed.
     ///
@@ -1296,7 +1400,7 @@ impl Store {
         let conn = self.conn();
 
         conn.execute(
-            "UPDATE classified SET applied_tray = ?3, \
+            "UPDATE classified SET owned_trays = ?3, \
              applied = CASE WHEN corrected_tray IS ?4 THEN 1 ELSE 0 END, \
              apply_error = CASE WHEN corrected_tray IS ?4 THEN NULL ELSE apply_error END \
              WHERE account_id = ?1 AND email_id = ?2",
@@ -1800,7 +1904,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("3"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("4"));
         assert_eq!(store.account_state("a", "email_state").unwrap(), None);
         assert_eq!(store.state("email_state").unwrap(), None);
         assert_eq!(store.state("identities").unwrap(), None);
@@ -1832,7 +1936,7 @@ mod tests {
 
             conn.execute_batch(
                 "CREATE TABLE sync_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO sync_state VALUES ('schema_version', '4');",
+                 INSERT INTO sync_state VALUES ('schema_version', '5');",
             )
             .unwrap();
         }
@@ -2201,7 +2305,7 @@ mod tests {
             store.account_state("b", "email_state").unwrap().as_deref(),
             Some("s1")
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("3"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("4"));
         assert_eq!(store.search(None, "subject", 0).unwrap().len(), 1);
     }
 

@@ -17,9 +17,15 @@
 //! A user's correction always wins over an automatic answer: an answer never
 //! replaces an existing row, is not applied once the row carries a correction,
 //! and a pending correction is retried on every run, outside the queue's
-//! attempt budget. A correction that lands while an automatic move is already
-//! on its way to the server can be overtaken there; the stored row still says
-//! what the user chose.
+//! attempt budget.
+//!
+//! Mailbox changes to one message are serialised inside the process
+//! ([`Store::lock_message`]): each application re-reads the row once it has its
+//! turn, so it acts on the latest choice, and an automatic answer never flags
+//! mail once a correction exists. The mailboxes the classifier may have added
+//! are kept in the row (`owned_trays`) until a change is confirmed, so
+//! successive corrections remove every earlier one. Separate processes (the
+//! CLI beside the GUI) are not ordered against each other.
 
 pub mod jev;
 pub mod state;
@@ -226,9 +232,17 @@ async fn drain<C: Classifier>(
         };
         let (account, id) = (row.account_id.as_str(), row.email_id.as_str());
         let result = async {
+            // The batch was read at the start: the email may have been
+            // corrected, classified or removed from the queue since.
+            if !store.awaits_classification(account, id)? {
+                return Ok(());
+            }
+
             store.begin_classify_attempt(account, id)?;
 
-            let answer = ask(cfg, store, client, classifier, account, id).await?;
+            let Some(answer) = ask(cfg, store, client, classifier, account, id).await? else {
+                return Ok(());
+            };
 
             report.classified += 1;
             report.input_tokens += answer.input_tokens;
@@ -310,7 +324,8 @@ fn fail(store: &Store, report: &mut ClassifyReport, account: &str, id: &str, e: 
 }
 
 /// Applies a stored answer and records the outcome: confirmed and out of the
-/// queue, or pending with the reason.
+/// queue, or pending with the reason. Waits for its turn on the message, then
+/// works from the row as it is by then, not from `c`.
 async fn settle(
     cfg: &Config,
     store: &Store,
@@ -319,23 +334,25 @@ async fn settle(
     report: &mut ClassifyReport,
 ) -> Result<()> {
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
-    let seen = c.corrected_tray.as_deref();
+    let _turn = store.lock_message(account, id).await;
+    let Some(row) = store.classification(account, id)? else {
+        return Ok(());
+    };
 
-    // An automatic answer gives way to a correction made since it was read.
-    if seen.is_none()
-        && store
-            .classification(account, id)?
-            .is_none_or(|now| now.corrected_tray.is_some())
-    {
+    // Someone else confirmed it meanwhile, or an automatic answer gives way
+    // to a correction made since it was read.
+    if row.applied || (c.corrected_tray.is_none() && row.corrected_tray.is_some()) {
         return Ok(());
     }
 
-    match apply_tray(cfg, store, client, c).await {
+    let seen = row.corrected_tray.as_deref();
+
+    match apply_tray(cfg, store, client, &row).await {
         Ok(flagged) => {
             report.moved += 1;
             report.flagged += usize::from(flagged);
 
-            if store.confirm_classification(account, id, c.effective_tray(), seen)? {
+            if store.confirm_classification(account, id, row.effective_tray(), seen)? {
                 store.remove_from_classify_queue(account, id)?;
             }
 
@@ -350,7 +367,8 @@ async fn settle(
 }
 
 /// Builds the state block of one email, asks `classifier` and returns the
-/// unapplied answer.
+/// unapplied answer; `None` when the email stopped awaiting classification
+/// (corrected, classified or dequeued) before Jev was asked.
 async fn ask<C: Classifier>(
     cfg: &Config,
     store: &Store,
@@ -358,7 +376,7 @@ async fn ask<C: Classifier>(
     classifier: &C,
     account: &str,
     id: &str,
-) -> Result<Classified> {
+) -> Result<Option<Classified>> {
     let email = store
         .email(account, id)?
         .ok_or_else(|| Error::NotFound(format!("email {account}/{id}")))?;
@@ -377,9 +395,15 @@ async fn ask<C: Classifier>(
         replied,
         cfg.classify.body_chars as usize,
     );
+
+    // The fetches above took time; do not pay for an answer nobody wants.
+    if !store.awaits_classification(account, id)? {
+        return Ok(None);
+    }
+
     let c = classifier.classify(&state).await?;
 
-    Ok(Classified {
+    Ok(Some(Classified {
         account_id: account.to_string(),
         email_id: id.to_string(),
         tray: c.tray.as_str().to_string(),
@@ -393,7 +417,7 @@ async fn ask<C: Classifier>(
         corrected_tray: None,
         applied: false,
         apply_error: None,
-    })
+    }))
 }
 
 /// The addresses the user writes from in `account`: its identities and its
@@ -568,6 +592,10 @@ pub async fn apply_tray(
         .filter(|r| !add.contains(r))
         .collect();
 
+    // Recorded before the request: if it fails half way, a later correction
+    // still knows to take this tray's mailbox away.
+    store.own_tray(account, id, tray.as_str())?;
+
     if !add.is_empty() || !remove.is_empty() {
         accepted(
             store,
@@ -579,7 +607,14 @@ pub async fn apply_tray(
         .await?;
     }
 
-    let flag = !corrected && tray == Tray::NeedsReply && c.urgency >= settings.flag_urgency_at;
+    // A flag cannot be taken back, so look at the row again: a correction
+    // made while the patch was in flight forbids it.
+    let flag = !corrected
+        && tray == Tray::NeedsReply
+        && c.urgency >= settings.flag_urgency_at
+        && !store
+            .classification(account, id)?
+            .is_some_and(|now| now.corrected_tray.is_some());
 
     if flag {
         accepted(store, client, account, id, Action::Flag).await?;
@@ -588,9 +623,9 @@ pub async fn apply_tray(
     Ok(flag)
 }
 
-/// The mailboxes a correction to `new` undoes: those of the tray the server
-/// last confirmed and of Jev's own answer (unless the row is a manual one),
-/// whichever differ from `new`. Spam undoes the junk mailbox. Mailboxes that
+/// The mailboxes a correction to `new` undoes: those of every tray the
+/// classifier may have added (the row's `owned_trays`) and of Jev's own answer
+/// (unless the row is a manual one), whichever differ from `new`. Spam undoes the junk mailbox. Mailboxes that
 /// do not exist locally are skipped.
 fn previous_mailboxes(
     cfg: &Config,
@@ -599,11 +634,11 @@ fn previous_mailboxes(
     new: Tray,
 ) -> Result<Vec<String>> {
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
-    let mut before: Vec<Tray> = Vec::new();
-
-    if let Some(confirmed) = store.confirmed_tray(account, id)? {
-        before.extend(confirmed.parse::<Tray>());
-    }
+    let mut before: Vec<Tray> = store
+        .owned_trays(account, id)?
+        .iter()
+        .filter_map(|t| t.parse().ok())
+        .collect();
 
     if c.model != "manual" {
         before.extend(c.tray.parse::<Tray>());
@@ -650,6 +685,9 @@ pub async fn correct(
     store.set_correction(account, id, tray.as_str())?;
     store.remove_from_classify_queue(account, id)?;
 
+    // Intent is stored; now wait for any change in flight, then apply the
+    // latest choice, which may be newer than `tray`.
+    let _turn = store.lock_message(account, id).await;
     let row = store
         .classification(account, id)?
         .ok_or_else(|| Error::NotFound(format!("classification {msg}")))?;

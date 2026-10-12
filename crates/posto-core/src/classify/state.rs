@@ -169,13 +169,111 @@ impl TextDecorator for JevDecorator {
     }
 }
 
-/// HTML as text the way jevmail's `message.HTMLToText` renders it. Headings
-/// carry no divider lines, which jevmail adds.
+/// HTML as text the way jevmail's `message.HTMLToText` renders it, with the
+/// divider lines the pinned renderer draws around `h1`-`h3` headings.
 fn html_to_text(html: &str) -> String {
+    render(&with_heading_dividers(html))
+}
+
+/// Renders HTML through [`JevDecorator`], without heading dividers.
+fn render(html: &str) -> String {
     html2text::config::with_decorator(JevDecorator)
         .string_from_read(html.as_bytes(), 10_000)
         .map(|t| t.trim().to_string())
         .unwrap_or_else(|_| crate::html::to_text(html))
+}
+
+/// Rewrites each `h1`-`h3` element as a paragraph carrying the dividers
+/// jaytaylor/html2text 1a4bdc82ecec draws: `*` above and below an `h1`, `-`
+/// above and below an `h2`, `-` below an `h3`. A divider is as long as the
+/// longest heading line less one, counted with the leading space the Go
+/// renderer puts before a heading's first word (which it later strips, so the
+/// divider ends up as long as the text).
+fn with_heading_dividers(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut at = 0;
+
+    while let Some(start) = find_heading(&lower, at) {
+        let level = lower.as_bytes()[start + 2];
+        let close = format!("</h{}", level as char);
+        let Some(open_end) = lower[start..].find('>').map(|n| start + n + 1) else {
+            break;
+        };
+        let Some(inner_end) = lower[open_end..].find(&close).map(|n| open_end + n) else {
+            break;
+        };
+        let Some(close_end) = lower[inner_end..].find('>').map(|n| inner_end + n + 1) else {
+            break;
+        };
+
+        out.push_str(&html[at..start]);
+        out.push_str(&heading_block(level, &render(&html[open_end..inner_end])));
+
+        at = close_end;
+    }
+
+    out.push_str(&html[at..]);
+
+    out
+}
+
+/// Byte offset of the next `<h1`, `<h2` or `<h3` tag at or after `from`.
+fn find_heading(lower: &str, from: usize) -> Option<usize> {
+    let mut at = from;
+
+    while let Some(n) = lower[at..].find("<h") {
+        let start = at + n;
+        let rest = &lower.as_bytes()[start + 2..];
+
+        if matches!(rest.first(), Some(b'1'..=b'3'))
+            && rest
+                .get(1)
+                .is_none_or(|c| c.is_ascii_whitespace() || matches!(c, b'>' | b'/'))
+        {
+            return Some(start);
+        }
+
+        at = start + 2;
+    }
+
+    None
+}
+
+/// The paragraph standing in for one heading of `level` (`b'1'`-`b'3'`) whose
+/// rendered text is `text`; nothing for an empty heading.
+fn heading_block(level: u8, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let longest = text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let chars = line.chars().count();
+
+            // The first line was emitted after a space, unless it starts with ".".
+            if i == 0 && !line.starts_with('.') {
+                chars
+            } else {
+                chars.saturating_sub(1)
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    let divider = (if level == b'1' { "*" } else { "-" }).repeat(longest);
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\n', "<br>");
+
+    if level == b'3' {
+        format!("<p>{escaped}<br>{divider}</p>")
+    } else {
+        format!("<p>{divider}<br>{escaped}<br>{divider}</p>")
+    }
 }
 
 /// Go's `\s`: ASCII space, tab, newline, form feed, carriage return.
@@ -387,12 +485,12 @@ mod tests {
 
         assert_eq!(
             text,
-            "Grüße, 日本語\n\nVisit our shop or today — naïve café ☕"
+            "**********\nGrüße, 日本語\n**********\n\nVisit our shop or today — naïve café ☕"
         );
 
         let cut = state_for(&e, &body(None, Some(html)), false, false, 5);
 
-        assert!(cut.ends_with("Body:\nGrüße…"), "{cut}");
+        assert!(cut.ends_with("Body:\n*****…"), "{cut}");
 
         // Without any body part the preview is used.
         let s = state_for(&e, &body(None, None), false, false, 2000);
@@ -419,6 +517,28 @@ mod tests {
             html_to_text("<ul><li>one</li><li>two</li></ul>"),
             "* one\n* two"
         );
+    }
+
+    #[test]
+    fn headings_get_the_pinned_renderers_dividers() {
+        // Divider length is the heading text length (Go counts a leading space
+        // and subtracts one); h1 uses "*", h2 "-" on both sides, h3 "-" below.
+        assert_eq!(
+            html_to_text("<h1>Heading</h1>"),
+            "*******\nHeading\n*******"
+        );
+        assert_eq!(
+            html_to_text("<h2>Heading</h2>"),
+            "-------\nHeading\n-------"
+        );
+        assert_eq!(html_to_text("<h3>Heading</h3>"), "Heading\n-------");
+        assert_eq!(
+            html_to_text("<p>Intro</p><H1 class=x>Big <b>news</b></H1><p>Body</p>"),
+            "Intro\n\n**********\nBig *news*\n**********\n\nBody"
+        );
+        // Other heading levels and `<hr>`/`<head>` are left to the renderer.
+        assert_eq!(html_to_text("<h4>Small</h4>"), "Small");
+        assert_eq!(html_to_text("<h1></h1><p>x</p>"), "x");
     }
 
     #[test]
