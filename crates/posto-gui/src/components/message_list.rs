@@ -3,7 +3,7 @@
 use dioxus::prelude::*;
 
 use crate::app::{
-    EMAILS, LIST_LIMIT, MAILBOXES, SEARCH_QUERY, SELECTED_EMAIL, SELECTED_MAILBOX, SIDEBAR_OPEN,
+    EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_EMAIL, SELECTED_MAILBOX, SIDEBAR_OPEN,
     load_more, select_email,
 };
 use crate::format;
@@ -33,7 +33,7 @@ pub fn MessageList() -> Element {
         ),
         (None, _) => ("Posto".to_string(), String::new()),
     };
-    let more = emails.len() >= *LIST_LIMIT.read() as usize;
+    let more = HAS_MORE();
 
     rsx! {
         section { class: "list",

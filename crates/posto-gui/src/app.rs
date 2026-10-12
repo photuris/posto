@@ -34,6 +34,8 @@ pub static ALLOW_REMOTE: GlobalSignal<bool> = Signal::global(|| false);
 pub static READER_MODE: GlobalSignal<bool> = Signal::global(|| false);
 pub static SEARCH_QUERY: GlobalSignal<String> = Signal::global(String::new);
 pub static LIST_LIMIT: GlobalSignal<u32> = Signal::global(|| PAGE);
+/// True when the last query filled its page, so older mail may remain.
+pub static HAS_MORE: GlobalSignal<bool> = Signal::global(|| false);
 pub static COMPOSER: GlobalSignal<Option<compose::Draft>> = Signal::global(|| None);
 pub static COMPOSER_TO: GlobalSignal<String> = Signal::global(String::new);
 pub static COMPOSER_CC: GlobalSignal<String> = Signal::global(String::new);
@@ -103,7 +105,15 @@ struct ThemeWatch {
 #[component]
 pub fn App() -> Element {
     use_context_provider(|| {
-        let signal = Signal::new(consume_context::<Backend>());
+        let backend = consume_context::<Backend>();
+
+        // Saved shortcuts apply from the first key press, not only after Settings.
+        *KEYMAP.write() =
+            Keymap::from_config(&backend.cfg.shortcuts).unwrap_or_else(|_| Keymap::defaults());
+
+        // Owned by the root scope: detached tasks (`run`) use it from there and
+        // outlive this component's scope.
+        let signal = Signal::new_in_scope(backend, ScopeId::ROOT);
 
         BACKEND.set(Some(signal));
         signal
@@ -270,7 +280,7 @@ fn fail(what: &str, e: Error) {
     match e {
         Error::NotConfigured(_) => set_status("No token configured — open Settings"),
         Error::Auth => {
-            backend().write().client = None;
+            backend().write().reset_client();
             set_status(format!("{what}: the server rejected the token"));
         }
         e => set_status(format!("{what}: {e}")),
@@ -544,6 +554,8 @@ pub async fn reload_list() {
         Ok(list) => {
             let backend = backend().peek().clone();
 
+            // Before blocked senders are removed: a full page may still have more behind it.
+            *HAS_MORE.write() = list.len() >= limit as usize;
             *EMAILS.write() = list
                 .into_iter()
                 .filter(|e| !backend.is_blocked(e))
@@ -830,4 +842,116 @@ async fn refresh_loop() {
 /// Makes the refresh loop sync on its next tick (after settings or token changes).
 pub fn sync_soon() {
     *LAST_SYNC.write() = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use dioxus::core::RuntimeGuard;
+    use posto_core::config::Config;
+    use posto_core::store::{Address, Store};
+
+    use super::*;
+
+    /// A backend over an empty in-memory store with `cfg`.
+    fn backend_with(cfg: Config) -> Backend {
+        Backend {
+            store: Arc::new(Store::open_memory().unwrap()),
+            client: None,
+            cfg,
+            ui_test: false,
+            conn_rev: 0,
+        }
+    }
+
+    /// Renders the real `App` once, headless, over `backend`.
+    fn rendered(backend: Backend) -> VirtualDom {
+        let mut dom = VirtualDom::new(App).with_root_context(backend);
+
+        dom.rebuild_in_place();
+        dom
+    }
+
+    #[test]
+    fn startup_keymap_uses_saved_shortcuts() {
+        let mut cfg = Config::default();
+
+        cfg.shortcuts.insert("archive".into(), "y".into());
+
+        let dom = rendered(backend_with(cfg));
+        let (archive, old) = dom.in_scope(ScopeId::ROOT, || {
+            let keymap = KEYMAP.peek();
+
+            (
+                keymap.lookup(&keys::chord_from_event("y", false, false, false, false)),
+                keymap.lookup(&keys::chord_from_event("e", false, false, false, false)),
+            )
+        });
+
+        assert_eq!(archive, Some(Action::Archive));
+        assert_eq!(old, None);
+    }
+
+    #[test]
+    fn backend_signal_is_owned_by_root_scope() {
+        let dom = rendered(backend_with(Config::default()));
+        let owner = dom.in_scope(ScopeId::ROOT, || backend().origin_scope());
+
+        assert_eq!(owner, ScopeId::ROOT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_more_survives_blocked_sender_in_full_page() {
+        let mut cfg = Config::default();
+
+        cfg.sync.refresh_minutes = 0;
+        cfg.blocked_senders = vec!["blocked@review.invalid".into()];
+
+        let dom = rendered(backend_with(cfg));
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let store = backend().peek().store.clone();
+
+        store
+            .upsert_mailboxes(&[Mailbox {
+                id: "box".into(),
+                name: "Box".into(),
+                role: Some("inbox".into()),
+                parent_id: None,
+                sort_order: 0,
+                total: 0,
+                unread: 0,
+            }])
+            .unwrap();
+
+        // PAGE + 1 emails, the newest of them blocked.
+        let rows: Vec<EmailSummary> = (0..=PAGE)
+            .map(|i| EmailSummary {
+                id: format!("e{i:03}"),
+                thread_id: format!("t{i:03}"),
+                received_at: format!("2026-10-12T{:02}:{:02}:00Z", i / 60, i % 60),
+                from: vec![Address {
+                    name: None,
+                    email: if i == PAGE {
+                        "blocked@review.invalid".into()
+                    } else {
+                        "allowed@review.invalid".into()
+                    },
+                }],
+                to: vec![],
+                cc: vec![],
+                subject: String::new(),
+                preview: String::new(),
+                size: 0,
+                has_attachment: false,
+                mailbox_ids: vec!["box".into()],
+                keywords: vec![],
+            })
+            .collect();
+
+        store.upsert_emails(&rows).unwrap();
+        reload_mailboxes();
+        reload_list().await;
+
+        assert_eq!(EMAILS.peek().len(), PAGE as usize - 1);
+        assert!(*HAS_MORE.peek(), "older allowed mail remains");
+    }
 }

@@ -113,7 +113,7 @@ pub fn Settings() -> Element {
             let mut b = shared.write();
 
             b.cfg = cfg;
-            b.client = None;
+            b.reset_client();
         }
 
         *KEYMAP.write() = keymap;
@@ -172,7 +172,7 @@ pub fn Settings() -> Element {
 
                                             let mut shared = backend();
 
-                                            shared.write().client = None;
+                                            shared.write().reset_client();
                                             sync_soon();
                                         }
                                         Err(e) => token_error.set(Some(e.to_string())),

@@ -17,6 +17,9 @@ pub struct Backend {
     pub cfg: Config,
     /// `POSTO_UI_TEST=1`: in-memory fixtures, no network, nothing written to disk.
     pub ui_test: bool,
+    /// Bumped whenever the endpoint or token may have changed, so a connection
+    /// that was already in flight is not cached under the new settings.
+    pub conn_rev: u64,
 }
 
 impl Backend {
@@ -38,6 +41,7 @@ impl Backend {
                 client: None,
                 cfg,
                 ui_test,
+                conn_rev: 0,
             });
         }
 
@@ -47,7 +51,14 @@ impl Backend {
             // A broken config.toml must not lock the user out of Settings.
             cfg: Config::load().unwrap_or_default(),
             ui_test,
+            conn_rev: 0,
         })
+    }
+
+    /// Drops the connection and invalidates any connection still being made.
+    pub fn reset_client(&mut self) {
+        self.client = None;
+        self.conn_rev += 1;
     }
 
     /// True when the sender (or its domain) is in `cfg.blocked_senders`.
@@ -74,32 +85,124 @@ pub fn sender_blocked(blocked: &[String], address: &str) -> bool {
 /// The connected client, connecting with the stored token when needed.
 ///
 /// `Ok(None)` in UI test mode. `Error::NotConfigured` when there is no token.
-pub async fn client(mut backend: Signal<Backend>) -> Result<Option<Arc<Client>>> {
-    let (existing, ui_test, session_url) = {
+pub async fn client(backend: Signal<Backend>) -> Result<Option<Arc<Client>>> {
+    {
         let b = backend.read();
 
-        (
-            b.client.clone(),
-            b.ui_test,
-            b.cfg.account.session_url.clone(),
-        )
-    };
-
-    if ui_test || existing.is_some() {
-        return Ok(existing);
+        if b.ui_test || b.client.is_some() {
+            return Ok(b.client.clone());
+        }
     }
 
     let token = Secrets::token()?.ok_or_else(|| Error::NotConfigured("token".into()))?;
-    let client = Arc::new(Client::connect(&session_url, &token).await?);
 
-    backend.write().client = Some(client.clone());
+    connect(backend, &token).await.map(Some)
+}
 
-    Ok(Some(client))
+/// Connects with the current session URL and caches the client.
+///
+/// # Errors
+///
+/// Besides connection errors, fails when the settings or token were saved
+/// while connecting: the client would belong to the old endpoint.
+async fn connect(mut backend: Signal<Backend>, token: &str) -> Result<Arc<Client>> {
+    let (session_url, rev) = {
+        let b = backend.read();
+
+        (b.cfg.account.session_url.clone(), b.conn_rev)
+    };
+    let client = Arc::new(Client::connect(&session_url, token).await?);
+    let mut b = backend.write();
+
+    if b.conn_rev != rev {
+        return Err(Error::Other(
+            "settings changed while connecting; try again".into(),
+        ));
+    }
+
+    b.client = Some(client.clone());
+
+    Ok(client)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use dioxus::core::RuntimeGuard;
+
     use super::*;
+
+    /// Serves one JMAP session response, after `release` is set.
+    fn session_server(requested: Arc<AtomicBool>, release: Arc<AtomicBool>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/session", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+
+            let _ = socket.read(&mut buf).unwrap();
+            requested.store(true, Ordering::SeqCst);
+
+            while !release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            let body = r#"{"apiUrl":"http://old.invalid/api","downloadUrl":"http://old.invalid/d","uploadUrl":"http://old.invalid/u","primaryAccounts":{"urn:ietf:params:jmap:mail":"a"}}"#;
+
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        url
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_connection_is_not_cached_after_settings_save() {
+        let (requested, release) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut cfg = Config::default();
+
+        cfg.account.session_url = session_server(requested.clone(), release.clone());
+
+        let dom = VirtualDom::new(VNode::empty);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let backend = Signal::new_in_scope(
+            Backend {
+                store: Arc::new(Store::open_memory().unwrap()),
+                client: None,
+                cfg,
+                ui_test: false,
+                conn_rev: 0,
+            },
+            ScopeId::ROOT,
+        );
+
+        // What Settings Save does while the connection is pending.
+        let mut saver = backend;
+        let save = async move {
+            while !requested.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            saver.write().cfg.account.session_url = "http://new.invalid/session".into();
+            saver.write().reset_client();
+            release.store(true, Ordering::SeqCst);
+        };
+        let (connected, ()) = tokio::join!(connect(backend, "fake-token"), save);
+
+        assert!(connected.is_err(), "stale client was returned");
+        assert!(backend.peek().client.is_none(), "stale client was cached");
+    }
 
     #[test]
     fn blocked_by_address_and_domain() {

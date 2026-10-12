@@ -1,6 +1,10 @@
 //! Pure display helpers: avatars, dates, sizes, address labels.
 
-use chrono::{DateTime, FixedOffset, Local, Utc};
+use std::fmt::Display;
+
+#[cfg(test)]
+use chrono::FixedOffset;
+use chrono::{DateTime, Local, TimeZone, Utc};
 use posto_core::store::Address;
 
 /// Avatar letters: first letters of the first two words, or the first
@@ -52,17 +56,28 @@ pub fn short_date(rfc3339: &str, now: DateTime<Utc>) -> String {
 }
 
 /// Reader date like `29 Aug 2026 at 17.00` in the local time zone.
+///
+/// The offset is the one in force at the email's own time, so winter and
+/// summer mail both match the list dates.
 pub fn long_date(rfc3339: &str) -> String {
-    let offset = *Local::now().offset();
-
-    long_date_in(rfc3339, offset)
+    long_date_with(rfc3339, &Local)
 }
 
 /// [`long_date`] in a fixed offset, for testing.
+#[cfg(test)]
 pub fn long_date_in(rfc3339: &str, offset: FixedOffset) -> String {
+    long_date_with(rfc3339, &offset)
+}
+
+/// [`long_date`] in the time zone `tz`.
+fn long_date_with<Tz>(rfc3339: &str, tz: &Tz) -> String
+where
+    Tz: TimeZone,
+    Tz::Offset: Display,
+{
     match DateTime::parse_from_rfc3339(rfc3339) {
         Ok(parsed) => parsed
-            .with_timezone(&offset)
+            .with_timezone(tz)
             .format("%-d %b %Y at %-H.%M")
             .to_string(),
         Err(_) => rfc3339.to_string(),
@@ -151,6 +166,71 @@ mod tests {
         assert_eq!(
             long_date_in("2026-08-29T15:00:00Z", plus_two),
             "29 Aug 2026 at 17.00"
+        );
+    }
+
+    /// A zone with daylight saving: UTC+1 from April to October, else UTC.
+    #[derive(Clone, Copy)]
+    struct SummerTime;
+
+    #[derive(Clone, Copy, Debug)]
+    struct SummerOffset(FixedOffset);
+
+    impl std::fmt::Display for SummerOffset {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    impl chrono::Offset for SummerOffset {
+        fn fix(&self) -> FixedOffset {
+            self.0
+        }
+    }
+
+    impl TimeZone for SummerTime {
+        type Offset = SummerOffset;
+
+        fn from_offset(_: &SummerOffset) -> Self {
+            SummerTime
+        }
+
+        fn offset_from_local_date(
+            &self,
+            _: &chrono::NaiveDate,
+        ) -> chrono::LocalResult<SummerOffset> {
+            unreachable!("only UTC to local conversion is used")
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            _: &chrono::NaiveDateTime,
+        ) -> chrono::LocalResult<SummerOffset> {
+            unreachable!("only UTC to local conversion is used")
+        }
+
+        fn offset_from_utc_date(&self, d: &chrono::NaiveDate) -> SummerOffset {
+            self.offset_from_utc_datetime(&d.and_hms_opt(12, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, dt: &chrono::NaiveDateTime) -> SummerOffset {
+            use chrono::Datelike;
+
+            let hours = if (4..=10).contains(&dt.month()) { 1 } else { 0 };
+
+            SummerOffset(FixedOffset::east_opt(hours * 3600).unwrap())
+        }
+    }
+
+    #[test]
+    fn long_date_uses_offset_in_force_at_that_time() {
+        assert_eq!(
+            long_date_with("2026-01-15T15:00:00Z", &SummerTime),
+            "15 Jan 2026 at 15.00"
+        );
+        assert_eq!(
+            long_date_with("2026-07-15T15:00:00Z", &SummerTime),
+            "15 Jul 2026 at 16.00"
         );
     }
 
