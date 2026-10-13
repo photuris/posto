@@ -138,7 +138,7 @@ input.invalid { border-color: #d33; }
 .row.unread .sender, .row.unread .subject { font-weight: 700; }
 .row-actions { display: none; gap: 2px; margin-left: 4px; }
 .row:hover .row-actions { display: inline-flex; }
-.row:hover .row-actions ~ .date, .row:hover .date { display: none; }
+.row:hover .date { display: none; } /* the hover actions take the date's slot */
 .row-action {
   display: inline-flex; align-items: center; justify-content: center;
   width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px;
