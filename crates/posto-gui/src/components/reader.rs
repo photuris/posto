@@ -57,6 +57,12 @@ pub fn Reader() -> Element {
                         }
                         button {
                             onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Label),
+                            Icon { name: "tag" }
+                            " Labels…"
+                        }
+                        button {
+                            onmousedown: |evt| evt.prevent_default(),
                             onclick: |_| dispatch(Action::Classify),
                             "Classify as…"
                         }
@@ -188,6 +194,14 @@ pub fn Reader() -> Element {
                             title: "Reader Mode",
                             Icon { name: "book-open" }
                             " Reader Mode"
+                        }
+                        button {
+                            class: "link",
+                            onmousedown: |evt| evt.prevent_default(),
+                            onclick: |_| dispatch(Action::Label),
+                            title: "Add or remove labels",
+                            Icon { name: "tag" }
+                            " Labels…"
                         }
                         button {
                             class: "link",

@@ -33,6 +33,8 @@ pub enum Action {
     SelectAll,
     /// Files the selection under a classifier tray chosen by the user.
     Classify,
+    /// Opens the label picker for the selection.
+    Label,
     /// Deletes the selection without asking; what the Delete confirmation runs.
     DeleteConfirmed,
 }
@@ -103,6 +105,7 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::ExtendPrev, "shift+k"),
     (Action::SelectAll, "ctrl+a"),
     (Action::Classify, "t"),
+    (Action::Label, "l"),
     (Action::DeleteConfirmed, "ctrl+shift+delete"),
 ];
 
@@ -236,6 +239,7 @@ mod tests {
             Action::ExtendPrev,
             Action::SelectAll,
             Action::Classify,
+            Action::Label,
             Action::DeleteConfirmed,
         ];
         for action in all {
@@ -261,6 +265,7 @@ mod tests {
                 | Action::ExtendPrev
                 | Action::SelectAll
                 | Action::Classify
+                | Action::Label
                 | Action::DeleteConfirmed => {}
             }
             assert!(map.chord_for(action).is_some(), "{action:?} unbound");
@@ -275,6 +280,15 @@ mod tests {
         assert_eq!(map.lookup(&chord("delete")), Some(Action::Delete));
         assert_eq!(map.lookup(&chord("backspace")), Some(Action::Back));
         assert_eq!(map.lookup(&chord("t")), Some(Action::Classify));
+        assert_eq!(map.lookup(&chord("l")), Some(Action::Label));
+        assert_eq!(
+            serde_json::to_value(Action::Label).unwrap(),
+            serde_json::json!("label")
+        );
+        assert_eq!(
+            serde_json::from_value::<Action>(serde_json::json!("label")).unwrap(),
+            Action::Label
+        );
     }
 
     #[test]

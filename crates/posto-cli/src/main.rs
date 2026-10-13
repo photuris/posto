@@ -98,6 +98,10 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
                 c::email_act(account, a.ids, |_, _| Ok(Action::Unflag), "unflag").await
             }
             EmailCmd::Move { mailbox, ids } => c::email_move(account, &mailbox, ids).await,
+            EmailCmd::Label { mailbox, ids } => c::email_label(account, &mailbox, ids, true).await,
+            EmailCmd::Unlabel { mailbox, ids } => {
+                c::email_label(account, &mailbox, ids, false).await
+            }
             EmailCmd::Reply {
                 id,
                 body_file,

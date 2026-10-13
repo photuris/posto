@@ -21,10 +21,13 @@ pub use sidebar::Sidebar;
 pub use toolbar::Toolbar;
 
 use crate::app::{
-    MAILBOXES, SHOW_CLASSIFY_PICKER, SHOW_MOVE_PICKER, TYPING, backend, classify_selected,
-    focus_root, move_selected, selected_refs, tray_label,
+    EMAILS, LabelState, MAILBOXES, SELECTION, SHOW_CLASSIFY_PICKER, SHOW_LABEL_PICKER,
+    SHOW_MOVE_PICKER, TYPING, backend, classify_selected, focus_root, label_removable, label_state,
+    move_selected, selected_emails, selected_refs, toggle_label, tray_label,
 };
+use crate::format;
 use posto_core::classify::Tray;
+use posto_core::store::mailbox_path;
 
 /// `onfocusin` for inputs: shortcuts are suspended while typing.
 pub fn focus_in(_: FocusEvent) {
@@ -87,6 +90,118 @@ pub fn MovePicker() -> Element {
             items,
             on_pick: move |id: String| move_selected(id),
             on_close: |_| *SHOW_MOVE_PICKER.write() = false,
+        }
+    }
+}
+
+/// A checkbox per label (a mailbox without a role, or the inbox) of the
+/// selected messages' account; a click or Enter toggles it on every selected
+/// message and the picker stays open. Reads the emails, selection and
+/// mailboxes during render, so a settled action refreshes the checkboxes.
+#[component]
+pub fn LabelPicker() -> Element {
+    let mut query = use_signal(String::new);
+    let mut index = use_signal(|| 0usize);
+    let (emails, selection, mailboxes) = (EMAILS(), SELECTION(), MAILBOXES());
+    let selected = selected_emails(&emails, &selection);
+    let account = selected.first().map(|e| e.account_id.clone());
+    let needle = query().to_lowercase();
+    let rows: Vec<(String, String, u16, LabelState, bool)> = mailboxes
+        .iter()
+        .filter(|m| Some(&m.account_id) == account.as_ref())
+        .filter(|m| m.role.as_deref().is_none_or(|r| r == "inbox"))
+        .filter_map(|m| {
+            let path = mailbox_path(&mailboxes, &m.account_id, &m.id)?;
+
+            path.to_lowercase().contains(&needle).then(|| {
+                let state = label_state(&selected, &m.id);
+                let blocked = state == LabelState::All && !label_removable(&selected, &m.id);
+
+                (
+                    m.id.clone(),
+                    path,
+                    format::avatar_hue(&m.name),
+                    state,
+                    blocked,
+                )
+            })
+        })
+        .collect();
+    let last = rows.len().saturating_sub(1);
+    let active = index().min(last);
+    let enter_target = rows
+        .get(active)
+        .filter(|row| !row.4)
+        .map(|row| row.0.clone());
+
+    rsx! {
+        div {
+            class: "overlay",
+            onclick: move |_| {
+                *SHOW_LABEL_PICKER.write() = false;
+                focus_root();
+            },
+            div { class: "picker", onclick: |evt| evt.stop_propagation(),
+                div { class: "picker-title", "Labels" }
+                input {
+                    r#type: "text",
+                    placeholder: "Filter labels",
+                    value: "{query}",
+                    onmounted: |evt| async move {
+                        let _ = evt.set_focus(true).await;
+                    },
+                    onfocusin: focus_in,
+                    onfocusout: focus_out,
+                    oninput: move |evt| {
+                        query.set(evt.value());
+                        index.set(0);
+                    },
+                    onkeydown: move |evt| match evt.key() {
+                        Key::ArrowDown => {
+                            evt.prevent_default();
+                            index.set((active + 1).min(last));
+                        }
+                        Key::ArrowUp => {
+                            evt.prevent_default();
+                            index.set(active.saturating_sub(1));
+                        }
+                        Key::Enter => {
+                            evt.prevent_default();
+
+                            if let Some(id) = enter_target.clone() {
+                                toggle_label(id);
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+                for (i, (id, path, hue, state, blocked)) in rows.into_iter().enumerate() {
+                    div {
+                        key: "{id}",
+                        class: match (i == active, blocked) {
+                            (true, true) => "picker-row label-row active disabled",
+                            (true, false) => "picker-row label-row active",
+                            (false, true) => "picker-row label-row disabled",
+                            (false, false) => "picker-row label-row",
+                        },
+                        title: if blocked { "A message must keep at least one label" } else { "" },
+                        onclick: move |_| {
+                            if !blocked {
+                                toggle_label(id.clone());
+                            }
+                        },
+                        Icon {
+                            name: match state {
+                                LabelState::All => "check-square",
+                                LabelState::Some => "minus-square",
+                                LabelState::None => "square",
+                            },
+                        }
+                        span { class: "label-dot", style: "--hue: {hue}" }
+                        "{path}"
+                    }
+                }
+            }
         }
     }
 }

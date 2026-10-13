@@ -251,6 +251,26 @@ pub enum EmailCmd {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    /// Add a label (any mailbox) to emails, keeping their other mailboxes.
+    ///
+    /// Output: {"applied": number, "action": "label", "offline": bool}
+    Label {
+        /// Mailbox name or id.
+        mailbox: String,
+        /// Email ids.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Remove a label from emails; an email never loses its last mailbox (it is not counted as applied).
+    ///
+    /// Output: {"applied": number, "action": "unlabel", "offline": bool}
+    Unlabel {
+        /// Mailbox name or id.
+        mailbox: String,
+        /// Email ids.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
     /// Reply to an email and send it; the original is quoted after the body file.
     ///
     /// Output: {"id": string}

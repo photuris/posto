@@ -293,6 +293,9 @@ input.number { width: 80px; }
 .confirm-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .picker-row { padding: 6px 10px; border-radius: 6px; cursor: pointer; }
 .picker-row:hover, .picker-row.active { background: var(--sel); }
+.picker-row.disabled { opacity: 0.5; cursor: not-allowed; }
+.label-row { display: flex; align-items: center; gap: 8px; }
+.label-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: hsl(var(--hue) 60% 55%); }
 
 .toast {
   position: fixed; right: 16px; bottom: 16px; z-index: 20;

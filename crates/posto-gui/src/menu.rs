@@ -192,6 +192,7 @@ pub fn build(keymap: &Keymap) -> (Menu, HashMap<MenuId, MenuAction>) {
     b.shortcut(&file, "Mark Read/Unread", Action::ToggleRead);
     b.shortcut(&file, "Flag/Unflag", Action::ToggleFlag);
     b.shortcut(&file, "Move…", Action::Move);
+    b.shortcut(&file, "Labels…", Action::Label);
     b.shortcut(&file, "Classify as…", Action::Classify);
     separator(&file);
     b.shortcut(&file, "Sync Now", Action::Sync);

@@ -413,6 +413,38 @@ fn move_by_name_and_delete() {
 }
 
 #[test]
+fn label_and_unlabel_mirror_offline() {
+    let sb = Sandbox::seeded();
+    let mailbox_ids =
+        |sb: &Sandbox| sb.json(&["email", "show", "fx-02"])["summary"]["mailbox_ids"].clone();
+
+    let v = sb.json(&["email", "label", "mb-newsletters", "fx-02"]);
+
+    assert_eq!(v["applied"], 1);
+    assert_eq!(v["action"], "label");
+    assert_eq!(v["offline"], true);
+
+    let ids = mailbox_ids(&sb);
+
+    assert!(
+        ids.as_array().unwrap().contains(&json!("mb-inbox")),
+        "{ids}"
+    );
+    assert!(
+        ids.as_array().unwrap().contains(&json!("mb-newsletters")),
+        "{ids}"
+    );
+
+    sb.json(&["email", "unlabel", "mb-newsletters", "fx-02"]);
+    assert_eq!(mailbox_ids(&sb), json!(["mb-inbox"]));
+
+    let v = sb.json(&["email", "unlabel", "mb-inbox", "fx-02"]);
+
+    assert_eq!(v["applied"], 0);
+    assert_eq!(mailbox_ids(&sb), json!(["mb-inbox"]));
+}
+
+#[test]
 fn unknown_mailbox_exits_6() {
     let out = Sandbox::seeded().run_with(&["email", "move", "Nope", "fx-01"], None);
     let err: Value = serde_json::from_slice(&out.stderr).unwrap();

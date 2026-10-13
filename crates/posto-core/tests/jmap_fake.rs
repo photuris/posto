@@ -749,6 +749,132 @@ async fn archive_action_patches_and_mirrors() -> Result<()> {
     Ok(())
 }
 
+/// Matches an `Email/set` whose `update` has exactly the keys `keys`.
+struct UpdatesExactly(&'static [&'static str]);
+
+impl Match for UpdatesExactly {
+    fn matches(&self, request: &Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+            return false;
+        };
+        let call = &body["methodCalls"][0];
+        let Some(update) = call[1]["update"].as_object() else {
+            return false;
+        };
+        let mut keys: Vec<&str> = update.keys().map(String::as_str).collect();
+
+        keys.sort_unstable();
+
+        call[0] == "Email/set" && keys == self.0
+    }
+}
+
+/// An email of account `a` in all of `mailboxes`.
+fn email_in(id: &str, mailboxes: &[&str]) -> EmailSummary {
+    EmailSummary {
+        mailbox_ids: ids(mailboxes),
+        ..email(id, "")
+    }
+}
+
+#[tokio::test]
+async fn patch_never_empties_mailboxes() -> Result<()> {
+    let remove_inbox = || Action::PatchMailboxes {
+        add: vec![],
+        remove: ids(&["mb-inbox"]),
+    };
+    let seed = || -> Result<Store> {
+        let store = Store::open_memory()?;
+
+        store.upsert_emails(&[
+            email_in("e1", &["mb-inbox"]),
+            email_in("e2", &["mb-inbox", "mb-promos"]),
+        ])?;
+
+        Ok(store)
+    };
+
+    // Offline.
+    let store = seed()?;
+    let n = apply(&store, None, "a", &ids(&["e1", "e2"]), remove_inbox()).await?;
+
+    assert_eq!(n, 1);
+    assert_eq!(store.email("a", "e1")?.unwrap().mailbox_ids, ["mb-inbox"]);
+    assert_eq!(store.email("a", "e2")?.unwrap().mailbox_ids, ["mb-promos"]);
+
+    // Online: e1 never reaches the server.
+    let server = server().await;
+    let c = client(&server).await;
+    let store = seed()?;
+
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(UpdatesExactly(&["e2"]))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "methodResponses": [["Email/set", { "updated": { "e2": null } }, "0"]],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let n = apply(&store, Some(&c), "a", &ids(&["e1", "e2"]), remove_inbox()).await?;
+
+    assert_eq!(n, 1);
+    assert_eq!(store.email("a", "e1")?.unwrap().mailbox_ids, ["mb-inbox"]);
+    assert_eq!(store.email("a", "e2")?.unwrap().mailbox_ids, ["mb-promos"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn patch_rechecks_after_the_server_answers() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    store.upsert_emails(&[email_in("e1", &["mb-inbox", "mb-promos"])])?;
+
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(Call {
+            name: "Email/set",
+            args: json!({}),
+        })
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "methodResponses": [["Email/set", { "updated": { "e1": null } }, "0"]],
+                }))
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let remove_inbox = Action::PatchMailboxes {
+        add: vec![],
+        remove: ids(&["mb-inbox"]),
+    };
+    let (n, ()) = tokio::join!(
+        async {
+            apply(&store, Some(&c), "a", &ids(&["e1"]), remove_inbox)
+                .await
+                .unwrap()
+        },
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            store
+                .set_mailbox_ids("a", "e1", &ids(&["mb-inbox"]))
+                .unwrap();
+        },
+    );
+
+    assert_eq!(n, 0);
+    assert_eq!(store.email("a", "e1")?.unwrap().mailbox_ids, ["mb-inbox"]);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn mark_read_offline_mirrors_only() -> Result<()> {
     let store = Store::open_memory()?;

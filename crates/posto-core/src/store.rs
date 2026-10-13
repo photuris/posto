@@ -351,6 +351,31 @@ fn mailbox_from_row(row: &Row) -> rusqlite::Result<Mailbox> {
 }
 
 /// Drops everything between `<` and `>`.
+/// The display path of mailbox `(account, id)` within `all`: its name behind
+/// each ancestor's, root first, joined by `" / "`. Parents are looked up among
+/// the mailboxes of `account` only. `None` when the mailbox is not in `all`; a
+/// dangling `parent_id` or a cycle ends the chain.
+pub fn mailbox_path(all: &[Mailbox], account: &str, id: &str) -> Option<String> {
+    let find = |id: &str| all.iter().find(|m| m.account_id == account && m.id == id);
+    let mut current = find(id)?;
+    let mut names = vec![current.name.as_str()];
+    let mut seen = vec![current.id.as_str()];
+
+    while let Some(parent) = current.parent_id.as_deref().and_then(find) {
+        if seen.contains(&parent.id.as_str()) {
+            break;
+        }
+
+        seen.push(parent.id.as_str());
+        names.push(parent.name.as_str());
+        current = parent;
+    }
+
+    names.reverse();
+
+    Some(names.join(" / "))
+}
+
 fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -1929,6 +1954,33 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn mailbox_path_joins_ancestors() {
+        let nested = |account: &str, id: &str, name: &str, parent: Option<&str>| Mailbox {
+            account_id: account.into(),
+            parent_id: parent.map(String::from),
+            ..mailbox(id, name, None)
+        };
+        let all = [
+            nested("a", "a", "A", None),
+            nested("a", "b", "B", Some("a")),
+            nested("a", "c", "C", Some("b")),
+            nested("a", "d", "D", Some("gone")),
+            nested("a", "e", "E", Some("f")),
+            nested("a", "f", "F", Some("e")),
+            nested("z", "b", "ZB", None),
+            nested("z", "c", "ZC", Some("b")),
+        ];
+
+        assert_eq!(mailbox_path(&all, "a", "c").as_deref(), Some("A / B / C"));
+        assert_eq!(mailbox_path(&all, "a", "a").as_deref(), Some("A"));
+        assert_eq!(mailbox_path(&all, "a", "nope"), None);
+        assert_eq!(mailbox_path(&all, "a", "d").as_deref(), Some("D"));
+        assert!(mailbox_path(&all, "a", "e").is_some());
+        assert_eq!(mailbox_path(&all, "z", "c").as_deref(), Some("ZB / ZC"));
+        assert_eq!(mailbox_path(&all, "a", "c").as_deref(), Some("A / B / C"));
     }
 
     #[test]

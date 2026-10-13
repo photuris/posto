@@ -482,6 +482,37 @@ pub async fn email_move(account: Option<&str>, mailbox: &str, ids: Vec<String>) 
     .await
 }
 
+/// Adds (`add`) or removes the mailbox `mailbox` on `ids`; the core refuses to
+/// empty an email's mailbox set.
+pub async fn email_label(
+    account: Option<&str>,
+    mailbox: &str,
+    ids: Vec<String>,
+    add: bool,
+) -> Result<Value> {
+    email_act(
+        account,
+        ids,
+        |store, id| {
+            let target = vec![resolve_mailbox(store, id, mailbox)?.id];
+
+            Ok(if add {
+                Action::PatchMailboxes {
+                    add: target,
+                    remove: vec![],
+                }
+            } else {
+                Action::PatchMailboxes {
+                    add: vec![],
+                    remove: target,
+                }
+            })
+        },
+        if add { "label" } else { "unlabel" },
+    )
+    .await
+}
+
 /// Parses a `--from` value; an invalid address is an error, never ignored.
 fn parse_from(from: Option<String>) -> Result<Option<posto_core::store::Address>> {
     let Some(from) = from else {
@@ -593,7 +624,7 @@ pub fn shortcuts_list() -> Result<Value> {
 
     for action in [
         Next, Prev, Open, Back, Archive, Delete, Reply, ReplyAll, Compose, ToggleRead, ToggleFlag,
-        Move, Search, Sync, Junk, Send, Escape, Classify,
+        Move, Search, Sync, Junk, Send, Escape, Classify, Label,
     ] {
         let chords = keymap.chords_for(action);
 

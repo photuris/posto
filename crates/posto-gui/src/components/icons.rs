@@ -28,6 +28,10 @@ pub const NAMES: &[&str] = &[
     "book-open",
     "sun",
     "chevron-down",
+    "square",
+    "check-square",
+    "minus-square",
+    "tag",
 ];
 
 /// The SVG elements drawn for `name`; empty for an unknown name.
@@ -92,6 +96,14 @@ fn shapes(name: &str) -> &'static str {
             r#"<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>"#
         }
         "chevron-down" => r#"<path d="m6 9 6 6 6-6"/>"#,
+        "square" => r#"<rect x="3" y="3" width="18" height="18" rx="2"/>"#,
+        "check-square" => {
+            r#"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="m9 12 2 2 4-4"/>"#
+        }
+        "minus-square" => r#"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8"/>"#,
+        "tag" => {
+            r#"<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"/><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"/>"#
+        }
         _ => "",
     }
 }

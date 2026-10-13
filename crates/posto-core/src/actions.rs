@@ -103,6 +103,21 @@ async fn destroy(
     Ok(gone.len())
 }
 
+/// `current` after leaving `remove` and joining `add`.
+fn patched(current: &[String], add: &[String], remove: &[String]) -> Vec<String> {
+    let mut mailboxes = current.to_vec();
+
+    mailboxes.retain(|m| !remove.contains(m));
+
+    for m in add {
+        if !mailboxes.contains(m) {
+            mailboxes.push(m.clone());
+        }
+    }
+
+    mailboxes
+}
+
 fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
     store
         .mailbox_by_role(account, role)?
@@ -115,6 +130,13 @@ fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
 ///
 /// Ids the server refuses (`notUpdated`) are neither mirrored nor counted.
 /// Without a client, only emails the store knows are counted.
+///
+/// A [`Action::PatchMailboxes`] never leaves an email without a mailbox: ids
+/// whose local copy would end up empty are dropped before anything is sent and
+/// not counted (ids unknown locally are sent; the server enforces its own
+/// rule), and the mirror recomputes from the local copy as it is after the
+/// server answered, skipping and not counting an id whose result would be empty
+/// (another writer changed the row meanwhile; the next sync reconciles).
 ///
 /// # Errors
 ///
@@ -141,6 +163,24 @@ pub async fn apply(
         Action::MarkAnswered => Change::Keyword("$answered", true),
     };
     let mut refused: Vec<String> = Vec::new();
+    let ids: Vec<String> = match &change {
+        Change::Patch { add, remove } => {
+            let mut keep = Vec::with_capacity(ids.len());
+
+            for id in ids {
+                let empties = store
+                    .email(account, id)?
+                    .is_some_and(|e| patched(&e.mailbox_ids, add, remove).is_empty());
+
+                if !empties {
+                    keep.push(id.clone());
+                }
+            }
+
+            keep
+        }
+        _ => ids.to_vec(),
+    };
 
     if let Some(client) = client.filter(|_| !ids.is_empty()) {
         let patch = match &change {
@@ -189,14 +229,10 @@ pub async fn apply(
                 store.set_mailbox_ids(account, id, std::slice::from_ref(target))?
             }
             Change::Patch { add, remove } => {
-                let mut mailboxes = email.mailbox_ids.clone();
+                let mailboxes = patched(&email.mailbox_ids, add, remove);
 
-                mailboxes.retain(|m| !remove.contains(m));
-
-                for m in add {
-                    if !mailboxes.contains(m) {
-                        mailboxes.push(m.clone());
-                    }
+                if mailboxes.is_empty() {
+                    continue;
                 }
 
                 store.set_mailbox_ids(account, id, &mailboxes)?

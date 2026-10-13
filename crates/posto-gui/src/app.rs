@@ -17,8 +17,8 @@ use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::components::{
-    ClassifyPicker, Composer, ConfirmDialog, MessageList, MovePicker, Reader, Settings, Sidebar,
-    Toolbar,
+    ClassifyPicker, Composer, ConfirmDialog, LabelPicker, MessageList, MovePicker, Reader,
+    Settings, Sidebar, Toolbar,
 };
 use crate::selection::{Click, Selection};
 use crate::state::{self, Backend, Folder, group_by_account, row_key};
@@ -99,6 +99,8 @@ pub static COMPOSER_TO: GlobalSignal<String> = Signal::global(String::new);
 pub static COMPOSER_CC: GlobalSignal<String> = Signal::global(String::new);
 pub static SHOW_SETTINGS: GlobalSignal<bool> = Signal::global(|| false);
 pub static SHOW_MOVE_PICKER: GlobalSignal<bool> = Signal::global(|| false);
+/// True while the label picker is open.
+pub static SHOW_LABEL_PICKER: GlobalSignal<bool> = Signal::global(|| false);
 pub static SHOW_CLASSIFY_PICKER: GlobalSignal<bool> = Signal::global(|| false);
 /// The tray in force and whether it is unsure, for each listed message (by row key).
 pub static CLASSIFIED: GlobalSignal<HashMap<String, (String, bool)>> = Signal::global(HashMap::new);
@@ -448,6 +450,9 @@ pub fn App() -> Element {
             if SHOW_MOVE_PICKER() {
                 MovePicker {}
             }
+            if SHOW_LABEL_PICKER() {
+                LabelPicker {}
+            }
             if SHOW_CLASSIFY_PICKER() {
                 ClassifyPicker {}
             }
@@ -466,6 +471,7 @@ pub fn dispatch(action: Action) {
     let modal = COMPOSER.peek().is_some()
         || *SHOW_SETTINGS.peek()
         || *SHOW_MOVE_PICKER.peek()
+        || *SHOW_LABEL_PICKER.peek()
         || *SHOW_CLASSIFY_PICKER.peek()
         || CONFIRM.peek().is_some();
 
@@ -513,6 +519,17 @@ pub fn dispatch(action: Action) {
                 set_status("Select messages from one account to move them.");
             } else {
                 *SHOW_MOVE_PICKER.write() = true;
+            }
+        }
+        Action::Label => {
+            let refs = selected_refs();
+
+            if refs.is_empty() {
+                // Nothing to label.
+            } else if group_by_account(&refs).len() > 1 {
+                set_status("Select messages from one account to label them.");
+            } else {
+                *SHOW_LABEL_PICKER.write() = true;
             }
         }
         Action::Classify => {
@@ -587,6 +604,8 @@ fn close_top() {
         *SHOW_SETTINGS.write() = false;
     } else if *SHOW_MOVE_PICKER.peek() {
         *SHOW_MOVE_PICKER.write() = false;
+    } else if *SHOW_LABEL_PICKER.peek() {
+        *SHOW_LABEL_PICKER.write() = false;
     } else if *SHOW_CLASSIFY_PICKER.peek() {
         *SHOW_CLASSIFY_PICKER.write() = false;
     } else if CONFIRM.peek().is_some() {
@@ -1118,12 +1137,14 @@ async fn act_on_selected(action: actions::Action) {
 /// Applies `action` to `refs`, reloads the list, and drops the ones that left it from the
 /// selection. If that empties the selection, the row at the old focus's position takes over.
 async fn act_on_emails(refs: &[MsgRef], action: actions::Action) -> Result<()> {
-    settle_selection(async { apply_local(refs, action).await.map(|_| ()) }).await
+    settle_selection(apply_local(refs, action))
+        .await
+        .map(|_| ())
 }
 
 /// Runs `change`, then reloads the list and fixes the selection as described
-/// at [`act_on_emails`].
-async fn settle_selection(change: impl Future<Output = Result<()>>) -> Result<()> {
+/// at [`act_on_emails`]; hands back what `change` returned.
+async fn settle_selection<T>(change: impl Future<Output = Result<T>>) -> Result<T> {
     let old_index = SELECTION
         .peek()
         .focus
@@ -1131,7 +1152,8 @@ async fn settle_selection(change: impl Future<Output = Result<()>>) -> Result<()
         .and_then(|f| EMAILS.peek().iter().position(|e| row_key(e) == *f));
     let had_selection = !SELECTION.peek().is_empty();
 
-    change.await?;
+    let done = change.await?;
+
     reload_unsure_counts();
     reload_list().await;
 
@@ -1150,7 +1172,124 @@ async fn settle_selection(change: impl Future<Output = Result<()>>) -> Result<()
         }
     }
 
-    Ok(())
+    Ok(done)
+}
+
+/// How many of the selected emails are in a mailbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelState {
+    /// Every selected email.
+    All,
+    /// Some, not all.
+    Some,
+    /// None (also when nothing is selected).
+    None,
+}
+
+/// The listed emails whose row is selected, in list order.
+pub fn selected_emails<'a>(
+    emails: &'a [EmailSummary],
+    selection: &Selection,
+) -> Vec<&'a EmailSummary> {
+    emails
+        .iter()
+        .filter(|e| selection.is_selected(&row_key(e)))
+        .collect()
+}
+
+/// Whether `selected` are in `mailbox_id`: all, some or none of them.
+pub fn label_state(selected: &[&EmailSummary], mailbox_id: &str) -> LabelState {
+    let has = selected
+        .iter()
+        .filter(|e| e.mailbox_ids.iter().any(|m| m == mailbox_id))
+        .count();
+
+    if has == 0 {
+        LabelState::None
+    } else if has == selected.len() {
+        LabelState::All
+    } else {
+        LabelState::Some
+    }
+}
+
+/// False when removing `mailbox_id` would leave one of `selected` in no mailbox.
+pub fn label_removable(selected: &[&EmailSummary], mailbox_id: &str) -> bool {
+    !selected
+        .iter()
+        .any(|e| e.mailbox_ids.iter().all(|m| m == mailbox_id) && !e.mailbox_ids.is_empty())
+}
+
+/// The toast after labelling (`add`) or unlabelling `applied` of `selected` messages.
+pub fn label_toast(applied: usize, selected: usize, add: bool) -> String {
+    let what = if add {
+        "Labelled"
+    } else {
+        "Removed label from"
+    };
+    let s = if selected == 1 { "" } else { "s" };
+
+    if applied == selected {
+        format!("{what} {applied} message{s}")
+    } else {
+        format!("{what} {applied} of {selected} message{s}")
+    }
+}
+
+/// Toggles `mailbox_id` on every selected message and keeps the picker open
+/// (see [`label_selected`]).
+pub fn toggle_label(mailbox_id: String) {
+    run(label_selected(mailbox_id));
+}
+
+/// Adds `mailbox_id` to the selected messages unless all have it, in which case
+/// it is removed from all; ignored while another action is pending. The
+/// picker closes only when the selection ends up empty or in another account.
+pub async fn label_selected(mailbox_id: String) {
+    let Some(_busy) = Flag::take(&BUSY) else {
+        return;
+    };
+    let refs = selected_refs();
+    let Some(account) = refs.first().map(|r| r.account_id.clone()) else {
+        return;
+    };
+    let (add, removable) = {
+        let (emails, selection) = (EMAILS.peek(), SELECTION.peek());
+        let picked = selected_emails(&emails, &selection);
+
+        (
+            label_state(&picked, &mailbox_id) != LabelState::All,
+            label_removable(&picked, &mailbox_id),
+        )
+    };
+
+    if !add && !removable {
+        return set_status("A message must keep at least one label.");
+    }
+
+    let patch = if add {
+        (vec![mailbox_id.clone()], vec![])
+    } else {
+        (vec![], vec![mailbox_id.clone()])
+    };
+    let action = actions::Action::PatchMailboxes {
+        add: patch.0,
+        remove: patch.1,
+    };
+
+    match settle_selection(apply_local(&refs, action)).await {
+        Ok(applied) => set_status(label_toast(applied, refs.len(), add)),
+        Err(e) => fail("Action failed", e),
+    }
+
+    let left = selected_refs()
+        .first()
+        .is_none_or(|r| r.account_id != account);
+
+    if left {
+        *SHOW_LABEL_PICKER.write() = false;
+        focus_root();
+    }
 }
 
 /// Moves the selected emails to `mailbox_id` and closes the picker.
@@ -2168,6 +2307,152 @@ mod tests {
             ),
             "Synced — Home: 2 new, 0 updated, 0 removed; w@x.io: failed: auth rejected"
         );
+    }
+
+    /// An email of account `default` in `mailboxes`.
+    fn labelled(id: &str, mailboxes: &[&str]) -> EmailSummary {
+        EmailSummary {
+            account_id: "default".into(),
+            id: id.into(),
+            thread_id: format!("t-{id}"),
+            received_at: "2026-10-12T10:00:00Z".into(),
+            from: vec![],
+            to: vec![],
+            cc: vec![],
+            subject: String::new(),
+            preview: String::new(),
+            size: 0,
+            has_attachment: false,
+            mailbox_ids: mailboxes.iter().map(|m| m.to_string()).collect(),
+            keywords: vec![],
+        }
+    }
+
+    /// Polls `fut` inside the root scope, as the scheduler does for a task, so
+    /// that `document::eval` and friends find a scope.
+    async fn in_root<T>(dom: &VirtualDom, fut: impl Future<Output = T>) -> T {
+        let runtime = dom.runtime();
+        let mut fut = std::pin::pin!(fut);
+
+        std::future::poll_fn(|cx| runtime.in_scope(ScopeId::ROOT, || fut.as_mut().poll(cx))).await
+    }
+
+    #[test]
+    fn label_state_and_removable() {
+        let (e1, e2, e3) = (
+            labelled("e1", &["inbox", "promos"]),
+            labelled("e2", &["promos"]),
+            labelled("e3", &["inbox"]),
+        );
+
+        assert_eq!(label_state(&[&e1, &e2], "promos"), LabelState::All);
+        assert_eq!(label_state(&[&e1, &e3], "promos"), LabelState::Some);
+        assert_eq!(label_state(&[&e3], "promos"), LabelState::None);
+        assert_eq!(label_state(&[], "promos"), LabelState::None);
+        assert!(!label_removable(&[&e1, &e2], "promos"));
+        assert!(!label_removable(&[&e1, &e3], "inbox"));
+        assert!(label_removable(&[&e1], "promos"));
+        assert_eq!(label_toast(2, 2, true), "Labelled 2 messages");
+        assert_eq!(
+            label_toast(1, 2, false),
+            "Removed label from 1 of 2 messages"
+        );
+        assert_eq!(label_toast(1, 1, true), "Labelled 1 message");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn label_selected_refreshes_rows_and_closes_when_selection_leaves() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let store = backend().peek().store.clone();
+        let mailbox = |id: &str, role: Option<&str>| Mailbox {
+            account_id: "default".into(),
+            id: id.into(),
+            name: id.into(),
+            role: role.map(String::from),
+            parent_id: None,
+            sort_order: 0,
+            total: 0,
+            unread: 0,
+        };
+
+        store
+            .upsert_mailboxes(&[mailbox("inbox", Some("inbox")), mailbox("promos", None)])
+            .unwrap();
+        store
+            .upsert_emails(&[labelled("e1", &["inbox"]), labelled("e2", &["inbox"])])
+            .unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Mailbox {
+            account_id: "default".into(),
+            id: "inbox".into(),
+        });
+        reload_list().await;
+
+        let order = list_order();
+
+        assert_eq!(order.len(), 2);
+
+        *SELECTION.write() = Selection {
+            anchor: order.first().cloned(),
+            focus: order.first().cloned(),
+            ids: order,
+        };
+        *SHOW_LABEL_PICKER.write() = true;
+
+        let state_of = |mailbox: &str| {
+            let (emails, selection) = (EMAILS.peek(), SELECTION.peek());
+
+            label_state(&selected_emails(&emails, &selection), mailbox)
+        };
+
+        in_root(&dom, label_selected("promos".into())).await;
+
+        for e in EMAILS.peek().iter() {
+            assert_eq!(e.mailbox_ids, ["inbox", "promos"], "{}", e.id);
+        }
+
+        assert_eq!(state_of("promos"), LabelState::All);
+        assert!(*SHOW_LABEL_PICKER.peek());
+
+        in_root(&dom, label_selected("inbox".into())).await;
+
+        assert!(EMAILS.peek().is_empty(), "{:?}", EMAILS.peek());
+        assert!(selected_refs().is_empty());
+        assert!(!*SHOW_LABEL_PICKER.peek());
+
+        // An action pending: the activation is ignored.
+        *SHOW_LABEL_PICKER.write() = true;
+        *SELECTED_MAILBOX.write() = Some(Folder::Mailbox {
+            account_id: "default".into(),
+            id: "promos".into(),
+        });
+        reload_list().await;
+
+        let order = list_order();
+
+        *SELECTION.write() = Selection {
+            anchor: order.first().cloned(),
+            focus: order.first().cloned(),
+            ids: order,
+        };
+
+        let busy = Flag::take(&BUSY).unwrap();
+
+        in_root(&dom, label_selected("inbox".into())).await;
+
+        drop(busy);
+
+        for e in EMAILS.peek().iter() {
+            assert_eq!(e.mailbox_ids, ["promos"], "{}", e.id);
+        }
+
+        assert_eq!(SELECTION.peek().ids.len(), 2);
+        assert!(*SHOW_LABEL_PICKER.peek());
     }
 }
 
