@@ -81,6 +81,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
             EmailCmd::Delete(a) => {
                 c::email_act(account, a.ids, |_, _| Ok(Action::Delete), "delete").await
             }
+            EmailCmd::Destroy { ids, yes } => c::email_destroy(account, ids.ids, yes).await,
             EmailCmd::Junk(a) => {
                 c::email_act(account, a.ids, |_, _| Ok(Action::Junk), "junk").await
             }

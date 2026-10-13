@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use clap::CommandFactory;
+use clap::error::ErrorKind;
 use posto_core::actions::{self, Action};
 use posto_core::body::{fetch_body, save_attachment};
 use posto_core::classify::{self, JEV_BASE_URL, JevClient, Tray};
@@ -450,6 +452,20 @@ pub async fn email_act(
     }
 
     Ok(json!({ "applied": applied, "action": name, "offline": offline }))
+}
+
+/// Permanently deletes `ids`; without `yes` it exits 2 as a usage error.
+pub async fn email_destroy(account: Option<&str>, ids: Vec<String>, yes: bool) -> Result<Value> {
+    if !yes {
+        crate::cli::Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "refusing to destroy without --yes",
+            )
+            .exit();
+    }
+
+    email_act(account, ids, |_, _| Ok(Action::Destroy), "destroy").await
 }
 
 pub async fn email_move(account: Option<&str>, mailbox: &str, ids: Vec<String>) -> Result<Value> {

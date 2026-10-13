@@ -1,11 +1,11 @@
 //! Integration tests against a wiremock fake JMAP server.
 
-use posto_core::actions::{Action, apply};
+use posto_core::actions::{Action, apply, in_trash};
 use posto_core::body::{fetch_body, save_attachment};
 use posto_core::compose::{Draft, send};
 use posto_core::config::{Account, Config};
 use posto_core::jmap::Client;
-use posto_core::store::{EmailSummary, Mailbox, Store};
+use posto_core::store::{EmailBody, EmailSummary, Mailbox, Store};
 use posto_core::sync::{sync_account, sync_all_with_lock};
 use posto_core::{Error, Result};
 use serde_json::{Value, json};
@@ -1199,6 +1199,67 @@ async fn online_action_counts_server_accepted_unknown_email() -> Result<()> {
     let count = apply(&store, Some(&c), "a", &ids(&["missing"]), Action::MarkRead).await?;
 
     assert_eq!(count, 1, "the server applied it, so it is counted");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn destroy_removes_locally_and_skips_not_destroyed() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    store.upsert_mailboxes(&[mailbox("mb-trash", "trash")])?;
+    store.upsert_emails(&[email("e1", "mb-trash"), email("e2", "mb-trash")])?;
+    store.put_body(
+        "a",
+        &EmailBody {
+            email_id: "e1".into(),
+            html: None,
+            text: Some("hi".into()),
+            attachments: vec![],
+            in_reply_to: vec![],
+            references: vec![],
+            message_id: vec![],
+        },
+    )?;
+
+    reply(
+        &server,
+        "Email/set",
+        json!({ "destroy": ["e1", "e2"] }),
+        json!({ "destroyed": ["e1"], "notDestroyed": { "e2": { "type": "notFound" } } }),
+        1,
+    )
+    .await;
+
+    let n = apply(&store, Some(&c), "a", &ids(&["e1", "e2"]), Action::Destroy).await?;
+
+    assert_eq!(n, 1);
+    assert!(store.email("a", "e1")?.is_none());
+    assert!(store.body("a", "e1")?.is_none());
+    assert!(store.email("a", "e2")?.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_trash_requires_trash_only() -> Result<()> {
+    let store = Store::open_memory()?;
+    let mut both = email("e2", "mb-trash");
+
+    both.mailbox_ids.push("mb-archive".into());
+    store.upsert_emails(&[email("e1", "mb-trash"), both, email("e3", "mb-inbox")])?;
+
+    // No trash-role mailbox yet.
+    assert!(!in_trash(&store, "a", "e1")?);
+
+    store.upsert_mailboxes(&[mailbox("mb-trash", "trash")])?;
+
+    assert!(in_trash(&store, "a", "e1")?);
+    assert!(!in_trash(&store, "a", "e2")?);
+    assert!(!in_trash(&store, "a", "e3")?);
+    assert!(!in_trash(&store, "a", "missing")?);
 
     Ok(())
 }

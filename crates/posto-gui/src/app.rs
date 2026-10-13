@@ -33,9 +33,39 @@ pub struct Confirm {
     pub on_accept: Action,
 }
 
-/// True when `action` on `selected` messages must be confirmed first.
-pub fn needs_confirm(action: Action, selected: usize) -> bool {
-    action == Action::Delete && selected > 1
+/// The question to ask before deleting `selected` messages, `destroying` of
+/// which are already in Trash and would be deleted permanently. Permanent
+/// deletion always asks; moving to Trash asks only for several messages.
+pub fn delete_prompt(selected: usize, destroying: usize) -> Option<Confirm> {
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    let (title, body, accept_label) = if destroying > 0 {
+        let moved = selected - destroying;
+
+        (
+            format!("Permanently delete {destroying} message{}?", s(destroying)),
+            if moved > 0 {
+                format!("{destroying} will be deleted permanently and {moved} moved to Trash.")
+            } else {
+                "This cannot be undone.".into()
+            },
+            "Delete permanently",
+        )
+    } else if selected > 1 {
+        (
+            format!("Delete {selected} messages?"),
+            "They will be moved to Trash.".into(),
+            "Delete",
+        )
+    } else {
+        return None;
+    };
+
+    Some(Confirm {
+        title,
+        body,
+        accept_label: accept_label.into(),
+        on_accept: Action::DeleteConfirmed,
+    })
 }
 
 /// Rows fetched per page of a list or search.
@@ -438,17 +468,15 @@ pub fn dispatch(action: Action) {
         || *SHOW_MOVE_PICKER.peek()
         || *SHOW_CLASSIFY_PICKER.peek()
         || CONFIRM.peek().is_some();
-    let selected = SELECTION.peek().len();
 
-    if !modal && needs_confirm(action, selected) {
-        *CONFIRM.write() = Some(Confirm {
-            title: format!("Delete {selected} messages?"),
-            body: "They will be moved to Trash.".into(),
-            accept_label: "Delete".into(),
-            on_accept: Action::DeleteConfirmed,
-        });
+    if !modal && action == Action::Delete {
+        let (destroy, trash) = split_trash(selected_refs());
 
-        return;
+        if let Some(prompt) = delete_prompt(destroy.len() + trash.len(), destroy.len()) {
+            *CONFIRM.write() = Some(prompt);
+
+            return;
+        }
     }
 
     match action {
@@ -469,9 +497,7 @@ pub fn dispatch(action: Action) {
         }
         Action::Open => focus("reader-body"),
         Action::Archive => run(act_on_selected(actions::Action::Archive)),
-        Action::Delete | Action::DeleteConfirmed => {
-            run(act_on_selected(actions::Action::Delete));
-        }
+        Action::Delete | Action::DeleteConfirmed => run(delete_selected()),
         Action::Junk => run(act_on_selected(actions::Action::Junk)),
         Action::Reply => run(start_reply(false)),
         Action::ReplyAll => run(start_reply(true)),
@@ -773,27 +799,29 @@ async fn apply_local(refs: &[MsgRef], action: actions::Action) -> Result<usize> 
             actions::apply(&b.store, client.as_deref(), &account, &ids, action.clone()).await?;
 
         for old in &before {
-            if let Ok(Some(new)) = b.store.email(&account, &old.id) {
-                bump_counts(old, &new);
-            }
+            let new = b.store.email(&account, &old.id).ok().flatten();
+
+            bump_counts(old, new.as_ref());
         }
     }
 
     Ok(applied)
 }
 
-/// Adjusts the mailbox badges for an email that changed from `old` to `new`.
-fn bump_counts(old: &EmailSummary, new: &EmailSummary) {
+/// Adjusts the mailbox badges for an email that changed from `old` to `new`
+/// (`None`: it is gone).
+fn bump_counts(old: &EmailSummary, new: Option<&EmailSummary>) {
     for m in MAILBOXES
         .write()
         .iter_mut()
         .filter(|m| m.account_id == old.account_id)
     {
         let was = old.mailbox_ids.contains(&m.id);
-        let is = new.mailbox_ids.contains(&m.id);
+        let is = new.is_some_and(|n| n.mailbox_ids.contains(&m.id));
 
         m.total += i64::from(is) - i64::from(was);
-        m.unread += i64::from(is && new.is_unread()) - i64::from(was && old.is_unread());
+        m.unread += i64::from(is && new.is_some_and(EmailSummary::is_unread))
+            - i64::from(was && old.is_unread());
     }
 }
 
@@ -1019,6 +1047,49 @@ fn drop_disabled_accounts_from_selection() {
     change_selection(|s| s.retain(&shown));
 }
 
+/// Splits `refs` into those already in Trash (to delete permanently) and the
+/// rest (to move to Trash). A lookup error counts as "not in Trash".
+fn split_trash(refs: Vec<MsgRef>) -> (Vec<MsgRef>, Vec<MsgRef>) {
+    let b = backend().peek().clone();
+
+    refs.into_iter()
+        .partition(|r| actions::in_trash(&b.store, &r.account_id, &r.id).unwrap_or(false))
+}
+
+/// Deletes the selection: messages in Trash permanently, the rest into Trash.
+async fn delete_selected() {
+    let Some(_busy) = Flag::take(&BUSY) else {
+        return;
+    };
+    let (destroy, trash) = split_trash(selected_refs());
+    let (d, t) = (destroy.len(), trash.len());
+
+    if d + t == 0 {
+        return;
+    }
+
+    let result = settle_selection(async {
+        apply_local(&destroy, actions::Action::Destroy).await?;
+        apply_local(&trash, actions::Action::Delete).await?;
+
+        Ok(())
+    })
+    .await;
+    let done = match (d, t) {
+        (d, 0) => format!("Permanently deleted {d}"),
+        (0, t) => format!(
+            "Moved {t} message{} to Trash",
+            if t == 1 { "" } else { "s" }
+        ),
+        (d, t) => format!("Permanently deleted {d}, moved {t} to Trash"),
+    };
+
+    match result {
+        Ok(()) => set_status(done),
+        Err(e) => fail("Action failed", e),
+    }
+}
+
 /// Applies `action` to every selected email.
 async fn act_on_selected(action: actions::Action) {
     let Some(_busy) = Flag::take(&BUSY) else {
@@ -1034,7 +1105,6 @@ async fn act_on_selected(action: actions::Action) {
     let s = if n == 1 { "" } else { "s" };
     let done = match &action {
         actions::Action::Archive => format!("Archived {n} message{s}"),
-        actions::Action::Delete => format!("Moved {n} message{s} to Trash"),
         actions::Action::Junk => format!("Marked {n} message{s} as junk"),
         _ => format!("Moved {n} message{s}"),
     };
@@ -1173,7 +1243,7 @@ async fn correct_refs(
 
         // Moves already made count even when a later step failed.
         if let (Some(old), Ok(Some(new))) = (before, b.store.email(&r.account_id, &r.id)) {
-            bump_counts(&old, &new);
+            bump_counts(&old, Some(&new));
         }
     }
 
@@ -1686,11 +1756,28 @@ mod tests {
     }
 
     #[test]
-    fn delete_prompts_only_for_many() {
-        assert!(needs_confirm(Action::Delete, 2));
-        assert!(!needs_confirm(Action::Delete, 1));
-        assert!(!needs_confirm(Action::Archive, 5));
-        assert!(!needs_confirm(Action::DeleteConfirmed, 5));
+    fn delete_prompt_rules() {
+        assert_eq!(delete_prompt(1, 0), None);
+
+        let trash = delete_prompt(3, 0).unwrap();
+
+        assert_eq!(trash.title, "Delete 3 messages?");
+        assert_eq!(trash.body, "They will be moved to Trash.");
+
+        let permanent = delete_prompt(1, 1).unwrap();
+
+        assert_eq!(permanent.title, "Permanently delete 1 message?");
+        assert_eq!(permanent.body, "This cannot be undone.");
+        assert_eq!(permanent.accept_label, "Delete permanently");
+        assert_eq!(permanent.on_accept, Action::DeleteConfirmed);
+
+        let mixed = delete_prompt(3, 2).unwrap();
+
+        assert_eq!(mixed.title, "Permanently delete 2 messages?");
+        assert_eq!(
+            mixed.body,
+            "2 will be deleted permanently and 1 moved to Trash."
+        );
     }
 
     #[test]

@@ -164,7 +164,9 @@ next `classify run` or classifying sync.
 `j`/`k` next/previous, `Enter` open, `Esc` close, `Backspace` back,
 `e` archive, `#` delete, `!` junk, `r` reply, `a` reply all, `c` compose,
 `u` toggle read, `s` toggle flag, `m` move, `t` classify as, `/` search, `g` sync,
-`Ctrl+Enter` send. Override any of them in Settings or in `config.toml`:
+`Ctrl+Enter` send. Delete moves a message to Trash; deleting a message that is
+already in Trash deletes it permanently, after a confirmation. Override any of
+them in Settings or in `config.toml`:
 
 ```toml
 [shortcuts]
@@ -185,6 +187,7 @@ printf '%s' "$TOKEN" | posto account set-token --account work --token-stdin
 posto email list --mailbox Inbox --unread --jsonl | jq -r .subject
 posto email show <id> --text
 posto email archive <id>...
+posto email destroy <id>... --yes   # permanent; `email delete` only moves to Trash
 posto email reply <id> --body-file reply.md --markdown
 ```
 

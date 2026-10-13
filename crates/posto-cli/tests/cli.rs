@@ -749,3 +749,27 @@ fn classify_correct_keeps_intent_when_the_server_is_unreachable() {
         "updates"
     );
 }
+
+#[test]
+fn destroy_requires_yes_and_mirrors_offline() {
+    let sb = Sandbox::seeded();
+    let refused = sb.run_with(&["email", "destroy", "fx-01"], None);
+
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("refusing to destroy without --yes"));
+    // Refusing changed nothing.
+    assert_eq!(
+        sb.run_with(&["email", "show", "fx-01"], None).status.code(),
+        Some(0)
+    );
+
+    let done = sb.json(&["email", "destroy", "fx-01", "--yes"]);
+
+    assert_eq!(done["applied"], 1);
+    assert_eq!(done["action"], "destroy");
+    assert_eq!(done["offline"], true);
+    assert_eq!(
+        sb.run_with(&["email", "show", "fx-01"], None).status.code(),
+        Some(6)
+    );
+}

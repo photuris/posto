@@ -211,6 +211,16 @@ pub enum EmailCmd {
     ///
     /// Output: {"applied": number, "action": "delete", "offline": bool}
     Delete(Ids),
+    /// Permanently delete emails (`Email/set destroy`); `delete` never does this.
+    ///
+    /// Output: {"applied": number, "action": "destroy", "offline": bool}
+    Destroy {
+        #[command(flatten)]
+        ids: Ids,
+        /// Confirm the permanent deletion; refused without it.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Move emails to the junk mailbox.
     ///
     /// Output: {"applied": number, "action": "junk", "offline": bool}

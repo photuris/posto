@@ -38,6 +38,8 @@ pub enum Action {
     Junk,
     /// Add `$answered`.
     MarkAnswered,
+    /// Delete permanently (`Email/set destroy`).
+    Destroy,
 }
 
 /// What an action changes.
@@ -51,6 +53,54 @@ enum Change {
     },
     /// Add (`true`) or remove (`false`) a keyword.
     Keyword(&'static str, bool),
+}
+
+/// True when `id` is in the trash mailbox and nowhere else.
+///
+/// # Errors
+///
+/// Returns any database error.
+pub fn in_trash(store: &Store, account: &str, id: &str) -> Result<bool> {
+    let (Some(trash), Some(email)) = (
+        store.mailbox_by_role(account, "trash")?,
+        store.email(account, id)?,
+    ) else {
+        return Ok(false);
+    };
+
+    Ok(email.mailbox_ids == [trash.id])
+}
+
+/// Destroys `ids` on the server (when `client` is given) and in the store.
+async fn destroy(
+    store: &Store,
+    client: Option<&Client>,
+    account: &str,
+    ids: &[String],
+) -> Result<usize> {
+    let mut gone: Vec<String> = ids.to_vec();
+
+    if let Some(client) = client.filter(|_| !ids.is_empty()) {
+        let r = client
+            .call_one(
+                "Email/set",
+                json!({ "accountId": client.session().account_id, "destroy": ids }),
+            )
+            .await?;
+
+        if let Some(refused) = r["notDestroyed"].as_object() {
+            gone.retain(|id| !refused.contains_key(id));
+        }
+    }
+
+    // Without a client, only emails the store knows are counted.
+    if client.is_none() {
+        gone.retain(|id| store.email(account, id).ok().flatten().is_some());
+    }
+
+    store.delete_emails(account, &gone)?;
+
+    Ok(gone.len())
 }
 
 fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
@@ -78,6 +128,7 @@ pub async fn apply(
     action: Action,
 ) -> Result<usize> {
     let change = match action {
+        Action::Destroy => return destroy(store, client, account, ids).await,
         Action::Archive => role_mailbox(store, account, "archive")?,
         Action::Delete => role_mailbox(store, account, "trash")?,
         Action::Junk => role_mailbox(store, account, "junk")?,
