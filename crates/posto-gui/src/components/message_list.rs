@@ -5,12 +5,13 @@ use posto_core::classify::Tray;
 
 use crate::app::{
     CLASSIFIED, EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION,
-    SIDEBAR_OPEN, backend, click_email, load_more, tray_label,
+    SIDEBAR_OPEN, backend, click_email, dispatch, load_more, tray_label,
 };
 use crate::components::Icon;
 use crate::format;
 use crate::selection::Click;
 use crate::state::{Folder, rows_for_display};
+use posto_core::shortcuts::Action;
 
 /// Avatar, sender, date, subject, preview and mailbox chips for every email in view.
 #[component]
@@ -153,17 +154,21 @@ pub fn MessageList() -> Element {
                             }
                             None => (None, false),
                         };
-                        let class = match (
-                            selection.is_selected(&key),
-                            selection.focus.as_deref() == Some(key.as_str()),
-                            e.is_unread(),
-                        ) {
-                            (true, true, _) => "row selected focused",
-                            (true, false, _) => "row selected",
-                            (false, _, true) => "row unread",
-                            (false, _, false) => "row",
-                        };
+                        // Unread is the only thing that bolds a row; selection and focus
+                        // are shown by background and outline alone.
+                        let mut class = String::from("row");
+                        if selection.is_selected(&key) {
+                            class.push_str(" selected");
+                        }
+                        if selection.focus.as_deref() == Some(key.as_str()) {
+                            class.push_str(" focused");
+                        }
+                        if e.is_unread() {
+                            class.push_str(" unread");
+                        }
                         let row_id = key.clone();
+                        let archive_id = key.clone();
+                        let delete_id = key.clone();
 
                         rsx! {
                             div {
@@ -207,6 +212,30 @@ pub fn MessageList() -> Element {
                                             }
                                         }
                                         span { class: "date", {format::short_date(&e.received_at, now)} }
+                                        span { class: "row-actions",
+                                            button {
+                                                class: "row-action",
+                                                title: "Archive",
+                                                onmousedown: |evt| evt.prevent_default(),
+                                                onclick: move |evt| {
+                                                    evt.stop_propagation();
+                                                    click_email(&archive_id, Click::Plain);
+                                                    dispatch(Action::Archive);
+                                                },
+                                                Icon { name: "archive", size: 14 }
+                                            }
+                                            button {
+                                                class: "row-action",
+                                                title: "Delete",
+                                                onmousedown: |evt| evt.prevent_default(),
+                                                onclick: move |evt| {
+                                                    evt.stop_propagation();
+                                                    click_email(&delete_id, Click::Plain);
+                                                    dispatch(Action::Delete);
+                                                },
+                                                Icon { name: "trash", size: 14 }
+                                            }
+                                        }
                                     }
                                     div { class: "subject", "{e.subject}" }
                                     div { class: "preview", "{e.preview}" }

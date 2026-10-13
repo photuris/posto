@@ -136,7 +136,15 @@ input.invalid { border-color: #d33; }
 .row-top { display: flex; align-items: center; gap: 6px; }
 .sender { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row.unread .sender, .row.unread .subject { font-weight: 700; }
-.row.selected .sender { font-weight: 600; }
+.row-actions { display: none; gap: 2px; margin-left: 4px; }
+.row:hover .row-actions { display: inline-flex; }
+.row:hover .row-actions ~ .date, .row:hover .date { display: none; }
+.row-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px;
+  background: transparent; color: var(--posto-muted); cursor: pointer;
+}
+.row-action:hover { background: var(--sel); color: var(--fg); }
 .date { font-size: 12px; color: var(--posto-muted); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--posto-accent); }
 .subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

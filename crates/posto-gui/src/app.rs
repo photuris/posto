@@ -345,6 +345,8 @@ pub fn App() -> Element {
             class: "app",
             tabindex: "0",
             autofocus: true,
+            // No WebKit context menu ("Inspect Element"); real menus come later.
+            oncontextmenu: |evt| evt.prevent_default(),
             onkeydown: |evt: KeyboardEvent| {
                 let m = evt.modifiers();
                 let chord = keys::chord_from_event(
