@@ -80,6 +80,12 @@ pub fn MessageList() -> Element {
     };
     let more = HAS_MORE();
 
+    let toggle_icon = if SIDEBAR_OPEN() {
+        "panel-close"
+    } else {
+        "panel-open"
+    };
+
     rsx! {
         section { class: "list",
             header { class: "list-head",
@@ -92,7 +98,7 @@ pub fn MessageList() -> Element {
 
                         *SIDEBAR_OPEN.write() = !open;
                     },
-                    Icon { name: "menu" }
+                    Icon { name: toggle_icon }
                 }
                 div {
                     div { class: "list-title", "{title}" }

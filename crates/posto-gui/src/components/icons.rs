@@ -21,6 +21,8 @@ pub const NAMES: &[&str] = &[
     "paperclip",
     "flag",
     "menu",
+    "panel-close",
+    "panel-open",
     "close",
     "more",
     "book-open",
@@ -72,6 +74,14 @@ fn shapes(name: &str) -> &'static str {
         }
         "menu" => {
             r#"<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/>"#
+        }
+        // Sidebar toggles: a panel outline with its left pane divided off and a
+        // chevron pointing the way the pane will move.
+        "panel-close" => {
+            r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path d="m16 9-3 3 3 3"/>"#
+        }
+        "panel-open" => {
+            r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path d="m13 9 3 3-3 3"/>"#
         }
         "close" => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
         "more" => {
