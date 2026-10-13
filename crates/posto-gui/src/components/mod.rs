@@ -185,6 +185,8 @@ pub fn LabelPicker() -> Element {
                             (false, false) => "picker-row label-row",
                         },
                         title: if blocked { "A message must keep at least one label" } else { "" },
+                        // Keep the filter focused across toggles.
+                        onmousedown: |evt| evt.prevent_default(),
                         onclick: move |_| {
                             if !blocked {
                                 toggle_label(id.clone());
