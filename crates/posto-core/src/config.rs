@@ -511,6 +511,10 @@ struct SecretsFile {
     /// Proton sessions by account id.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     proton: BTreeMap<String, ProtonSecret>,
+    /// Highest Proton generation ever issued per account id. Not a secret;
+    /// survives `clear_account` so a generation is never reused.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    proton_generations: BTreeMap<String, u64>,
 }
 
 /// What a Proton account keeps in `secrets.toml`.
@@ -621,6 +625,16 @@ impl Secrets {
     /// Holds an exclusive lock on `secrets.lock` across the read, the change
     /// and the write, so concurrent processes never lose each other's keys.
     fn update(change: impl FnOnce(&mut SecretsFile)) -> Result<()> {
+        Self::update_if(|f| {
+            change(f);
+
+            true
+        })
+    }
+
+    /// Like [`Secrets::update`], but `change` returns whether to write; when it
+    /// returns `false` the file is left untouched, byte for byte.
+    fn update_if(change: impl FnOnce(&mut SecretsFile) -> bool) -> Result<()> {
         std::fs::create_dir_all(data_dir())?;
 
         let mut lock =
@@ -634,7 +648,9 @@ impl Secrets {
                 .or_insert(legacy);
         }
 
-        change(&mut file);
+        if !change(&mut file) {
+            return Ok(());
+        }
 
         let text = toml::to_string(&file).map_err(|e| Error::Config(e.to_string()))?;
 
@@ -719,6 +735,7 @@ impl Secrets {
         Self::update(|f| {
             f.tokens.remove(account_id);
             f.proton.remove(account_id);
+            // `proton_generations` stays: it keeps generations unique.
         })
     }
 
@@ -736,8 +753,9 @@ impl Secrets {
 
     /// Stores the Proton login of `account_id` as a new sign-in and returns
     /// its generation. `secret.generation` is ignored: the new one is the
-    /// current time in nanoseconds, or one above the stored one if that is
-    /// not larger, so a generation is never reused.
+    /// current time in nanoseconds, or one above the highest generation ever
+    /// issued for the account if that is not larger, so a generation is never
+    /// reused, even after [`Secrets::clear_account`].
     ///
     /// # Errors
     ///
@@ -751,9 +769,15 @@ impl Secrets {
                 .ok()
                 .and_then(|d| u64::try_from(d.as_nanos()).ok())
                 .unwrap_or(0);
-            let stored = f.proton.get(account_id).map_or(0, |s| s.generation);
+            let high_water = f
+                .proton
+                .get(account_id)
+                .map_or(0, |s| s.generation)
+                .max(f.proton_generations.get(account_id).copied().unwrap_or(0));
 
-            generation = now.max(stored + 1);
+            generation = now.max(high_water + 1);
+            f.proton_generations
+                .insert(account_id.to_string(), generation);
             f.proton.insert(
                 account_id.to_string(),
                 ProtonSecret {
@@ -783,14 +807,19 @@ impl Secrets {
             "proton login for account {account_id}"
         )));
 
-        Self::update(|f| {
-            if let Some(entry) = f.proton.get_mut(account_id) {
-                outcome = Ok(entry.generation == generation);
+        Self::update_if(|f| {
+            let Some(entry) = f.proton.get_mut(account_id) else {
+                return false;
+            };
+            let current = entry.generation == generation;
 
-                if entry.generation == generation {
-                    entry.session = session.to_string();
-                }
+            outcome = Ok(current);
+
+            if current {
+                entry.session = session.to_string();
             }
+
+            current
         })?;
 
         outcome
@@ -1333,34 +1362,38 @@ mod tests {
         let g1 = Secrets::set_proton("pm", &secret).unwrap();
 
         assert!(g1 > 0);
-        assert_eq!(Secrets::token("fm").unwrap().as_deref(), Some("t1"));
-        assert_eq!(
-            Secrets::proton("pm").unwrap(),
-            Some(ProtonSecret {
-                generation: g1,
-                ..secret.clone()
-            })
+        assert!(
+            Secrets::token("fm").unwrap().as_deref() == Some("t1"),
+            "token beside the proton entry changed"
+        );
+        assert!(
+            Secrets::proton("pm").unwrap()
+                == Some(ProtonSecret {
+                    generation: g1,
+                    ..secret.clone()
+                }),
+            "stored proton secret differs"
         );
 
         let a2 = "{\"uid\":\"u\",\"access_token\":\"a2\"}";
 
         assert!(Secrets::set_proton_session("pm", g1, a2).unwrap());
-        assert_eq!(session_of(), a2);
-        assert_eq!(
-            Secrets::proton("pm").unwrap().unwrap().mailbox_password,
-            "pw"
+        assert!(session_of() == a2, "session was not replaced");
+        assert!(
+            Secrets::proton("pm").unwrap().unwrap().mailbox_password == "pw",
+            "mailbox password changed"
         );
 
         // A stale generation, a non-object and non-JSON leave the entry alone.
         assert!(!Secrets::set_proton_session("pm", g1 + 1, "{\"uid\":\"x\"}").unwrap());
-        assert_eq!(session_of(), a2);
+        assert!(session_of() == a2, "stale refresh changed the session");
 
         for bad in ["[1,2]", "not json"] {
             assert!(matches!(
                 Secrets::set_proton_session("pm", g1, bad),
                 Err(Error::Config(_))
             ));
-            assert_eq!(session_of(), a2);
+            assert!(session_of() == a2, "invalid blob changed the session");
         }
 
         // A fresh sign-in invalidates the old generation, also after clear_account.
@@ -1400,13 +1433,85 @@ mod tests {
 
         let shown = format!("{secret:?}");
 
-        assert!(shown.contains("<redacted>"), "{shown}");
-        assert!(!shown.contains("pw") && !shown.contains("uid"), "{shown}");
+        assert!(shown.contains("<redacted>"), "Debug does not redact");
+        assert!(
+            !shown.contains("pw") && !shown.contains("uid"),
+            "Debug leaks a secret field"
+        );
 
         Secrets::clear_account("pm").unwrap();
         Secrets::clear_account("fm").unwrap();
 
-        assert_eq!(Secrets::proton("pm").unwrap(), None);
-        assert_eq!(Secrets::token("fm").unwrap(), None);
+        assert!(
+            Secrets::proton("pm").unwrap().is_none(),
+            "proton entry survived clear_account"
+        );
+        assert!(
+            Secrets::token("fm").unwrap().is_none(),
+            "token survived clear_account"
+        );
+    }
+
+    #[test]
+    fn stale_refresh_does_not_write() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolate();
+        let secret = ProtonSecret {
+            session: "{}".into(),
+            ..ProtonSecret::default()
+        };
+        let generation = Secrets::set_proton("pm", &secret).unwrap();
+        let path = dir.path().join("secrets.toml");
+        let before = format!("# keep\n{}", std::fs::read_to_string(&path).unwrap());
+
+        std::fs::write(&path, &before).unwrap();
+
+        assert!(!Secrets::set_proton_session("pm", generation + 1, "{}").unwrap());
+        assert!(
+            std::fs::read_to_string(&path).unwrap() == before,
+            "stale refresh wrote the file"
+        );
+
+        // No entry: refused, and the file is not touched either.
+        assert!(matches!(
+            Secrets::set_proton_session("ghost", generation, "{}"),
+            Err(Error::NotConfigured(_))
+        ));
+        assert!(
+            std::fs::read_to_string(&path).unwrap() == before,
+            "refresh without an entry wrote the file"
+        );
+    }
+
+    #[test]
+    fn generation_survives_clear_account_and_clock_rollback() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _dir = isolate();
+        let secret = ProtonSecret {
+            session: "{}".into(),
+            ..ProtonSecret::default()
+        };
+
+        // A persisted generation far ahead of the clock models a rollback.
+        Secrets::update(|f| {
+            f.proton.insert(
+                "pm".into(),
+                ProtonSecret {
+                    generation: 4_000_000_000_000_000_000,
+                    ..secret.clone()
+                },
+            );
+        })
+        .unwrap();
+
+        let prior = Secrets::set_proton("pm", &secret).unwrap();
+
+        assert!(prior == 4_000_000_000_000_000_001, "stored + 1 not used");
+
+        Secrets::clear_account("pm").unwrap();
+
+        let next = Secrets::set_proton("pm", &secret).unwrap();
+
+        assert!(next > prior, "generation high-water mark lost after clear");
     }
 }
