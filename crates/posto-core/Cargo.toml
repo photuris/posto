@@ -12,6 +12,7 @@ fd-lock.workspace = true
 html2text.workspace = true
 notify.workspace = true
 percent-encoding.workspace = true
+proton-mail-api.workspace = true
 pulldown-cmark.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

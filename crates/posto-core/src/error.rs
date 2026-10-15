@@ -24,6 +24,13 @@ pub enum Error {
     /// The server reported a JMAP error.
     #[error("jmap: {0}")]
     Jmap(String),
+    /// The Proton API or the Proton client library failed; the text never
+    /// holds a token, password or key.
+    #[error("proton: {0}")]
+    Proton(String),
+    /// The account's provider has no way to do this.
+    #[error("not available for this account: {0}")]
+    Unsupported(String),
     /// A requested item does not exist.
     #[error("not found: {0}")]
     NotFound(String),
@@ -44,7 +51,7 @@ impl Error {
         match self {
             Error::NotConfigured(_) | Error::Config(_) => 3,
             Error::Auth => 4,
-            Error::Http(_) | Error::Jmap(_) => 5,
+            Error::Http(_) | Error::Jmap(_) | Error::Proton(_) => 5,
             Error::NotFound(_) => 6,
             Error::Locked(_) => 7,
             _ => 1,
