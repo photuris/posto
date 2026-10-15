@@ -8,7 +8,7 @@ use posto_core::actions::{self, Action};
 use posto_core::classify::state::state_for;
 use posto_core::classify::{Classification, Classifier, ClassifyReport, Tray};
 use posto_core::config::{Config, Secrets};
-use posto_core::provider::Connection;
+use posto_core::provider::{self, Connection};
 use posto_core::store::{Classified, EmailBody, EmailSummary, MsgRef, Store};
 use posto_core::{Error, Result, fixtures};
 
@@ -170,12 +170,12 @@ async fn mirror_tray_move(
 pub struct Backend {
     pub store: Arc<Store>,
     /// One connection per account, made lazily on first use; empty offline, in
-    /// UI test mode, or without tokens.
+    /// UI test mode, or without credentials.
     pub clients: HashMap<String, Arc<Connection>>,
     pub cfg: Config,
     /// `POSTO_UI_TEST=1`: in-memory fixtures, no network, nothing written to disk.
     pub ui_test: bool,
-    /// Bumped whenever an endpoint or token may have changed, so a connection
+    /// Bumped whenever an endpoint or credential may have changed, so a connection
     /// that was already in flight is not cached under the new settings.
     pub conn_rev: u64,
     /// Why `config.toml` could not be loaded. While set, `cfg` is a stand-in:
@@ -297,11 +297,12 @@ pub fn remote_allowed(cfg: &Config, from: &str) -> bool {
         || (!from.trim().is_empty() && sender_blocked(&cfg.trusted_senders, from))
 }
 
-/// The connected client of `account_id`, connecting with its stored token when needed.
+/// The connected client of `account_id`, connecting with its stored credentials when needed.
 ///
-/// `Ok(None)` in UI test mode. `Error::NotConfigured` when there is no token.
+/// `Ok(None)` in UI test mode. `Error::NotConfigured` when the account has no
+/// token (JMAP) or Proton login.
 pub async fn client(backend: Signal<Backend>, account_id: &str) -> Result<Option<Arc<Connection>>> {
-    let token = {
+    {
         let b = backend.read();
 
         if b.ui_test {
@@ -312,34 +313,53 @@ pub async fn client(backend: Signal<Backend>, account_id: &str) -> Result<Option
             return Ok(Some(client.clone()));
         }
 
-        Secrets::token_for(&b.cfg, account_id)?
-    }
-    .ok_or_else(|| Error::NotConfigured("token".into()))?;
+        let account = b
+            .cfg
+            .account(account_id)
+            .ok_or_else(|| Error::NotFound(format!("account {account_id}")))?;
 
-    connect(backend, account_id, &token).await.map(Some)
+        if !Secrets::has_credentials(&b.cfg, account)? {
+            return Err(provider::credential_error(account));
+        }
+    }
+
+    connect(backend, account_id).await.map(Some)
 }
 
-/// Connects `account_id` with its current session URL and caches the client.
+/// Connects `account_id` through [`provider::connect`] and caches the client.
 ///
 /// # Errors
 ///
-/// Besides connection errors, fails when the settings or token were saved
-/// while connecting: the client would belong to the old endpoint.
-async fn connect(
-    mut backend: Signal<Backend>,
-    account_id: &str,
-    token: &str,
-) -> Result<Arc<Connection>> {
-    let (session_url, rev) = {
+/// Besides connection errors, fails when the settings or credentials were
+/// saved while connecting: the client would belong to the old endpoint.
+async fn connect(backend: Signal<Backend>, account_id: &str) -> Result<Arc<Connection>> {
+    let (cfg, account) = {
         let b = backend.read();
         let account = b
             .cfg
             .account(account_id)
             .ok_or_else(|| Error::NotFound(format!("account {account_id}")))?;
 
-        (account.session_url.clone(), b.conn_rev)
+        (b.cfg.clone(), account.clone())
     };
-    let client = Arc::new(Connection::connect_jmap(&session_url, token).await?);
+
+    connect_with(backend, account_id, async {
+        provider::connect(&cfg, &account)
+            .await?
+            .ok_or_else(|| provider::credential_error(&account))
+    })
+    .await
+}
+
+/// Awaits `make` and caches its connection, unless the settings changed
+/// (`conn_rev`) in the meantime.
+async fn connect_with(
+    mut backend: Signal<Backend>,
+    account_id: &str,
+    make: impl Future<Output = Result<Connection>>,
+) -> Result<Arc<Connection>> {
+    let rev = backend.peek().conn_rev;
+    let client = Arc::new(make.await?);
     let mut b = backend.write();
 
     if b.conn_rev != rev {
@@ -429,7 +449,8 @@ mod tests {
         );
         let mut cfg = Config::default();
 
-        cfg.accounts[0].session_url = session_server(requested.clone(), release.clone());
+        let session_url = session_server(requested.clone(), release.clone());
+        cfg.accounts[0].session_url = session_url.clone();
 
         let dom = VirtualDom::new(VNode::empty);
         let _guard = RuntimeGuard::new(dom.runtime());
@@ -456,7 +477,10 @@ mod tests {
             saver.write().reset_client();
             release.store(true, Ordering::SeqCst);
         };
-        let (connected, ()) = tokio::join!(connect(backend, "default", "fake-token"), save);
+        let connect = connect_with(backend, "default", async {
+            Connection::connect_jmap(&session_url, "fake-token").await
+        });
+        let (connected, ()) = tokio::join!(connect, save);
 
         assert!(connected.is_err(), "stale client was returned");
         assert!(backend.peek().clients.is_empty(), "stale client was cached");

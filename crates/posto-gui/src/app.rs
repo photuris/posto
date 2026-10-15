@@ -408,7 +408,7 @@ pub fn App() -> Element {
             }
             if NEEDS_TOKEN() {
                 div { class: "banner",
-                    "No token configured — open Settings"
+                    "Not signed in — open Settings"
                     button { onclick: |_| *SHOW_SETTINGS.write() = true, "Settings" }
                 }
             }
@@ -560,13 +560,13 @@ pub fn set_status(msg: impl Into<String>) {
     });
 }
 
-/// Reports a failed operation; a rejected token drops the connection.
+/// Reports a failed operation; rejected credentials drop the connection.
 fn fail(what: &str, e: Error) {
     match e {
-        Error::NotConfigured(_) => set_status("No token configured — open Settings"),
+        Error::NotConfigured(_) => set_status("Not signed in — open Settings"),
         Error::Auth => {
             backend().write().reset_client();
-            set_status(format!("{what}: the server rejected the token"));
+            set_status(format!("{what}: the server rejected the credentials"));
         }
         e => set_status(format!("{what}: {e}")),
     }
@@ -789,8 +789,8 @@ async fn mark_read_later(r: MsgRef) {
     }
 }
 
-/// The server connection of `account_id`; sets the "no token" banner as a side
-/// effect when it has no token.
+/// The server connection of `account_id`; sets the "not signed in" banner as a side
+/// effect when it has no credentials.
 pub async fn get_client(account_id: &str) -> Result<Option<Arc<Connection>>> {
     let result = state::client(backend(), account_id).await;
 
@@ -1621,13 +1621,13 @@ pub fn save_attachment(account_id: String, email_id: String, att: Attachment) {
     });
 }
 
-/// The report error of an account that has no token.
+/// The report error of an account that has no credentials.
 const NO_TOKEN: &str = "no token";
 
 /// One line about a sync pass: totals for one account, a per-account list for several.
 fn sync_summary(cfg: &Config, reports: &[sync::SyncReport]) -> String {
     let outcome = |r: &sync::SyncReport| match r.error.as_deref() {
-        Some(NO_TOKEN) => "no token configured".to_string(),
+        Some(NO_TOKEN) => "not signed in".to_string(),
         Some(e) => format!("failed: {e}"),
         None => format!(
             "{} new, {} updated, {} removed",
@@ -1637,7 +1637,7 @@ fn sync_summary(cfg: &Config, reports: &[sync::SyncReport]) -> String {
 
     match reports {
         [only] => match only.error.as_deref() {
-            Some(NO_TOKEN) => "No token configured — open Settings".to_string(),
+            Some(NO_TOKEN) => "Not signed in — open Settings".to_string(),
             Some(e) => format!("Sync failed: {e}"),
             None => format!("Synced: {}", outcome(only)),
         },
@@ -1690,7 +1690,7 @@ pub async fn run_sync(manual: bool) {
             Ok(Some(client)) => {
                 clients.insert(a.id.clone(), client);
             }
-            // No token: the pass reports it for this account.
+            // No credentials: the pass reports it for this account.
             Ok(None) | Err(Error::NotConfigured(_)) => {}
             Err(e) => {
                 unreachable.insert(a.id.clone(), e.to_string());
@@ -2295,7 +2295,7 @@ mod tests {
         );
         assert_eq!(
             sync_summary(&cfg, &[report("default", 0, Some(NO_TOKEN))]),
-            "No token configured — open Settings"
+            "Not signed in — open Settings"
         );
         assert_eq!(
             sync_summary(

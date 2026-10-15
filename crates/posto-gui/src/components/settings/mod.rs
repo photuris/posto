@@ -10,7 +10,7 @@ mod reading;
 mod shortcuts;
 
 use dioxus::prelude::*;
-use posto_core::config::{Account, Config, Secrets};
+use posto_core::config::{Account, Config, Provider, Secrets};
 use posto_core::shortcuts::Keymap;
 
 use crate::app::{
@@ -76,16 +76,26 @@ fn close() {
 /// shortcuts: account fields, the classification numbers as typed, names.
 fn prepare(mut cfg: Config, margin: &str, urgency: &str) -> std::result::Result<Config, String> {
     for a in &mut cfg.accounts {
-        let url = a.session_url.trim().to_string();
-
         a.id = a.id.trim().to_string();
         a.name = a.name.trim().to_string();
         a.email = a.email.trim().to_string();
-        a.session_url = if url.is_empty() {
-            Account::default().session_url
-        } else {
-            url
-        };
+        a.username = a.username.trim().to_string();
+
+        match a.provider {
+            Provider::Jmap => {
+                let url = a.session_url.trim();
+
+                a.session_url = if url.is_empty() {
+                    Account::default().session_url
+                } else {
+                    url.to_string()
+                };
+            }
+            Provider::Proton if a.username.is_empty() && a.email.is_empty() => {
+                return Err("A Proton account needs a username or an email".into());
+            }
+            Provider::Proton => {}
+        }
     }
 
     classification::tidy(&mut cfg.classify);
@@ -161,13 +171,13 @@ pub fn Settings() -> Element {
             .map(|a| a.id.clone())
             .collect();
 
-        // A removed account takes its cached mail and token with it.
+        // A removed account takes its cached mail and credentials with it.
         for id in &removed {
             if let Err(e) = shared.peek().store.delete_account(id) {
                 return save_error.set(Some(e.to_string()));
             }
 
-            if !ui_test && let Err(e) = Secrets::clear_token(id) {
+            if !ui_test && let Err(e) = Secrets::clear_account(id) {
                 return save_error.set(Some(e.to_string()));
             }
         }
@@ -288,6 +298,37 @@ mod tests {
         assert!(prepare(cfg.clone(), "0.25", "").is_err());
         assert!(prepare(cfg.clone(), "2", "3").is_err());
         assert_eq!(cfg.classify.unsure_margin, kept);
+    }
+
+    #[test]
+    fn prepare_rejects_a_proton_account_without_login_name() {
+        let mut cfg = Config::default();
+
+        cfg.accounts[0] = Account::proton("pm", "");
+        cfg.accounts[0].session_url.clear();
+
+        let refused = prepare(cfg.clone(), "0.25", "3");
+
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("Proton")),
+            "{refused:?}"
+        );
+
+        cfg.accounts[0].username = " me ".into();
+
+        let ok = prepare(cfg.clone(), "0.25", "3").unwrap();
+
+        assert_eq!(ok.accounts[0].username, "me");
+        assert_eq!(ok.accounts[0].session_url, "");
+
+        // JMAP accounts still get the default URL.
+        cfg.accounts[0] = Account::new("jm", "");
+        cfg.accounts[0].session_url = "  ".into();
+
+        assert_eq!(
+            prepare(cfg, "0.25", "3").unwrap().accounts[0].session_url,
+            Account::default().session_url
+        );
     }
 
     #[test]
