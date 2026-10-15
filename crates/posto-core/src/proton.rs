@@ -656,9 +656,12 @@ impl Session {
     ///
     /// Always `Error::Unsupported`.
     pub async fn create_mailbox(&self, _name: &str) -> Result<Mailbox> {
-        Err(Error::Unsupported(
-            "creating mailboxes on Proton accounts".into(),
-        ))
+        self.tracked(async {
+            Err(Error::Unsupported(
+                "creating mailboxes on Proton accounts".into(),
+            ))
+        })
+        .await
     }
 
     /// Refreshes the account's mailboxes from Proton's labels, keeping stored
@@ -872,9 +875,12 @@ impl Session {
     ///
     /// Always `Error::Unsupported`.
     pub async fn destroy(&self, _ids: &[String]) -> Result<Vec<String>> {
-        Err(Error::Unsupported(
-            "permanent delete on Proton accounts".into(),
-        ))
+        self.tracked(async {
+            Err(Error::Unsupported(
+                "permanent delete on Proton accounts".into(),
+            ))
+        })
+        .await
     }
 
     /// True when the message carries a `List-Unsubscribe` header; a failed

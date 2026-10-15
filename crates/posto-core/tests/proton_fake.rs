@@ -507,7 +507,7 @@ async fn delta_server(event: Value) -> MockServer {
 
     mount_get(&server, "/core/v4/events/ev0", event).await;
     mount_message(&server, "m1", json!({})).await;
-    mount_message(&server, "m3", json!({"Unread": 0})).await;
+    mount_message(&server, "m3", json!({"Unread": 0, "Subject": "Full m3"})).await;
 
     Mock::given(method("GET"))
         .and(path("/mail/v4/messages/m4"))
@@ -549,6 +549,10 @@ async fn delta_fetches_changed_and_drops_deleted() {
     assert_eq!(page.state, "ev1");
     assert!(!page.more && !page.mailboxes_changed);
     assert!(!page.emails[1].keywords.is_empty(), "m3 is read");
+    // The inline payload of the event has no subject or conversation: these
+    // come only from fetching the whole message.
+    assert_eq!(page.emails[1].subject, "Full m3");
+    assert_eq!(page.emails[1].thread_id, "c1");
 
     let labels = json!([{"ID": "l1", "Action": 2, "Label": {"ID": "l1", "Name": "x", "Type": 1}}]);
     let server = delta_server(event_body(labels, 0)).await;
@@ -606,25 +610,69 @@ async fn delta_fetches_changed_and_drops_deleted() {
 
     assert!(page.destroyed.contains(&"m1".to_owned()));
     assert!(page.emails.iter().all(|e| e.id != "m1"));
+
+    // A delete followed by a create or an update leaves the id changed only.
+    let server = MockServer::start().await;
+
+    mount_get(
+        &server,
+        "/core/v4/events/ev0",
+        json!({
+            "Code": 1000, "EventID": "ev1", "More": 0, "Refresh": 0, "Labels": [],
+            "Messages": [
+                {"ID": "m5", "Action": 0},
+                {"ID": "m5", "Action": 1},
+                {"ID": "m6", "Action": 0},
+                {"ID": "m6", "Action": 2},
+            ],
+        }),
+    )
+    .await;
+    mount_message(&server, "m5", json!({})).await;
+    mount_message(&server, "m6", json!({})).await;
+
+    let Delta::Page(page) = plain(&server, None).delta("a", "ev0").await.unwrap() else {
+        panic!("expected a page");
+    };
+    let ids: Vec<&str> = page.emails.iter().map(|e| e.id.as_str()).collect();
+
+    assert_eq!(ids, ["m5", "m6"]);
+    assert!(page.destroyed.is_empty());
 }
 
-/// Runs `change` on messages `m1`, `m2` against a server that accepts every
-/// triage call (`label_reply` answers the label request) and returns the
-/// outcome and the `PUT`s it received as `(path, body)`.
+/// [`run_update_with`] where unlabelling succeeds.
 async fn run_update(
     ids: &[&str],
     change: Change,
     label_reply: Value,
 ) -> (Result<Vec<String>>, Vec<(String, Value)>) {
+    run_update_with(ids, change, label_reply, json!({"Code": 1000})).await
+}
+
+/// Runs `change` on messages `m1`, `m2` against a server that accepts every
+/// triage call (`label_reply` and `unlabel_reply` answer those requests) and
+/// returns the outcome and the `PUT`s it received as `(path, body)`.
+async fn run_update_with(
+    ids: &[&str],
+    change: Change,
+    label_reply: Value,
+    unlabel_reply: Value,
+) -> (Result<Vec<String>>, Vec<(String, Value)>) {
     let server = MockServer::start().await;
 
-    for p in ["read", "unread", "unlabel"] {
+    for p in ["read", "unread"] {
         Mock::given(method("PUT"))
             .and(path(format!("/mail/v4/messages/{p}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Code": 1000})))
             .mount(&server)
             .await;
     }
+
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/unlabel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(unlabel_reply))
+        .mount(&server)
+        .await;
 
     Mock::given(method("PUT"))
         .and(path("/mail/v4/messages/label"))
@@ -705,9 +753,21 @@ async fn update_maps_every_change() {
     assert_eq!(puts[1].1["LabelID"], "l1");
 
     let refusal = json!({"Code": 1001, "Responses": [{"ID": "m2", "Response": {"Code": 2000}}]});
-    let (result, _) = run_update(&ids, Change::Mailbox("6".into()), refusal).await;
+    let (result, _) = run_update(&ids, Change::Mailbox("6".into()), refusal.clone()).await;
 
     assert_eq!(result.unwrap(), ["m2"]);
+
+    // A refusal while unlabelling is kept and the additions still run.
+    let patch = Change::Patch {
+        add: vec!["l1".into()],
+        remove: vec!["0".into()],
+    };
+    let (result, puts) = run_update_with(&ids, patch, ok.clone(), refusal).await;
+
+    assert_eq!(result.unwrap(), ["m2"]);
+    assert_eq!(puts.len(), 2);
+    assert_eq!(puts[1].0, "/mail/v4/messages/label");
+    assert_eq!(puts[1].1["LabelID"], "l1");
 
     let (result, puts) = run_update(&[], Change::Keyword("$seen", true), ok).await;
 
@@ -791,7 +851,11 @@ async fn body_download_and_unsubscribe_with_real_keys() {
 
     let body = session.body("m1").await.unwrap().unwrap();
 
-    assert_eq!(body.html.as_deref(), Some("<p>Hi</p>"));
+    assert_eq!(body.email_id, "m1");
+    assert!(
+        body.html.as_deref() == Some("<p>Hi</p>"),
+        "html body matches"
+    );
     assert!(body.text.is_none());
     assert_eq!(body.message_id, ["m1@x"]);
     assert_eq!(body.in_reply_to, ["p@x"]);
@@ -832,15 +896,25 @@ fn collector() -> (Arc<Mutex<Vec<String>>>, Persist) {
     (blobs, persist)
 }
 
-/// Mounts a 401 for the first `GET /core/v4/users` and the refresh that
-/// follows it.
-async fn mount_rotation(server: &MockServer) {
+/// Mounts a 401 for the first `GET p`; mount it before the real handler.
+async fn mount_401_once(server: &MockServer, p: &str) {
     Mock::given(method("GET"))
-        .and(path("/core/v4/users"))
+        .and(path(p))
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({"Code": 401, "Error": "x"})))
         .up_to_n_times(1)
         .mount(server)
         .await;
+}
+
+/// Mounts a 401 for the first `GET /core/v4/users` and the refresh that
+/// follows it.
+async fn mount_rotation(server: &MockServer) {
+    mount_401_once(server, "/core/v4/users").await;
+    mount_refresh(server).await;
+}
+
+/// Mounts the token refresh, answering with the rotated tokens.
+async fn mount_refresh(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/auth/v4/refresh"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1047,4 +1121,203 @@ async fn persist_retries_after_a_failed_write() {
     session.sync_mailboxes(&store, "a").await.unwrap();
 
     assert_eq!(seen().len(), 2);
+}
+
+/// A persist callback that records every blob and answers `outcome(n)` to its
+/// `n`th call (counting from 1).
+fn scripted_collector(outcome: fn(usize) -> Result<bool>) -> (Arc<Mutex<Vec<String>>>, Persist) {
+    let blobs = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&blobs);
+    let persist: Persist = Box::new(move |blob| {
+        let mut blobs = sink.lock().unwrap();
+
+        blobs.push(blob.to_owned());
+
+        outcome(blobs.len())
+    });
+
+    (blobs, persist)
+}
+
+/// A server whose first labels request is rotated by a refresh, and a session
+/// whose first persist write fails; returns them after the first
+/// `sync_mailboxes` has left the rotated blob unsaved.
+async fn rotated_with_unsaved_blob() -> (Session, Arc<Mutex<Vec<String>>>) {
+    let server = MockServer::start().await;
+    let nothing = no_labels();
+
+    mount_401_once(&server, "/core/v4/labels").await;
+    mount_refresh(&server).await;
+    mount_labels(&server, &nothing, &nothing, &nothing).await;
+
+    let (calls, persist) = scripted_collector(|n| match n {
+        1 => Err(Error::Other("disk full".into())),
+        _ => Ok(true),
+    });
+    let session = plain(&server, Some(persist));
+    let store = Store::open_memory().unwrap();
+
+    session.sync_mailboxes(&store, "a").await.unwrap();
+
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    (session, calls)
+}
+
+#[tokio::test]
+async fn operations_without_a_request_still_persist() {
+    let (session, calls) = rotated_with_unsaved_blob().await;
+    let result = session.create_mailbox("x").await;
+
+    assert!(matches!(result, Err(Error::Unsupported(_))));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "create_mailbox retries the write"
+    );
+
+    let (session, calls) = rotated_with_unsaved_blob().await;
+    let result = session.destroy(&["m1".to_owned()]).await;
+
+    assert!(matches!(result, Err(Error::Unsupported(_))));
+    assert_eq!(calls.lock().unwrap().len(), 2, "destroy retries the write");
+}
+
+#[tokio::test]
+async fn persist_ok_false_is_not_retried() {
+    let server = MockServer::start().await;
+    let nothing = no_labels();
+
+    mount_401_once(&server, "/core/v4/labels").await;
+    mount_refresh(&server).await;
+    mount_labels(&server, &nothing, &nothing, &nothing).await;
+
+    let (calls, persist) = scripted_collector(|_| Ok(false));
+    let session = plain(&server, Some(persist));
+    let store = Store::open_memory().unwrap();
+
+    session.sync_mailboxes(&store, "a").await.unwrap();
+    session.sync_mailboxes(&store, "a").await.unwrap();
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "a superseded write is final"
+    );
+}
+
+#[tokio::test]
+async fn persist_survives_operation_errors() {
+    // A refresh followed by a failing call still stores the rotated blob.
+    let server = MockServer::start().await;
+
+    mount_401_once(&server, "/core/v4/addresses").await;
+    mount_refresh(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/core/v4/addresses"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"Code": 0, "Error": "x"})))
+        .mount(&server)
+        .await;
+
+    let (calls, persist) = collector();
+    let result = plain(&server, Some(persist)).identities().await;
+
+    assert!(result.is_err());
+    assert!(calls.lock().unwrap().len() == 1 && is_rotated(&calls.lock().unwrap()[0]));
+
+    // `has_unsubscribe` swallows the failure but still stores the blob.
+    let server = MockServer::start().await;
+
+    mount_401_once(&server, "/mail/v4/messages/m1").await;
+    mount_refresh(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/mail/v4/messages/m1"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({"Code": 2501, "Error": "x"})))
+        .mount(&server)
+        .await;
+
+    let (calls, persist) = collector();
+
+    assert!(!plain(&server, Some(persist)).has_unsubscribe("m1").await);
+    assert!(calls.lock().unwrap().len() == 1 && is_rotated(&calls.lock().unwrap()[0]));
+}
+
+/// An already unlocked session blob as the crate serialises it.
+fn unlocked_blob() -> Value {
+    let mut blob = blob_json("access-old");
+
+    blob["key_password"] = json!(MAILBOX);
+
+    blob
+}
+
+#[tokio::test]
+async fn connect_baseline_is_the_supplied_blob_and_the_user_lookup_persists() {
+    let address_key = TestKey::new();
+
+    // The supplied text differs from the crate's serialisation and nothing
+    // rotates: the first comparison writes the normalised blob once.
+    let server = MockServer::start().await;
+
+    for (p, body) in key_replies(&address_key) {
+        mount_get(&server, p, body).await;
+    }
+
+    let (blobs, persist) = collector();
+    let supplied = serde_json::to_string_pretty(&unlocked_blob()).unwrap();
+
+    connect_with(client(&server), &supplied, MAILBOX, Some(persist))
+        .await
+        .unwrap();
+
+    let saved = blobs.lock().unwrap().clone();
+
+    assert!(saved.len() == 1 && !is_rotated(&saved[0]));
+
+    // The supplied text equals the crate's serialisation: only a rotation
+    // during the user lookup (the second `GET /core/v4/users`) is written,
+    // on success and on failure.
+    let supplied = serde_json::to_string(
+        &serde_json::from_value::<PersistedSession>(unlocked_blob()).unwrap(),
+    )
+    .unwrap();
+
+    for lookup_works in [true, false] {
+        let server = MockServer::start().await;
+        let replies = key_replies(&address_key);
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/users"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(replies[0].1.clone()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_rotation(&server).await;
+
+        if lookup_works {
+            mount_get(&server, replies[0].0, replies[0].1.clone()).await;
+        } else {
+            Mock::given(method("GET"))
+                .and(path("/core/v4/users"))
+                .respond_with(
+                    ResponseTemplate::new(500).set_body_json(json!({"Code": 0, "Error": "x"})),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        for (p, body) in replies.into_iter().skip(1) {
+            mount_get(&server, p, body).await;
+        }
+
+        let (blobs, persist) = collector();
+        let result = connect_with(client(&server), &supplied, MAILBOX, Some(persist)).await;
+        let saved = blobs.lock().unwrap().clone();
+
+        assert_eq!(result.is_ok(), lookup_works);
+        assert!(
+            saved.len() == 1 && is_rotated(&saved[0]),
+            "lookup_works={lookup_works}"
+        );
+    }
 }
