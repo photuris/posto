@@ -1385,7 +1385,9 @@ mod tests {
         );
 
         // A stale generation, a non-object and non-JSON leave the entry alone.
-        assert!(!Secrets::set_proton_session("pm", g1 + 1, "{\"uid\":\"x\"}").unwrap());
+        let stale = Secrets::set_proton_session("pm", g1 + 1, "{\"uid\":\"x\"}").unwrap();
+
+        assert!(!stale, "stale generation was accepted");
         assert!(session_of() == a2, "stale refresh changed the session");
 
         for bad in ["[1,2]", "not json"] {
