@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use posto_core::config::Provider;
 
 /// Posto email client CLI. JSON on stdout, errors as JSON on stderr.
 #[derive(Parser)]
@@ -77,11 +78,13 @@ pub enum Noun {
 pub enum AccountCmd {
     /// List the configured accounts.
     ///
-    /// Output: [{"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool}]
-    List,
-    /// Add an account (store its token with `account set-token --account <id>`).
+    /// `has_token` means "has credentials": a token, or a Proton login.
     ///
-    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: [{"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool}]
+    List,
+    /// Add an account (store its token with `account set-token --account <id>`, or sign in to a Proton account with `account login --account <id>`).
+    ///
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Add {
         /// New account id: lower-case letters, digits and '-', at most 32.
         #[arg(long)]
@@ -95,6 +98,12 @@ pub enum AccountCmd {
         /// JMAP session URL (default: Fastmail).
         #[arg(long)]
         session_url: Option<String>,
+        /// Mail provider: jmap or proton.
+        #[arg(long, default_value = "jmap")]
+        provider: Provider,
+        /// Proton login name (default: the email address).
+        #[arg(long)]
+        username: Option<String>,
     },
     /// Remove an account with its token and cached mail (never the last one).
     ///
@@ -105,15 +114,15 @@ pub enum AccountCmd {
     },
     /// Read the API token from stdin and store it for the account.
     ///
-    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     SetToken {
         /// Required: read the token from stdin (the CLI never prompts).
         #[arg(long, required = true)]
         token_stdin: bool,
     },
-    /// Update the account's name, sender email, JMAP session URL or enabled flag.
+    /// Update the account's name, sender email, Proton login name, JMAP session URL or enabled flag.
     ///
-    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Set {
         /// Sender email address.
         #[arg(long)]
@@ -124,14 +133,31 @@ pub enum AccountCmd {
         /// Display name.
         #[arg(long)]
         name: Option<String>,
+        /// Proton login name.
+        #[arg(long)]
+        username: Option<String>,
         /// Sync and show the account (true or false).
         #[arg(long)]
         enabled: Option<bool>,
     },
-    /// Show the account settings; never the token itself.
+    /// Show the account settings; never the token itself. `has_token` means "has credentials": a token, or a Proton login.
     ///
-    /// Output: {"id": string, "name": string, "email": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Show,
+    /// Sign in to a Proton account: reads the password from the first line of stdin and, with --two-password, the mailbox password from the second line.
+    ///
+    /// Output: the account as `account show` prints it.
+    Login {
+        /// Current two-factor code, when the account has one.
+        #[arg(long)]
+        totp: Option<String>,
+        /// The account has a separate mailbox password: read it from the second stdin line.
+        #[arg(long)]
+        two_password: bool,
+        /// Required: read the password from stdin (the CLI never prompts).
+        #[arg(long, required = true)]
+        password_stdin: bool,
+    },
     /// List the account's cached sending identities (filled by `sync run`).
     ///
     /// Output: [{"id": string, "name": string, "email": string}]

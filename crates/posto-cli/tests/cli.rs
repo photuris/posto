@@ -25,12 +25,19 @@ impl Sandbox {
     }
 
     fn run_with(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        self.run_env(args, stdin, &[])
+    }
+
+    /// Like `run_with`, with extra environment variables set on top.
+    fn run_env(&self, args: &[&str], stdin: Option<&str>, extra: &[(&str, &str)]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_posto"))
             .args(args)
             .env("POSTO_DATA_DIR", &self.0)
             .env("XDG_STATE_HOME", &self.0)
             .env_remove("POSTO_TOKEN")
             .env_remove("TYPESAFE_API_KEY")
+            .env_remove("POSTO_PROTON_APP_VERSION")
+            .envs(extra.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -175,6 +182,151 @@ fn account_add_list_remove_and_scoped_token() {
         .status
         .code(),
         Some(3)
+    );
+}
+
+#[test]
+fn proton_account_add_show_and_sync_without_login() {
+    let sb = Sandbox::new();
+    let added = sb.json(&[
+        "account",
+        "add",
+        "--id",
+        "pm",
+        "--email",
+        "me@proton.me",
+        "--provider",
+        "proton",
+        "--username",
+        "me",
+    ]);
+
+    assert_eq!(added["provider"], "proton");
+    assert_eq!(added["username"], "me");
+    assert_eq!(added["has_token"], false);
+
+    let list = sb.json(&["account", "list"]);
+
+    assert_eq!(list[0]["id"], "default");
+    assert_eq!(list[0]["provider"], "jmap");
+
+    let sync = sb.run_with(&["sync", "run", "--account", "pm"], None);
+
+    assert_eq!(sync.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&sync.stderr).contains("proton login"),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+
+    let set = sb.run_with(
+        &["account", "set-token", "--account", "pm", "--token-stdin"],
+        Some("x"),
+    );
+
+    assert_eq!(set.status.code(), Some(3));
+
+    let bad = sb.run_with(
+        &[
+            "account",
+            "add",
+            "--id",
+            "bad",
+            "--email",
+            "a@b",
+            "--provider",
+            "imap",
+        ],
+        None,
+    );
+
+    assert_eq!(bad.status.code(), Some(2));
+
+    sb.json(&["account", "remove", "pm"]);
+
+    let left = sb.json(&["account", "list"]);
+
+    assert_eq!(left.as_array().unwrap().len(), 1);
+    assert_eq!(left[0]["id"], "default");
+}
+
+#[test]
+fn proton_login_validates_inputs_before_any_network() {
+    let sb = Sandbox::new();
+    let env = [("POSTO_PROTON_APP_VERSION", "posto-test@0.0.0")];
+    let started = std::time::Instant::now();
+
+    sb.json(&[
+        "account",
+        "add",
+        "--id",
+        "pm",
+        "--email",
+        "me@proton.me",
+        "--provider",
+        "proton",
+    ]);
+
+    // (args, stdin, expected stderr text)
+    let cases: [(&[&str], &str, &str); 3] = [
+        (
+            &[
+                "account",
+                "login",
+                "--account",
+                "default",
+                "--password-stdin",
+            ],
+            "pw\n",
+            "not a Proton account",
+        ),
+        (
+            &["account", "login", "--account", "pm", "--password-stdin"],
+            "",
+            "empty password on stdin",
+        ),
+        (
+            &[
+                "account",
+                "login",
+                "--account",
+                "pm",
+                "--password-stdin",
+                "--two-password",
+            ],
+            "pw\n",
+            "mailbox password missing",
+        ),
+    ];
+
+    for (args, stdin, expected) in cases {
+        let out = sb.run_env(args, Some(stdin), &env);
+        let err = String::from_utf8_lossy(&out.stderr);
+
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {err}");
+        assert!(err.contains(expected), "{args:?}: {err}");
+        assert!(!err.contains("transport") && !err.contains("http"), "{err}");
+    }
+
+    // An empty `proton.app_version` and no variable.
+    std::fs::write(
+        sb.0.join("config.toml"),
+        "[[accounts]]\nid = \"default\"\n\n[[accounts]]\nid = \"pm\"\nemail = \"me@proton.me\"\nprovider = \"proton\"\n\n[proton]\napp_version = \"\"\n",
+    )
+    .unwrap();
+
+    let out = sb.run_with(
+        &["account", "login", "--account", "pm", "--password-stdin"],
+        Some("pw\n"),
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err.contains("proton.app_version"), "{err}");
+    assert!(!err.contains("transport") && !err.contains("http"), "{err}");
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "no command waits on a network"
     );
 }
 

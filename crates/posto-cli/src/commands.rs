@@ -10,13 +10,13 @@ use posto_core::actions::{self, Action};
 use posto_core::body::{fetch_body, save_attachment};
 use posto_core::classify::{self, JEV_BASE_URL, JevClient, Tray};
 use posto_core::compose::{self, Draft};
-use posto_core::config::{Account, Config, Secrets};
-use posto_core::provider::Connection;
+use posto_core::config::{Account, Config, ProtonSecret, Provider, Secrets};
+use posto_core::provider::{self, Connection};
 use posto_core::shortcuts::{self, Keymap};
 use posto_core::store::{
     CLASSIFY_MAX_ATTEMPTS, EmailBody, EmailSummary, ListQuery, Mailbox, Store,
 };
-use posto_core::{Error, Result, fixtures, html, sync, theme};
+use posto_core::{Error, Result, fixtures, html, proton, sync, theme};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -48,20 +48,16 @@ fn scope(cfg: &Config, flag: Option<&str>) -> Result<Vec<String>> {
     }
 }
 
-/// Connects with the account's stored token; no token is `NotConfigured`.
+/// Connects with the account's stored credentials; none is `NotConfigured`.
 async fn client_for(cfg: &Config, account: &Account) -> Result<Connection> {
-    let token = Secrets::token_for(cfg, &account.id)?
-        .ok_or_else(|| Error::NotConfigured(format!("token for account {}", account.id)))?;
-
-    Connection::connect_jmap(&account.session_url, &token).await
+    provider::connect(cfg, account)
+        .await?
+        .ok_or_else(|| provider::credential_error(account))
 }
 
-/// `None` when the account has no token, so local-only commands keep working offline.
+/// `None` when the account has no credentials, so local-only commands keep working offline.
 async fn optional_client(cfg: &Config, account: &Account) -> Result<Option<Connection>> {
-    match Secrets::token_for(cfg, &account.id)? {
-        None => Ok(None),
-        Some(_) => client_for(cfg, account).await.map(Some),
-    }
+    provider::connect(cfg, account).await
 }
 
 /// The configured account with this id.
@@ -140,9 +136,11 @@ fn account_json(cfg: &Config, a: &Account) -> Result<Value> {
         "id": a.id,
         "name": a.name,
         "email": a.email,
+        "provider": a.provider.as_str(),
+        "username": a.username,
         "session_url": a.session_url,
         "enabled": a.enabled,
-        "has_token": Secrets::token_for(cfg, &a.id)?.is_some(),
+        "has_token": Secrets::has_credentials(cfg, a)?,
     }))
 }
 
@@ -171,11 +169,17 @@ pub fn account_add(
     email: String,
     name: Option<String>,
     session_url: Option<String>,
+    provider: Provider,
+    username: Option<String>,
 ) -> Result<Value> {
     let mut cfg = Config::load()?;
-    let mut account = Account::new(&id, &email);
+    let mut account = match provider {
+        Provider::Jmap => Account::new(&id, &email),
+        Provider::Proton => Account::proton(&id, &email),
+    };
 
     account.name = name.unwrap_or_default();
+    account.username = username.unwrap_or_default();
 
     if let Some(url) = session_url {
         account.session_url = url;
@@ -192,7 +196,7 @@ pub fn account_remove(id: &str) -> Result<Value> {
     cfg.remove_account(id)?;
     cfg.save()?;
     open_store()?.delete_account(id)?;
-    Secrets::clear_token(id)?;
+    Secrets::clear_account(id)?;
 
     Ok(json!({ "removed": id }))
 }
@@ -204,7 +208,17 @@ pub fn account_identities(account: Option<&str>) -> Result<Value> {
 }
 
 pub fn account_set_token(account: Option<&str>) -> Result<Value> {
-    let id = pick_account(&Config::load()?, account)?.id.clone();
+    let cfg = Config::load()?;
+    let picked = pick_account(&cfg, account)?;
+
+    if picked.provider == Provider::Proton {
+        return Err(Error::Config(format!(
+            "account {} is a Proton account: use `account login`",
+            picked.id
+        )));
+    }
+
+    let id = picked.id.clone();
     let mut token = String::new();
 
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut token)?;
@@ -224,6 +238,7 @@ pub fn account_set(
     email: Option<String>,
     session_url: Option<String>,
     name: Option<String>,
+    username: Option<String>,
     enabled: Option<bool>,
 ) -> Result<Value> {
     let mut cfg = Config::load()?;
@@ -242,6 +257,10 @@ pub fn account_set(
             a.name = name;
         }
 
+        if let Some(username) = username {
+            a.username = username;
+        }
+
         if let Some(enabled) = enabled {
             a.enabled = enabled;
         }
@@ -249,6 +268,86 @@ pub fn account_set(
 
     cfg.save()?;
     account_show(Some(&id))
+}
+
+/// Signs in to a Proton account with the password read from stdin, and
+/// stores the session.
+pub async fn account_login(
+    account: Option<&str>,
+    totp: Option<String>,
+    two_password: bool,
+) -> Result<Value> {
+    let mut cfg = Config::load()?;
+    let picked = pick_account(&cfg, account)?.clone();
+
+    if picked.provider != Provider::Proton {
+        return Err(Error::Config(format!(
+            "account {} is not a Proton account",
+            picked.id
+        )));
+    }
+
+    let mut input = String::new();
+
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+
+    let mut lines = input.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let password = lines.next().unwrap_or_default().to_owned();
+
+    if password.is_empty() {
+        return Err(Error::Config("empty password on stdin".into()));
+    }
+
+    let mailbox_password = if two_password {
+        match lines.next().filter(|l| !l.is_empty()) {
+            Some(line) => Some(line.to_owned()),
+            None => {
+                return Err(Error::Config(
+                    "mailbox password missing: give it on the second stdin line".into(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    drop(input);
+
+    let app_version = cfg
+        .proton_app_version()
+        .ok_or_else(|| Error::NotConfigured("proton.app_version".into()))?;
+    let login = proton::login(
+        &app_version,
+        picked.login_name(),
+        &password,
+        totp.as_deref(),
+        mailbox_password.as_deref(),
+    )
+    .await;
+
+    drop(password);
+    drop(mailbox_password);
+
+    let login = login?;
+
+    Secrets::set_proton(
+        &picked.id,
+        &ProtonSecret {
+            session: login.session,
+            mailbox_password: login.mailbox_password,
+            generation: 0,
+        },
+    )?;
+
+    if picked.email.is_empty()
+        && !login.email.is_empty()
+        && let Some(a) = cfg.accounts.iter_mut().find(|a| a.id == picked.id)
+    {
+        a.email = login.email;
+        cfg.save()?;
+    }
+
+    account_show(Some(&picked.id))
 }
 
 /// The accounts `--account` selects (default: every enabled one); none is an error.
@@ -265,7 +364,7 @@ fn targets(cfg: &Config, account: Option<&str>) -> Result<Vec<Account>> {
     Ok(targets)
 }
 
-/// Connects every target that has a token. An account that cannot connect is
+/// Connects every target that has credentials. An account that cannot connect is
 /// returned with the reason instead of failing the others.
 async fn connect_clients(
     cfg: &Config,
@@ -275,7 +374,7 @@ async fn connect_clients(
     let mut unreachable: HashMap<String, String> = HashMap::new();
 
     for a in targets {
-        if Secrets::token_for(cfg, &a.id)?.is_none() {
+        if !Secrets::has_credentials(cfg, a)? {
             continue;
         }
 

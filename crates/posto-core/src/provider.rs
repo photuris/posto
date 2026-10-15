@@ -7,8 +7,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compose::Draft;
-use crate::error::Result;
+use crate::config::{Account, Config, Provider, Secrets};
+use crate::error::{Error, Result};
 use crate::jmap;
+use crate::proton;
 use crate::store::{Attachment, EmailBody, EmailSummary, Mailbox, Store};
 
 /// A sending identity: a JMAP `Identity` or a Proton address that may send.
@@ -76,12 +78,15 @@ pub enum Delta {
 pub enum Connection {
     /// A JMAP account (Fastmail).
     Jmap(jmap::Client),
+    /// A Proton Mail account.
+    Proton(proton::Session),
 }
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Connection::Jmap(c) => c.fmt(f),
+            Connection::Proton(s) => s.fmt(f),
         }
     }
 }
@@ -100,10 +105,19 @@ impl Connection {
         ))
     }
 
+    /// Which provider this connection speaks to.
+    pub fn provider(&self) -> Provider {
+        match self {
+            Connection::Jmap(_) => Provider::Jmap,
+            Connection::Proton(_) => Provider::Proton,
+        }
+    }
+
     /// The server's own id for the account (not the local slug).
     pub fn server_account_id(&self) -> &str {
         match self {
             Connection::Jmap(c) => &c.session().account_id,
+            Connection::Proton(s) => s.server_account_id(),
         }
     }
 
@@ -111,6 +125,7 @@ impl Connection {
     pub fn provider_name(&self) -> &'static str {
         match self {
             Connection::Jmap(_) => "jmap",
+            Connection::Proton(s) => s.provider_name(),
         }
     }
 
@@ -119,6 +134,7 @@ impl Connection {
     pub fn local_counts(&self) -> bool {
         match self {
             Connection::Jmap(_) => false,
+            Connection::Proton(s) => s.local_counts(),
         }
     }
 
@@ -130,6 +146,7 @@ impl Connection {
     pub async fn identities(&self) -> Result<Vec<Identity>> {
         match self {
             Connection::Jmap(c) => c.identities().await,
+            Connection::Proton(s) => s.identities().await,
         }
     }
 
@@ -142,6 +159,7 @@ impl Connection {
     pub async fn create_mailbox(&self, name: &str) -> Result<Mailbox> {
         match self {
             Connection::Jmap(c) => c.create_mailbox(name).await,
+            Connection::Proton(s) => s.create_mailbox(name).await,
         }
     }
 
@@ -153,6 +171,7 @@ impl Connection {
     pub async fn sync_mailboxes(&self, store: &Store, account: &str) -> Result<()> {
         match self {
             Connection::Jmap(c) => c.sync_mailboxes(store, account).await,
+            Connection::Proton(s) => s.sync_mailboxes(store, account).await,
         }
     }
 
@@ -169,6 +188,7 @@ impl Connection {
     ) -> Result<(Vec<EmailSummary>, String)> {
         match self {
             Connection::Jmap(c) => c.initial(account, limit).await,
+            Connection::Proton(s) => s.initial(account, limit).await,
         }
     }
 
@@ -180,6 +200,7 @@ impl Connection {
     pub async fn delta(&self, account: &str, since: &str) -> Result<Delta> {
         match self {
             Connection::Jmap(c) => c.delta(account, since).await,
+            Connection::Proton(s) => s.delta(account, since).await,
         }
     }
 
@@ -191,6 +212,7 @@ impl Connection {
     pub async fn body(&self, email_id: &str) -> Result<Option<EmailBody>> {
         match self {
             Connection::Jmap(c) => c.body(email_id).await,
+            Connection::Proton(s) => s.body(email_id).await,
         }
     }
 
@@ -207,6 +229,7 @@ impl Connection {
 
                 c.download_blob(&att.blob_id, &att.name, &att.mime).await
             }
+            Connection::Proton(s) => s.download(email_id, att).await,
         }
     }
 
@@ -218,6 +241,7 @@ impl Connection {
     pub async fn update(&self, ids: &[String], change: &Change) -> Result<Updated> {
         match self {
             Connection::Jmap(c) => c.update(ids, change).await,
+            Connection::Proton(s) => s.update(ids, change).await,
         }
     }
 
@@ -229,6 +253,7 @@ impl Connection {
     pub async fn destroy(&self, ids: &[String]) -> Result<Vec<String>> {
         match self {
             Connection::Jmap(c) => c.destroy(ids).await,
+            Connection::Proton(s) => s.destroy(ids).await,
         }
     }
 
@@ -237,6 +262,7 @@ impl Connection {
     pub async fn has_unsubscribe(&self, email_id: &str) -> bool {
         match self {
             Connection::Jmap(c) => c.has_unsubscribe(email_id).await,
+            Connection::Proton(s) => s.has_unsubscribe(email_id).await,
         }
     }
 
@@ -260,6 +286,65 @@ impl Connection {
     ) -> Result<String> {
         match self {
             Connection::Jmap(c) => c.send(store, account, identity, draft, text, html).await,
+            Connection::Proton(s) => s.send(store, account, identity, draft, text, html).await,
         }
+    }
+}
+
+/// Connects `account` with its stored credentials; `Ok(None)` when it has
+/// none, so callers that work offline can carry on.
+///
+/// # Errors
+///
+/// Returns [`Error::NotConfigured`] when a Proton account has no
+/// `proton.app_version`, [`Error::Auth`] on 401/403, and any other network,
+/// server or secrets-file error.
+pub async fn connect(cfg: &Config, account: &Account) -> Result<Option<Connection>> {
+    if !Secrets::has_credentials(cfg, account)? {
+        return Ok(None);
+    }
+
+    match account.provider {
+        Provider::Jmap => {
+            let Some(token) = Secrets::token_for(cfg, &account.id)? else {
+                return Ok(None);
+            };
+
+            Ok(Some(Connection::Jmap(
+                jmap::Client::connect(&account.session_url, &token).await?,
+            )))
+        }
+        Provider::Proton => {
+            let app_version = cfg
+                .proton_app_version()
+                .ok_or_else(|| Error::NotConfigured("proton.app_version".into()))?;
+            let Some(secret) = Secrets::proton(&account.id)? else {
+                return Ok(None);
+            };
+            let id = account.id.clone();
+            let generation = secret.generation;
+            let session = proton::connect(
+                &app_version,
+                &secret.session,
+                &secret.mailbox_password,
+                Some(Box::new(move |blob| {
+                    Secrets::set_proton_session(&id, generation, blob)
+                })),
+            )
+            .await?;
+
+            Ok(Some(Connection::Proton(session)))
+        }
+    }
+}
+
+/// The error for a command that needs a connection when [`connect`] found no
+/// credentials.
+pub fn credential_error(account: &Account) -> Error {
+    let id = &account.id;
+
+    match account.provider {
+        Provider::Jmap => Error::NotConfigured(format!("token for account {id}")),
+        Provider::Proton => Error::NotConfigured(format!("proton login for account {id}")),
     }
 }

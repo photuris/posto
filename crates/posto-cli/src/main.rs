@@ -52,15 +52,21 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
                 email,
                 name,
                 session_url,
-            } => c::account_add(id, email, name, session_url),
+                provider,
+                username,
+            } => c::account_add(id, email, name, session_url, provider, username),
             AccountCmd::Remove { id } => c::account_remove(&id),
             AccountCmd::SetToken { .. } => c::account_set_token(account),
             AccountCmd::Set {
                 email,
                 session_url,
                 name,
+                username,
                 enabled,
-            } => c::account_set(account, email, session_url, name, enabled),
+            } => c::account_set(account, email, session_url, name, username, enabled),
+            AccountCmd::Login {
+                totp, two_password, ..
+            } => c::account_login(account, totp, two_password).await,
             AccountCmd::Show => c::account_show(account),
             AccountCmd::Identities => c::account_identities(account),
         },
