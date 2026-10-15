@@ -1,0 +1,15 @@
+{
+  "Code": 1000,
+  "Labels": [
+    {"ID": "0", "Name": "Inbox", "Path": "Inbox", "Color": "", "Type": 4},
+    {"ID": "1", "Name": "All Drafts", "Path": "All Drafts", "Color": "", "Type": 4},
+    {"ID": "2", "Name": "All Sent", "Path": "All Sent", "Color": "", "Type": 4},
+    {"ID": "3", "Name": "Trash", "Path": "Trash", "Color": "", "Type": 4},
+    {"ID": "4", "Name": "Spam", "Path": "Spam", "Color": "", "Type": 4},
+    {"ID": "5", "Name": "All Mail", "Path": "All Mail", "Color": "", "Type": 4},
+    {"ID": "6", "Name": "Archive", "Path": "Archive", "Color": "", "Type": 4},
+    {"ID": "7", "Name": "Sent", "Path": "Sent", "Color": "", "Type": 4},
+    {"ID": "8", "Name": "Drafts", "Path": "Drafts", "Color": "", "Type": 4},
+    {"ID": "10", "Name": "Starred", "Path": "Starred", "Color": "", "Type": 4}
+  ]
+}

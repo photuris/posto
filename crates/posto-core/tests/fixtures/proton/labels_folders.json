@@ -1,0 +1,7 @@
+{
+  "Code": 1000,
+  "Labels": [
+    {"ID": "f1", "ParentID": "", "Name": "Work", "Path": "Work", "Color": "#8080FF", "Type": 3},
+    {"ID": "f2", "ParentID": "f1", "Name": "Reports", "Path": "Work/Reports", "Color": "#8080FF", "Type": 3}
+  ]
+}
