@@ -11,6 +11,7 @@ use posto_core::classify::{
 };
 use posto_core::config::{Account, Config};
 use posto_core::jmap::Client;
+use posto_core::provider::Connection;
 use posto_core::store::{Address, Classified, EmailSummary, Mailbox, MsgRef, Store};
 use posto_core::{Error, Result};
 use serde_json::{Value, json};
@@ -266,7 +267,7 @@ struct Env {
     jev: FakeJev,
     store: Store,
     cfg: Config,
-    clients: HashMap<String, Arc<Client>>,
+    clients: HashMap<String, Arc<Connection>>,
     lock: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -337,11 +338,11 @@ async fn env_with(accounts: &[(&str, Option<bool>)], fallback: ResponseTemplate)
             .unwrap();
         clients.insert(
             id.to_string(),
-            Arc::new(
+            Arc::new(Connection::Jmap(
                 Client::connect(&format!("{}/session", jmap.uri()), "tok")
                     .await
                     .unwrap(),
-            ),
+            )),
         );
     }
 

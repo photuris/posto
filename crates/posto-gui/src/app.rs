@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use dioxus::prelude::*;
 use posto_core::classify::{self, Classifier, ClassifyReport, JEV_BASE_URL, JevClient, Tray};
 use posto_core::config::{Account, Config, Secrets, UiConfig};
-use posto_core::jmap::{Client, Identity};
+use posto_core::provider::{Connection, Identity};
 use posto_core::shortcuts::{Action, Keymap};
 use posto_core::store::{Attachment, EmailBody, EmailSummary, ListQuery, Mailbox, MsgRef};
 use posto_core::theme::{self, Theme, Watcher};
@@ -791,7 +791,7 @@ async fn mark_read_later(r: MsgRef) {
 
 /// The server connection of `account_id`; sets the "no token" banner as a side
 /// effect when it has no token.
-pub async fn get_client(account_id: &str) -> Result<Option<Arc<Client>>> {
+pub async fn get_client(account_id: &str) -> Result<Option<Arc<Connection>>> {
     let result = state::client(backend(), account_id).await;
 
     if matches!(result, Err(Error::NotConfigured(_))) && !*NEEDS_TOKEN.peek() {
@@ -1317,7 +1317,7 @@ pub fn classify_selected(tray: Tray) {
         }
 
         let b = backend().peek().clone();
-        let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
+        let mut clients: HashMap<String, Arc<Connection>> = HashMap::new();
 
         for (account, _) in group_by_account(&refs) {
             if let Ok(Some(client)) = get_client(&account).await {
@@ -1362,7 +1362,7 @@ pub fn classify_selected(tray: Tray) {
 /// many were filed and the first error.
 async fn correct_refs(
     b: &Backend,
-    clients: &HashMap<String, Arc<Client>>,
+    clients: &HashMap<String, Arc<Connection>>,
     refs: &[MsgRef],
     tray: Tray,
 ) -> (usize, Option<Error>) {
@@ -1599,7 +1599,7 @@ async fn send_draft(archive: bool) {
 }
 
 /// Downloads an attachment of a message of `account_id` into the downloads folder.
-pub fn save_attachment(account_id: String, att: Attachment) {
+pub fn save_attachment(account_id: String, email_id: String, att: Attachment) {
     run(async move {
         let b = backend().peek().clone();
 
@@ -1614,7 +1614,7 @@ pub fn save_attachment(account_id: String, att: Attachment) {
         };
         let dir = dirs::download_dir().unwrap_or_else(posto_core::config::data_dir);
 
-        match body::save_attachment(&client, &att, &dir).await {
+        match body::save_attachment(&client, &email_id, &att, &dir).await {
             Ok(path) => set_status(format!("Saved to {}", path.display())),
             Err(e) => fail("Download failed", e),
         }
@@ -1682,7 +1682,7 @@ pub async fn run_sync(manual: bool) {
     }
 
     let b = backend().peek().clone();
-    let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
+    let mut clients: HashMap<String, Arc<Connection>> = HashMap::new();
     let mut unreachable: HashMap<String, String> = HashMap::new();
 
     for a in b.cfg.accounts_enabled() {
@@ -1757,7 +1757,7 @@ pub async fn run_sync(manual: bool) {
 /// and a TypeSafe key exists (UI test mode: always, with [`FakeJev`]). A
 /// failure becomes a toast; background passes stay quiet unless something was
 /// classified or went wrong.
-async fn classify_pass(clients: HashMap<String, Arc<Client>>, manual: bool) {
+async fn classify_pass(clients: HashMap<String, Arc<Connection>>, manual: bool) {
     let b = backend().peek().clone();
 
     if !b.ui_test
@@ -1827,7 +1827,7 @@ const ALREADY_RUNNING: &str = "classifier already running";
 /// network never blocks the UI.
 async fn run_classifier<C: Classifier + 'static>(
     b: &Backend,
-    clients: HashMap<String, Arc<Client>>,
+    clients: HashMap<String, Arc<Connection>>,
     classifier: C,
 ) -> ClassifyReport {
     let (cfg, store) = (b.cfg.clone(), b.store.clone());
@@ -2204,7 +2204,7 @@ mod tests {
 
         assert!(!MAILBOXES.peek().iter().any(|m| m.name == "Statements"));
 
-        let client = Client::connect(&format!("{}/session", server.uri()), "tok")
+        let client = Connection::connect_jmap(&format!("{}/session", server.uri()), "tok")
             .await
             .unwrap();
         let clients = HashMap::from([("default".to_string(), Arc::new(client))]);

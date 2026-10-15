@@ -2,11 +2,14 @@
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Response, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 
+use crate::compose::Draft;
 use crate::error::{Error, Result};
-use crate::store::Mailbox;
+use crate::provider::{Change, Delta, DeltaPage, Identity, Updated};
+use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
+use crate::sync::get_state;
 
 /// Capabilities sent in every request's `using`.
 const USING: [&str; 3] = [
@@ -25,6 +28,31 @@ const ENCODE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
+/// Email properties kept in the store.
+const EMAIL_PROPS: [&str; 12] = [
+    "id",
+    "threadId",
+    "mailboxIds",
+    "keywords",
+    "receivedAt",
+    "from",
+    "to",
+    "cc",
+    "subject",
+    "preview",
+    "size",
+    "hasAttachment",
+];
+
+/// Largest page for `Email/query` and chunk for `Email/get`.
+const PAGE: usize = 100;
+
+/// Times a paged query restarts after the server's query state moved.
+const MAX_RESTARTS: usize = 3;
+
+/// One `[name, args, call_id]` triple of a JMAP request or response.
+type Reply = (String, Value, String);
+
 /// The parts of the JMAP session resource Posto needs.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,18 +69,6 @@ pub struct Session {
     /// Login name.
     #[serde(default)]
     pub username: String,
-}
-
-/// A sending identity.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Identity {
-    /// Server-assigned id.
-    pub id: String,
-    /// Display name.
-    #[serde(default)]
-    pub name: String,
-    /// Sender address.
-    pub email: String,
 }
 
 /// An authenticated JMAP connection.
@@ -322,5 +338,624 @@ impl Client {
             total: created["totalEmails"].as_i64().unwrap_or(0),
             unread: created["unreadEmails"].as_i64().unwrap_or(0),
         })
+    }
+}
+
+/// Ids from a JSON string array; anything else yields an empty list.
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Keys of a JSON object whose value is `true`.
+fn true_keys(v: &Value) -> Vec<String> {
+    v.as_object()
+        .map(|o| {
+            o.iter()
+                .filter(|(_, v)| v.as_bool() == Some(true))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reads a required string property.
+fn str_of(v: &Value, key: &str) -> Result<String> {
+    v[key]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| Error::Jmap(format!("response missing {key}")))
+}
+
+fn addresses(v: &Value) -> Vec<Address> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    Some(Address {
+                        name: x["name"].as_str().map(String::from),
+                        email: x["email"].as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mailbox_from(account: &str, v: &Value) -> Result<Mailbox> {
+    Ok(Mailbox {
+        account_id: account.to_string(),
+        id: str_of(v, "id")?,
+        name: v["name"].as_str().unwrap_or_default().to_string(),
+        role: v["role"].as_str().map(String::from),
+        parent_id: v["parentId"].as_str().map(String::from),
+        sort_order: v["sortOrder"].as_i64().unwrap_or(0),
+        total: v["totalEmails"].as_i64().unwrap_or(0),
+        unread: v["unreadEmails"].as_i64().unwrap_or(0),
+    })
+}
+
+/// Collapses runs of whitespace (including newlines) into single spaces, trims the ends,
+/// and drops invisible format characters (zero-width spaces/joiners, soft hyphen, BOM,
+/// combining grapheme joiner) that newsletters use to pad preheader text.
+fn squash_ws(s: &str) -> String {
+    let invisible = |c: char| {
+        matches!(
+            c,
+            '\u{00AD}' | '\u{034F}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+        )
+    };
+    s.replace(invisible, "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn email_from(account: &str, v: &Value) -> Result<EmailSummary> {
+    Ok(EmailSummary {
+        account_id: account.to_string(),
+        id: str_of(v, "id")?,
+        thread_id: v["threadId"].as_str().unwrap_or_default().to_string(),
+        received_at: v["receivedAt"].as_str().unwrap_or_default().to_string(),
+        from: addresses(&v["from"]),
+        to: addresses(&v["to"]),
+        cc: addresses(&v["cc"]),
+        subject: v["subject"].as_str().unwrap_or_default().to_string(),
+        preview: squash_ws(v["preview"].as_str().unwrap_or_default()),
+        size: v["size"].as_i64().unwrap_or(0),
+        has_attachment: v["hasAttachment"].as_bool().unwrap_or(false),
+        mailbox_ids: true_keys(&v["mailboxIds"]),
+        keywords: true_keys(&v["keywords"]),
+    })
+}
+
+fn attachment(v: &Value) -> Attachment {
+    Attachment {
+        blob_id: v["blobId"].as_str().unwrap_or_default().to_string(),
+        name: v["name"].as_str().unwrap_or("attachment").to_string(),
+        mime: v["type"].as_str().unwrap_or_default().to_string(),
+        size: v["size"].as_i64().unwrap_or(0),
+    }
+}
+
+/// Concatenates the values of the `mime` parts listed under `key`, if any.
+fn joined(email: &Value, key: &str, mime: &str) -> Option<String> {
+    let parts: Vec<&Value> = email[key]
+        .as_array()?
+        .iter()
+        .filter(|p| p["type"].as_str() == Some(mime))
+        .collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(
+        parts
+            .iter()
+            .filter_map(|p| email["bodyValues"][p["partId"].as_str()?]["value"].as_str())
+            .collect(),
+    )
+}
+
+/// Finds the first response named `name` with call id `id`, with its index.
+fn find<'a>(rs: &'a [Reply], name: &str, id: &str) -> Option<(usize, &'a Value)> {
+    rs.iter()
+        .enumerate()
+        .find(|(_, (n, _, i))| n == name && i == id)
+        .map(|(idx, (_, args, _))| (idx, args))
+}
+
+/// Fetches mailboxes by id; `None` fetches all of them.
+async fn get_mailboxes(
+    client: &Client,
+    account: &str,
+    ids: Option<&[String]>,
+) -> Result<(Vec<Mailbox>, String)> {
+    let r = client
+        .call_one(
+            "Mailbox/get",
+            json!({ "accountId": client.session().account_id, "ids": ids }),
+        )
+        .await?;
+    let list = r["list"].as_array().map(Vec::as_slice).unwrap_or_default();
+
+    Ok((
+        list.iter()
+            .map(|v| mailbox_from(account, v))
+            .collect::<Result<_>>()?,
+        str_of(&r, "state")?,
+    ))
+}
+
+/// Replaces the mailbox table of `account` with the server's full list.
+async fn replace_mailboxes(store: &Store, account: &str, client: &Client) -> Result<()> {
+    let (boxes, state) = get_mailboxes(client, account, None).await?;
+    let stale: Vec<String> = store
+        .mailboxes(account)?
+        .into_iter()
+        .map(|m| m.id)
+        .filter(|id| !boxes.iter().any(|m| m.id == *id))
+        .collect();
+
+    store.delete_mailboxes(account, &stale)?;
+    store.upsert_mailboxes(&boxes)?;
+    store.set_account_state(account, "mailbox_state", &state)
+}
+
+/// Fetches summaries for `ids` in chunks, in request order.
+async fn fetch_summaries(
+    client: &Client,
+    account: &str,
+    ids: &[String],
+) -> Result<Vec<EmailSummary>> {
+    let mut emails = Vec::with_capacity(ids.len());
+
+    for chunk in ids.chunks(PAGE) {
+        let r = client
+            .call_one(
+                "Email/get",
+                json!({
+                    "accountId": client.session().account_id,
+                    "ids": chunk,
+                    "properties": EMAIL_PROPS,
+                }),
+            )
+            .await?;
+        let list = r["list"].as_array().map(Vec::as_slice).unwrap_or_default();
+
+        for v in list {
+            emails.push(email_from(account, v)?);
+        }
+    }
+
+    Ok(emails)
+}
+
+/// Collects up to `limit` newest email ids, restarting if the query changes.
+async fn query_ids(client: &Client, limit: usize) -> Result<Vec<String>> {
+    let mut restarts = 0;
+
+    'restart: loop {
+        let mut ids: Vec<String> = Vec::new();
+        let mut first_state: Option<String> = None;
+
+        while ids.len() < limit {
+            let r = client
+                .call_one(
+                    "Email/query",
+                    json!({
+                        "accountId": client.session().account_id,
+                        "sort": [{ "property": "receivedAt", "isAscending": false }],
+                        "calculateTotal": false,
+                        "position": ids.len(),
+                        "limit": PAGE.min(limit - ids.len()),
+                    }),
+                )
+                .await?;
+            let query_state = str_of(&r, "queryState")?;
+
+            match &first_state {
+                None => first_state = Some(query_state),
+                Some(s) if *s != query_state && restarts < MAX_RESTARTS => {
+                    restarts += 1;
+                    continue 'restart;
+                }
+                // ponytail: after the restart budget, keep paging this pass even
+                // though the snapshot moved; a later delta repairs any drift
+                Some(_) => {}
+            }
+
+            let page = strings(&r["ids"]);
+
+            // A server may clamp the page size, so only an empty page ends paging.
+            if page.is_empty() {
+                break;
+            }
+
+            ids.extend(page);
+        }
+
+        ids.truncate(limit);
+
+        return Ok(ids);
+    }
+}
+
+/// Step (a) of a send: the id of the email created in Drafts.
+fn created_id(client: &Client, rs: &[Reply]) -> Result<String> {
+    let Some((_, r)) = find(rs, "Email/set", "0") else {
+        return Err(Error::Jmap(match find(rs, "error", "0") {
+            Some((_, e)) => client.describe(e),
+            None => "no create response".into(),
+        }));
+    };
+
+    if let Some(e) = r["notCreated"].get("d") {
+        return Err(Error::Jmap(format!("create: {}", client.describe(e))));
+    }
+
+    r["created"]["d"]["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| Error::Jmap("create: no id returned".into()))
+}
+
+/// Step (b) of a send: the submission was accepted.
+fn check_submission(client: &Client, rs: &[Reply]) -> Result<()> {
+    let Some((_, r)) = find(rs, "EmailSubmission/set", "1") else {
+        return Err(Error::Jmap(match find(rs, "error", "1") {
+            Some((_, e)) => client.redact(e["type"].as_str().unwrap_or("unknown")),
+            None => "no submission response".into(),
+        }));
+    };
+
+    match r["notCreated"].get("s") {
+        Some(e) => Err(Error::Jmap(format!("submit: {}", client.describe(e)))),
+        None => Ok(()),
+    }
+}
+
+/// Step (c) of a send: the implicit `Email/set` after the submission moved the
+/// email. The mail is already sent, so every failure here is [`Error::Other`].
+fn check_moved_to_sent(client: &Client, rs: &[Reply], id: &str) -> Result<()> {
+    let fail = |detail: String| {
+        Err(Error::Other(format!(
+            "sent as {id}, but moving to Sent failed: {detail}"
+        )))
+    };
+    let submission = find(rs, "EmailSubmission/set", "1").map_or(0, |(idx, _)| idx);
+    let after = |name: &str| {
+        rs.iter()
+            .skip(submission + 1)
+            .find(|(n, _, i)| n == name && i == "1")
+            .map(|(_, args, _)| args)
+    };
+
+    if let Some(r) = after("Email/set") {
+        return match r["notUpdated"].get(id) {
+            Some(e) => fail(client.describe(e)),
+            None => Ok(()),
+        };
+    }
+
+    match after("error") {
+        Some(e) => fail(client.describe(e)),
+        None => fail("no update response".into()),
+    }
+}
+
+/// The provider operations behind [`crate::provider::Connection`].
+impl Client {
+    /// Mirrors the server's mailboxes into the store: `Mailbox/changes` from
+    /// the `mailbox_state` cursor, or a full replace when there is none or the
+    /// server cannot calculate the changes.
+    pub(crate) async fn sync_mailboxes(&self, store: &Store, account: &str) -> Result<()> {
+        let Some(mut since) = get_state(store, account, "mailbox_state")? else {
+            return replace_mailboxes(store, account, self).await;
+        };
+
+        loop {
+            let r = match self
+                .call_one(
+                    "Mailbox/changes",
+                    json!({ "accountId": self.session().account_id, "sinceState": since }),
+                )
+                .await
+            {
+                Err(Error::Jmap(m)) if m.starts_with("cannotCalculateChanges") => {
+                    return replace_mailboxes(store, account, self).await;
+                }
+                other => other?,
+            };
+            let changed: Vec<String> = [&r["created"], &r["updated"]]
+                .into_iter()
+                .flat_map(strings)
+                .collect();
+
+            if !changed.is_empty() {
+                store.upsert_mailboxes(&get_mailboxes(self, account, Some(&changed)).await?.0)?;
+            }
+
+            store.delete_mailboxes(account, &strings(&r["destroyed"]))?;
+
+            since = str_of(&r, "newState")?;
+            store.set_account_state(account, "mailbox_state", &since)?;
+
+            if r["hasMoreChanges"].as_bool() != Some(true) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The `limit` newest emails and the email state captured before paging, so
+    /// changes made during paging show up in the next delta.
+    pub(crate) async fn initial(
+        &self,
+        account: &str,
+        limit: usize,
+    ) -> Result<(Vec<EmailSummary>, String)> {
+        let s0 = self
+            .call_one(
+                "Email/get",
+                json!({ "accountId": self.session().account_id, "ids": [] }),
+            )
+            .await?;
+        let s0 = str_of(&s0, "state")?;
+        let ids = query_ids(self, limit).await?;
+
+        Ok((fetch_summaries(self, account, &ids).await?, s0))
+    }
+
+    /// One `Email/changes` page after `since`; [`Delta::Resync`] when the
+    /// server can no longer calculate changes from it.
+    pub(crate) async fn delta(&self, account: &str, since: &str) -> Result<Delta> {
+        let r = match self
+            .call_one(
+                "Email/changes",
+                json!({
+                    "accountId": self.session().account_id,
+                    "sinceState": since,
+                    "maxChanges": 500,
+                }),
+            )
+            .await
+        {
+            Err(Error::Jmap(m)) if m.starts_with("cannotCalculateChanges") => {
+                return Ok(Delta::Resync);
+            }
+            other => other?,
+        };
+        let changed: Vec<String> = [&r["created"], &r["updated"]]
+            .into_iter()
+            .flat_map(strings)
+            .collect();
+
+        Ok(Delta::Page(DeltaPage {
+            emails: fetch_summaries(self, account, &changed).await?,
+            destroyed: strings(&r["destroyed"]),
+            state: str_of(&r, "newState")?,
+            more: r["hasMoreChanges"].as_bool() == Some(true),
+            mailboxes_changed: false,
+        }))
+    }
+
+    /// The body of `email_id`; `None` when the server does not know the email.
+    pub(crate) async fn body(&self, email_id: &str) -> Result<Option<EmailBody>> {
+        let r = self
+            .call_one(
+                "Email/get",
+                json!({
+                    "accountId": self.session().account_id,
+                    "ids": [email_id],
+                    "properties": [
+                        "textBody", "htmlBody", "bodyValues", "attachments",
+                        "inReplyTo", "references", "messageId",
+                    ],
+                    "fetchHTMLBodyValues": true,
+                    "fetchTextBodyValues": true,
+                    "maxBodyValueBytes": 2_000_000,
+                }),
+            )
+            .await?;
+        let Some(email) = r["list"].get(0) else {
+            return Ok(None);
+        };
+
+        Ok(Some(EmailBody {
+            email_id: email_id.to_string(),
+            html: joined(email, "htmlBody", "text/html"),
+            text: joined(email, "textBody", "text/plain"),
+            attachments: email["attachments"]
+                .as_array()
+                .map(|a| a.iter().map(attachment).collect())
+                .unwrap_or_default(),
+            in_reply_to: strings(&email["inReplyTo"]),
+            references: strings(&email["references"]),
+            message_id: strings(&email["messageId"]),
+        }))
+    }
+
+    /// Applies `change` to `ids` with one `Email/set`; `refused` holds the
+    /// keys of `notUpdated`.
+    pub(crate) async fn update(&self, ids: &[String], change: &Change) -> Result<Updated> {
+        let patch = match change {
+            Change::Mailbox(id) => json!({ "mailboxIds": { id: true } }),
+            Change::Patch { add, remove } => {
+                // Removals first so an id in both lists ends up added.
+                let mut patch = Map::new();
+
+                for id in remove {
+                    patch.insert(format!("mailboxIds/{id}"), Value::Null);
+                }
+
+                for id in add {
+                    patch.insert(format!("mailboxIds/{id}"), Value::Bool(true));
+                }
+
+                Value::Object(patch)
+            }
+            Change::Keyword(k, on) => json!({ format!("keywords/{k}"): on.then_some(true) }),
+        };
+        let update: Map<String, Value> = ids.iter().map(|id| (id.clone(), patch.clone())).collect();
+        let r = self
+            .call_one(
+                "Email/set",
+                json!({ "accountId": self.session().account_id, "update": update }),
+            )
+            .await?;
+
+        Ok(Updated {
+            refused: r["notUpdated"]
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Destroys `ids` with `Email/set`; returns those the server did not refuse.
+    pub(crate) async fn destroy(&self, ids: &[String]) -> Result<Vec<String>> {
+        let r = self
+            .call_one(
+                "Email/set",
+                json!({ "accountId": self.session().account_id, "destroy": ids }),
+            )
+            .await?;
+        let mut gone = ids.to_vec();
+
+        if let Some(refused) = r["notDestroyed"].as_object() {
+            gone.retain(|id| !refused.contains_key(id));
+        }
+
+        Ok(gone)
+    }
+
+    /// Whether the email has a non-empty `List-Unsubscribe` header; a failed
+    /// fetch counts as no.
+    pub(crate) async fn has_unsubscribe(&self, id: &str) -> bool {
+        const HEADER: &str = "header:List-Unsubscribe:asText";
+
+        self.call_one(
+            "Email/get",
+            json!({
+                "accountId": self.session().account_id,
+                "ids": [id],
+                "properties": [HEADER],
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|r| r["list"][0][HEADER].as_str().map(|h| !h.trim().is_empty()))
+        .unwrap_or(false)
+    }
+
+    /// Creates the email in Drafts, submits it, and moves it to Sent, in one
+    /// request. Returns the new email id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when the Drafts or Sent mailbox is unknown,
+    /// and [`Error::Jmap`] when the server refuses to create or submit the
+    /// email. Once the mail is submitted, a failed move to Sent is reported as
+    /// [`Error::Other`]; callers must not resend then.
+    pub(crate) async fn send(
+        &self,
+        store: &Store,
+        account: &str,
+        identity: &Identity,
+        draft: &Draft,
+        text: &str,
+        html: &str,
+    ) -> Result<String> {
+        let drafts = store
+            .mailbox_by_role(account, "drafts")?
+            .ok_or_else(|| Error::NotFound("drafts mailbox".into()))?;
+        let sent = store
+            .mailbox_by_role(account, "sent")?
+            .ok_or_else(|| Error::NotFound("sent mailbox".into()))?;
+        let server_account = &self.session().account_id;
+
+        let mut email = json!({
+            "mailboxIds": { &drafts.id: true },
+            "keywords": { "$seen": true, "$draft": true },
+            "from": [{ "name": identity.name, "email": identity.email }],
+            "to": draft.to,
+            "subject": draft.subject,
+            "bodyStructure": {
+                "type": "multipart/alternative",
+                "subParts": [
+                    { "partId": "t", "type": "text/plain" },
+                    { "partId": "h", "type": "text/html" },
+                ],
+            },
+            "bodyValues": { "t": { "value": text }, "h": { "value": html } },
+        });
+
+        if !draft.cc.is_empty() {
+            email["cc"] = json!(draft.cc);
+        }
+
+        if !draft.bcc.is_empty() {
+            email["bcc"] = json!(draft.bcc);
+        }
+
+        if let Some(id) = &draft.in_reply_to {
+            email["inReplyTo"] = json!([id]);
+        }
+
+        if !draft.references.is_empty() {
+            email["references"] = json!(draft.references);
+        }
+
+        let responses = self
+            .call(vec![
+                (
+                    "Email/set".into(),
+                    json!({ "accountId": server_account, "create": { "d": email } }),
+                    "0".into(),
+                ),
+                (
+                    "EmailSubmission/set".into(),
+                    json!({
+                        "accountId": server_account,
+                        "create": { "s": { "identityId": identity.id, "emailId": "#d" } },
+                        "onSuccessUpdateEmail": { "#s": {
+                            format!("mailboxIds/{}", drafts.id): null,
+                            format!("mailboxIds/{}", sent.id): true,
+                            "keywords/$draft": null,
+                        } },
+                    }),
+                    "1".into(),
+                ),
+            ])
+            .await?;
+
+        let id = created_id(self, &responses)?;
+
+        check_submission(self, &responses)?;
+        check_moved_to_sent(self, &responses, &id)?;
+
+        Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_whitespace_is_squashed() {
+        let v = json!({"id": "e1", "preview": "COMING UP      \n\t soon   "});
+        assert_eq!(email_from("a", &v).unwrap().preview, "COMING UP soon");
+        let v = json!({"id": "e2", "preview": "\u{034f}   \u{200b}\u{feff}🚨 Joshua, polls\u{00ad} close"});
+        assert_eq!(
+            email_from("a", &v).unwrap().preview,
+            "🚨 Joshua, polls close"
+        );
     }
 }

@@ -4,6 +4,7 @@ use posto_core::Error;
 use posto_core::compose::{Draft, send};
 use posto_core::config::{Account, Config};
 use posto_core::jmap::Client;
+use posto_core::provider::Connection;
 use posto_core::store::{Address, EmailSummary, Mailbox, Store};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
@@ -27,10 +28,12 @@ async fn server() -> MockServer {
     server
 }
 
-async fn client(server: &MockServer) -> Client {
-    Client::connect(&format!("{}/session", server.uri()), "tok")
-        .await
-        .unwrap()
+async fn client(server: &MockServer) -> Connection {
+    Connection::Jmap(
+        Client::connect(&format!("{}/session", server.uri()), "tok")
+            .await
+            .unwrap(),
+    )
 }
 
 /// Mounts `responses` for POSTs whose body contains `needle`.

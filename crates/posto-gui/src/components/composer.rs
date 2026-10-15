@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 use posto_core::compose::{self, Draft};
-use posto_core::jmap::Identity;
+use posto_core::provider::Identity;
 use posto_core::store::Address;
 
 use crate::app::{

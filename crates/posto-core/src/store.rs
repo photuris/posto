@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::jmap::Identity;
+use crate::provider::Identity;
 
 /// Version of the table layout below; stored in `sync_state` as `schema_version`.
 const SCHEMA_VERSION: u32 = 5;
@@ -1878,6 +1878,36 @@ impl Store {
 
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+
+    /// Sets `total` and `unread` of every mailbox of `account` from the cached
+    /// emails (the same figures as [`Store::counts`]); mailboxes without rows
+    /// get 0. For providers that report no counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn recount_mailboxes(&self, account: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            &format!(
+                "UPDATE mailboxes SET \
+                 total = (SELECT COUNT(*) FROM email_mailboxes em \
+                     WHERE em.account_id = mailboxes.account_id \
+                     AND em.mailbox_id = mailboxes.id), \
+                 unread = (SELECT COUNT(*) FROM email_mailboxes em JOIN emails e \
+                         ON e.account_id = em.account_id AND e.id = em.email_id \
+                     WHERE em.account_id = mailboxes.account_id \
+                     AND em.mailbox_id = mailboxes.id AND {UNREAD_SQL}) \
+                 WHERE account_id = ?1"
+            ),
+            [account],
+        )?;
+        tx.commit()?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2333,6 +2363,60 @@ mod tests {
             "b"
         );
         assert_eq!(store.search(Some("b"), "alpha", 0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn recount_mailboxes_counts_cached_rows() {
+        let store = Store::open_memory().unwrap();
+        let stored = |account: &str, id: &str| Mailbox {
+            account_id: account.into(),
+            total: 9,
+            unread: 9,
+            ..mailbox(id, id, None)
+        };
+        let mut e2 = email("e2", "2026-10-01T10:00:00Z", "two", &["inbox", "promos"]);
+
+        e2.keywords = vec!["$seen".into()];
+
+        store
+            .upsert_mailboxes(&[
+                stored("a", "inbox"),
+                stored("a", "promos"),
+                stored("a", "empty"),
+                stored("b", "inbox"),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                email("e1", "2026-10-01T09:00:00Z", "one", &["inbox"]),
+                e2,
+                email("e3", "2026-10-01T11:00:00Z", "three", &["promos"]),
+            ])
+            .unwrap();
+        store.recount_mailboxes("a").unwrap();
+
+        let counts = |account: &str| -> Vec<(String, i64, i64)> {
+            let mut v: Vec<_> = store
+                .mailboxes(account)
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.id, m.total, m.unread))
+                .collect();
+
+            v.sort();
+
+            v
+        };
+
+        assert_eq!(
+            counts("a"),
+            [
+                ("empty".to_string(), 0, 0),
+                ("inbox".to_string(), 2, 1),
+                ("promos".to_string(), 2, 1),
+            ]
+        );
+        assert_eq!(counts("b"), [("inbox".to_string(), 9, 9)]);
     }
 
     #[test]

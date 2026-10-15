@@ -11,7 +11,7 @@ use posto_core::body::{fetch_body, save_attachment};
 use posto_core::classify::{self, JEV_BASE_URL, JevClient, Tray};
 use posto_core::compose::{self, Draft};
 use posto_core::config::{Account, Config, Secrets};
-use posto_core::jmap::Client;
+use posto_core::provider::Connection;
 use posto_core::shortcuts::{self, Keymap};
 use posto_core::store::{
     CLASSIFY_MAX_ATTEMPTS, EmailBody, EmailSummary, ListQuery, Mailbox, Store,
@@ -49,15 +49,15 @@ fn scope(cfg: &Config, flag: Option<&str>) -> Result<Vec<String>> {
 }
 
 /// Connects with the account's stored token; no token is `NotConfigured`.
-async fn client_for(cfg: &Config, account: &Account) -> Result<Client> {
+async fn client_for(cfg: &Config, account: &Account) -> Result<Connection> {
     let token = Secrets::token_for(cfg, &account.id)?
         .ok_or_else(|| Error::NotConfigured(format!("token for account {}", account.id)))?;
 
-    Client::connect(&account.session_url, &token).await
+    Connection::connect_jmap(&account.session_url, &token).await
 }
 
 /// `None` when the account has no token, so local-only commands keep working offline.
-async fn optional_client(cfg: &Config, account: &Account) -> Result<Option<Client>> {
+async fn optional_client(cfg: &Config, account: &Account) -> Result<Option<Connection>> {
     match Secrets::token_for(cfg, &account.id)? {
         None => Ok(None),
         Some(_) => client_for(cfg, account).await.map(Some),
@@ -270,8 +270,8 @@ fn targets(cfg: &Config, account: Option<&str>) -> Result<Vec<Account>> {
 async fn connect_clients(
     cfg: &Config,
     targets: &[Account],
-) -> Result<(HashMap<String, Arc<Client>>, HashMap<String, String>)> {
-    let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
+) -> Result<(HashMap<String, Arc<Connection>>, HashMap<String, String>)> {
+    let mut clients: HashMap<String, Arc<Connection>> = HashMap::new();
     let mut unreachable: HashMap<String, String> = HashMap::new();
 
     for a in targets {
@@ -300,7 +300,7 @@ async fn sync_targets(
     cfg: &Config,
     store: &Store,
     targets: &[Account],
-) -> Result<(Vec<sync::SyncReport>, HashMap<String, Arc<Client>>)> {
+) -> Result<(Vec<sync::SyncReport>, HashMap<String, Arc<Connection>>)> {
     if let [only] = targets {
         let client = Arc::new(client_for(cfg, only).await?);
         let report = sync::sync_account(&sync::lock_path(), cfg, &only.id, store, &client).await?;
@@ -609,7 +609,7 @@ pub async fn attachment_save(
 
     std::fs::create_dir_all(&dir)?;
 
-    Ok(json!({ "path": save_attachment(&client, att, &dir).await? }))
+    Ok(json!({ "path": save_attachment(&client, &email.id, att, &dir).await? }))
 }
 
 pub fn theme_show() -> Result<Value> {
@@ -859,7 +859,7 @@ pub async fn classify_correct(account: Option<&str>, id: &str, tray: &str) -> Re
             Err(e) => return Err(e),
         };
     let offline = client.is_none();
-    let clients: HashMap<String, Arc<Client>> = client
+    let clients: HashMap<String, Arc<Connection>> = client
         .map(|c| (email.account_id.clone(), Arc::new(c)))
         .into_iter()
         .collect();

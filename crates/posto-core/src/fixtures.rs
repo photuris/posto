@@ -1,7 +1,7 @@
 //! Deterministic sample data for tests and the GUI's UI test mode.
 
 use crate::error::Result;
-use crate::jmap::Identity;
+use crate::provider::Identity;
 use crate::store::{Address, Attachment, Classified, EmailBody, EmailSummary, Mailbox, Store};
 
 /// Account the fixtures belong to: the id of a fresh config's only account.

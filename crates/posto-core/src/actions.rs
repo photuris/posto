@@ -1,9 +1,7 @@
 //! Email actions: applied on the server first, then mirrored in the store.
 
-use serde_json::{Map, Value, json};
-
 use crate::error::{Error, Result};
-use crate::jmap::Client;
+use crate::provider::{Change, Connection};
 use crate::store::Store;
 
 /// Something to do to one or more emails.
@@ -42,19 +40,6 @@ pub enum Action {
     Destroy,
 }
 
-/// What an action changes.
-enum Change {
-    /// Replace the mailbox set.
-    Mailbox(String),
-    /// Join and leave individual mailboxes.
-    Patch {
-        add: Vec<String>,
-        remove: Vec<String>,
-    },
-    /// Add (`true`) or remove (`false`) a keyword.
-    Keyword(&'static str, bool),
-}
-
 /// True when `id` is in the trash mailbox and nowhere else.
 ///
 /// # Errors
@@ -74,23 +59,14 @@ pub fn in_trash(store: &Store, account: &str, id: &str) -> Result<bool> {
 /// Destroys `ids` on the server (when `client` is given) and in the store.
 async fn destroy(
     store: &Store,
-    client: Option<&Client>,
+    client: Option<&Connection>,
     account: &str,
     ids: &[String],
 ) -> Result<usize> {
     let mut gone: Vec<String> = ids.to_vec();
 
     if let Some(client) = client.filter(|_| !ids.is_empty()) {
-        let r = client
-            .call_one(
-                "Email/set",
-                json!({ "accountId": client.session().account_id, "destroy": ids }),
-            )
-            .await?;
-
-        if let Some(refused) = r["notDestroyed"].as_object() {
-            gone.retain(|id| !refused.contains_key(id));
-        }
+        gone = client.destroy(ids).await?;
     }
 
     // Without a client, only emails the store knows are counted.
@@ -128,7 +104,7 @@ fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
 /// Applies `action` to `ids` of `account` on the server (when `client` is given)
 /// and in the store. `client` must be the connection of `account`.
 ///
-/// Ids the server refuses (`notUpdated`) are neither mirrored nor counted.
+/// Ids the server refuses are neither mirrored nor counted.
 /// Without a client, only emails the store knows are counted.
 ///
 /// A [`Action::PatchMailboxes`] never leaves an email without a mailbox: ids
@@ -138,17 +114,40 @@ fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
 /// server answered, skipping and not counting an id whose result would be empty
 /// (another writer changed the row meanwhile; the next sync reconciles).
 ///
+/// An account whose sync state says `provider = proton` (connection or not)
+/// follows Proton's folder rules. A message sits in at most one folder (a
+/// mailbox with a role) and any number of labels (no role); an id unknown to
+/// the store counts as a folder. [`Action::Destroy`] is refused, and so is a
+/// move to a label, both before anything is sent. A move to a folder keeps the
+/// message's labels. A patch that adds a folder drops every other folder from
+/// the mirror (the last folder in `add` wins), as the server does.
+///
 /// # Errors
 ///
-/// Returns [`Error::NotFound`] when a required role mailbox is missing, and
-/// any network, server or database error.
+/// Returns [`Error::NotFound`] when a required role mailbox is missing,
+/// [`Error::Unsupported`] for the refused Proton actions, and any network,
+/// server or database error.
 pub async fn apply(
     store: &Store,
-    client: Option<&Client>,
+    client: Option<&Connection>,
     account: &str,
     ids: &[String],
     action: Action,
 ) -> Result<usize> {
+    let proton = store.account_state(account, "provider")?.as_deref() == Some("proton");
+    let mailboxes = if proton {
+        store.mailboxes(account)?
+    } else {
+        Vec::new()
+    };
+    let is_label = |id: &str| mailboxes.iter().any(|m| m.id == id && m.role.is_none());
+
+    if proton && action == Action::Destroy {
+        return Err(Error::Unsupported(
+            "permanent delete on Proton accounts".into(),
+        ));
+    }
+
     let change = match action {
         Action::Destroy => return destroy(store, client, account, ids).await,
         Action::Archive => role_mailbox(store, account, "archive")?,
@@ -162,6 +161,16 @@ pub async fn apply(
         Action::Unflag => Change::Keyword("$flagged", false),
         Action::MarkAnswered => Change::Keyword("$answered", true),
     };
+
+    if let Change::Mailbox(target) = &change
+        && proton
+        && is_label(target)
+    {
+        return Err(Error::Unsupported(
+            "moving to a label on Proton accounts".into(),
+        ));
+    }
+
     let mut refused: Vec<String> = Vec::new();
     let ids: Vec<String> = match &change {
         Change::Patch { add, remove } => {
@@ -183,35 +192,7 @@ pub async fn apply(
     };
 
     if let Some(client) = client.filter(|_| !ids.is_empty()) {
-        let patch = match &change {
-            Change::Mailbox(id) => json!({ "mailboxIds": { id: true } }),
-            Change::Patch { add, remove } => {
-                // Removals first so an id in both lists ends up added.
-                let mut patch = Map::new();
-
-                for id in remove {
-                    patch.insert(format!("mailboxIds/{id}"), Value::Null);
-                }
-
-                for id in add {
-                    patch.insert(format!("mailboxIds/{id}"), Value::Bool(true));
-                }
-
-                Value::Object(patch)
-            }
-            Change::Keyword(k, on) => json!({ format!("keywords/{k}"): on.then_some(true) }),
-        };
-        let update: Map<String, Value> = ids.iter().map(|id| (id.clone(), patch.clone())).collect();
-        let r = client
-            .call_one(
-                "Email/set",
-                json!({ "accountId": client.session().account_id, "update": update }),
-            )
-            .await?;
-
-        if let Some(not_updated) = r["notUpdated"].as_object() {
-            refused = not_updated.keys().cloned().collect();
-        }
+        refused = client.update(&ids, &change).await?.refused;
     }
 
     let mut applied = 0;
@@ -226,16 +207,27 @@ pub async fn apply(
 
         match &change {
             Change::Mailbox(target) => {
-                store.set_mailbox_ids(account, id, std::slice::from_ref(target))?
+                let mut mirror = vec![target.clone()];
+
+                if proton {
+                    mirror.extend(email.mailbox_ids.iter().filter(|m| is_label(m)).cloned());
+                }
+
+                store.set_mailbox_ids(account, id, &mirror)?
             }
             Change::Patch { add, remove } => {
-                let mailboxes = patched(&email.mailbox_ids, add, remove);
+                let mut mirror = patched(&email.mailbox_ids, add, remove);
 
-                if mailboxes.is_empty() {
+                // The server keeps one folder: the last folder added.
+                if proton && let Some(keep) = add.iter().rev().find(|m| !is_label(m)) {
+                    mirror.retain(|m| is_label(m) || m == keep);
+                }
+
+                if mirror.is_empty() {
                     continue;
                 }
 
-                store.set_mailbox_ids(account, id, &mailboxes)?
+                store.set_mailbox_ids(account, id, &mirror)?
             }
             Change::Keyword(k, on) => {
                 email.keywords.retain(|x| x != k);

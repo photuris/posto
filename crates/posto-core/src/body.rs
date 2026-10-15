@@ -2,14 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
-
 use crate::error::{Error, Result};
-use crate::jmap::Client;
+use crate::provider::Connection;
 use crate::store::{Attachment, EmailBody, Store};
 
-/// Returns the cached body of `email_id` in `account`, or fetches it with
-/// `Email/get` (through that account's `client`) and caches it.
+/// Returns the cached body of `email_id` in `account`, or fetches it through
+/// that account's `client` and caches it.
 ///
 /// # Errors
 ///
@@ -17,7 +15,7 @@ use crate::store::{Attachment, EmailBody, Store};
 /// is no client or the server does not know the email.
 pub async fn fetch_body(
     store: &Store,
-    client: Option<&Client>,
+    client: Option<&Connection>,
     account: &str,
     email_id: &str,
 ) -> Result<EmailBody> {
@@ -26,80 +24,14 @@ pub async fn fetch_body(
     }
 
     let client = client.ok_or_else(|| Error::NotFound(email_id.to_string()))?;
-    let r = client
-        .call_one(
-            "Email/get",
-            json!({
-                "accountId": client.session().account_id,
-                "ids": [email_id],
-                "properties": [
-                    "textBody", "htmlBody", "bodyValues", "attachments",
-                    "inReplyTo", "references", "messageId",
-                ],
-                "fetchHTMLBodyValues": true,
-                "fetchTextBodyValues": true,
-                "maxBodyValueBytes": 2_000_000,
-            }),
-        )
-        .await?;
-    let email = r["list"]
-        .get(0)
+    let body = client
+        .body(email_id)
+        .await?
         .ok_or_else(|| Error::NotFound(email_id.to_string()))?;
-    let body = EmailBody {
-        email_id: email_id.to_string(),
-        html: joined(email, "htmlBody", "text/html"),
-        text: joined(email, "textBody", "text/plain"),
-        attachments: email["attachments"]
-            .as_array()
-            .map(|a| a.iter().map(attachment).collect())
-            .unwrap_or_default(),
-        in_reply_to: strings(&email["inReplyTo"]),
-        references: strings(&email["references"]),
-        message_id: strings(&email["messageId"]),
-    };
 
     store.put_body(account, &body)?;
 
     Ok(body)
-}
-
-fn strings(v: &Value) -> Vec<String> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn attachment(v: &Value) -> Attachment {
-    Attachment {
-        blob_id: v["blobId"].as_str().unwrap_or_default().to_string(),
-        name: v["name"].as_str().unwrap_or("attachment").to_string(),
-        mime: v["type"].as_str().unwrap_or_default().to_string(),
-        size: v["size"].as_i64().unwrap_or(0),
-    }
-}
-
-/// Concatenates the values of the `mime` parts listed under `key`, if any.
-fn joined(email: &Value, key: &str, mime: &str) -> Option<String> {
-    let parts: Vec<&Value> = email[key]
-        .as_array()?
-        .iter()
-        .filter(|p| p["type"].as_str() == Some(mime))
-        .collect();
-
-    if parts.is_empty() {
-        return None;
-    }
-
-    Some(
-        parts
-            .iter()
-            .filter_map(|p| email["bodyValues"][p["partId"].as_str()?]["value"].as_str())
-            .collect(),
-    )
 }
 
 /// Makes a server-supplied file name safe to use as a single path component.
@@ -122,15 +54,19 @@ fn sanitise(name: &str) -> String {
     }
 }
 
-/// Downloads `att` into `dir`, never overwriting: collisions get ` (2)`, ` (3)`, ...
+/// Downloads `att` of email `email_id` into `dir`, never overwriting:
+/// collisions get ` (2)`, ` (3)`, ...
 ///
 /// # Errors
 ///
 /// Returns an error when the download or the write fails.
-pub async fn save_attachment(client: &Client, att: &Attachment, dir: &Path) -> Result<PathBuf> {
-    let data = client
-        .download_blob(&att.blob_id, &att.name, &att.mime)
-        .await?;
+pub async fn save_attachment(
+    client: &Connection,
+    email_id: &str,
+    att: &Attachment,
+    dir: &Path,
+) -> Result<PathBuf> {
+    let data = client.download(email_id, att).await?;
     let name = PathBuf::from(sanitise(&att.name));
     let stem = name
         .file_stem()

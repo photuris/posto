@@ -270,8 +270,15 @@ pub fn Reader() -> Element {
                                 onclick: {
                                     let att = att.clone();
                                     let account_id = email.account_id.clone();
+                                    let email_id = email.id.clone();
 
-                                    move |_| save_attachment(account_id.clone(), att.clone())
+                                    move |_| {
+                                        save_attachment(
+                                            account_id.clone(),
+                                            email_id.clone(),
+                                            att.clone(),
+                                        )
+                                    }
                                 },
                                 span { class: "att-name", {format::clip(&att.name, 34)} }
                                 span { class: "att-size", {format::size(att.size)} }

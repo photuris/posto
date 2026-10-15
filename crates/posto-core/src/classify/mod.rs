@@ -40,7 +40,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 pub use jev::{Classification, Classifier, JEV_BASE_URL, JevClient};
 
@@ -48,7 +47,7 @@ use crate::actions::{Action, apply};
 use crate::body::fetch_body;
 use crate::config::{Config, data_dir};
 use crate::error::{Error, Result};
-use crate::jmap::Client;
+use crate::provider::Connection;
 use crate::store::{CLASSIFY_MAX_ATTEMPTS, Classified, MsgRef, QueueRow, Store};
 
 /// A mailbox category Jev sorts mail into.
@@ -148,7 +147,7 @@ pub fn lock_path() -> PathBuf {
 pub async fn run<C: Classifier>(
     cfg: &Config,
     store: &Store,
-    clients: &HashMap<String, Arc<Client>>,
+    clients: &HashMap<String, Arc<Connection>>,
     classifier: &C,
     limit: Option<usize>,
 ) -> ClassifyReport {
@@ -165,7 +164,7 @@ pub async fn run_with_lock<C: Classifier>(
     lock_path: &Path,
     cfg: &Config,
     store: &Store,
-    clients: &HashMap<String, Arc<Client>>,
+    clients: &HashMap<String, Arc<Connection>>,
     classifier: &C,
     limit: Option<usize>,
 ) -> ClassifyReport {
@@ -205,7 +204,7 @@ pub async fn run_with_lock<C: Classifier>(
 async fn drain<C: Classifier>(
     cfg: &Config,
     store: &Store,
-    clients: &HashMap<String, Arc<Client>>,
+    clients: &HashMap<String, Arc<Connection>>,
     classifier: &C,
     limit: Option<usize>,
     report: &mut ClassifyReport,
@@ -275,7 +274,7 @@ async fn drain<C: Classifier>(
 async fn apply_pending(
     cfg: &Config,
     store: &Store,
-    clients: &HashMap<String, Arc<Client>>,
+    clients: &HashMap<String, Arc<Connection>>,
     report: &mut ClassifyReport,
 ) -> Result<()> {
     let queue: HashMap<(String, String), QueueRow> = store
@@ -332,7 +331,7 @@ fn fail(store: &Store, report: &mut ClassifyReport, account: &str, id: &str, e: 
 async fn settle(
     cfg: &Config,
     store: &Store,
-    client: Option<&Client>,
+    client: Option<&Connection>,
     c: &Classified,
     report: &mut ClassifyReport,
 ) -> Result<()> {
@@ -380,7 +379,7 @@ async fn settle(
 async fn ask<C: Classifier>(
     cfg: &Config,
     store: &Store,
-    client: &Client,
+    client: &Connection,
     classifier: &C,
     account: &str,
     id: &str,
@@ -389,7 +388,7 @@ async fn ask<C: Classifier>(
         .email(account, id)?
         .ok_or_else(|| Error::NotFound(format!("email {account}/{id}")))?;
     let body = fetch_body(store, Some(client), account, id).await?;
-    let has_unsubscribe = has_unsubscribe(client, id).await;
+    let has_unsubscribe = client.has_unsubscribe(id).await;
     let replied = store.thread_has_reply_from(
         account,
         &email.thread_id,
@@ -446,31 +445,12 @@ fn own_addresses(cfg: &Config, store: &Store, account: &str) -> Result<Vec<Strin
     Ok(addresses)
 }
 
-/// Whether the email has a non-empty `List-Unsubscribe` header; a failed
-/// fetch counts as no.
-async fn has_unsubscribe(client: &Client, id: &str) -> bool {
-    const HEADER: &str = "header:List-Unsubscribe:asText";
-
-    client
-        .call_one(
-            "Email/get",
-            json!({
-                "accountId": client.session().account_id,
-                "ids": [id],
-                "properties": [HEADER],
-            }),
-        )
-        .await
-        .ok()
-        .and_then(|r| r["list"][0][HEADER].as_str().map(|h| !h.trim().is_empty()))
-        .unwrap_or(false)
-}
-
 /// The id of the top-level mailbox `name` in `account`, created on the
-/// server (and stored) when missing.
+/// server (and stored) when missing. A Proton account only accepts an existing
+/// label: a folder is a config error and nothing is created.
 async fn ensure_mailbox(
     store: &Store,
-    client: Option<&Client>,
+    client: Option<&Connection>,
     account: &str,
     name: &str,
 ) -> Result<String> {
@@ -478,8 +458,21 @@ async fn ensure_mailbox(
         return Err(Error::Config("a classifier mailbox name is empty".into()));
     }
 
-    if let Some(m) = store.top_level_mailbox_by_name(account, name)? {
-        return Ok(m.id);
+    let proton = store.account_state(account, "provider")?.as_deref() == Some("proton");
+
+    match store.top_level_mailbox_by_name(account, name)? {
+        Some(m) if !proton || m.role.is_none() => return Ok(m.id),
+        Some(_) => {
+            return Err(Error::Config(format!(
+                "mailbox {name} is a Proton folder; make it a label"
+            )));
+        }
+        None if proton => {
+            return Err(Error::Unsupported(
+                "creating mailboxes on Proton accounts".into(),
+            ));
+        }
+        None => {}
     }
 
     let client = client.ok_or_else(|| Error::NotFound(format!("mailbox {name}")))?;
@@ -494,7 +487,7 @@ async fn ensure_mailbox(
 /// Runs one action on one email; an email nobody accepted is an error.
 async fn accepted(
     store: &Store,
-    client: Option<&Client>,
+    client: Option<&Connection>,
     account: &str,
     id: &str,
     action: Action,
@@ -555,7 +548,7 @@ pub struct Applied {
 pub async fn apply_tray(
     cfg: &Config,
     store: &Store,
-    client: Option<&Client>,
+    client: Option<&Connection>,
     c: &Classified,
     revision: i64,
 ) -> Result<Applied> {
@@ -734,7 +727,7 @@ fn previous_mailboxes(
 pub async fn correct(
     cfg: &Config,
     store: &Store,
-    clients: &HashMap<String, Arc<Client>>,
+    clients: &HashMap<String, Arc<Connection>>,
     msg: &MsgRef,
     tray: Tray,
 ) -> Result<()> {
@@ -848,6 +841,42 @@ mod tests {
             total: 0,
             unread: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_mailbox_on_proton_accepts_labels_and_refuses_folders_and_creation() {
+        let store = Store::open_memory().unwrap();
+
+        store.set_account_state("a", "provider", "proton").unwrap();
+        store
+            .upsert_mailboxes(&[
+                mailbox("lbl", "Promos", None),
+                mailbox("fld", "Work", Some("folder")),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            ensure_mailbox(&store, None, "a", "Promos").await.unwrap(),
+            "lbl"
+        );
+        assert!(matches!(
+            ensure_mailbox(&store, None, "a", "Work").await,
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            ensure_mailbox(&store, None, "a", "Missing").await,
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_mailbox_on_jmap_without_client_is_not_found() {
+        let store = Store::open_memory().unwrap();
+
+        assert!(matches!(
+            ensure_mailbox(&store, None, "a", "Missing").await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ use posto_core::body::{fetch_body, save_attachment};
 use posto_core::compose::{Draft, send};
 use posto_core::config::{Account, Config};
 use posto_core::jmap::Client;
+use posto_core::provider::Connection;
 use posto_core::store::{EmailBody, EmailSummary, Mailbox, Store};
 use posto_core::sync::{sync_account, sync_all_with_lock};
 use posto_core::{Error, Result};
@@ -56,10 +57,14 @@ async fn server() -> MockServer {
     server
 }
 
-async fn client(server: &MockServer) -> Client {
+async fn raw_client(server: &MockServer) -> Client {
     Client::connect(&format!("{}/session", server.uri()), "tok")
         .await
         .unwrap()
+}
+
+async fn client(server: &MockServer) -> Connection {
+    Connection::Jmap(raw_client(server).await)
 }
 
 /// Mounts a one-call reply for `name` whose args contain `args`.
@@ -154,7 +159,7 @@ fn ids(v: &[&str]) -> Vec<String> {
 #[tokio::test]
 async fn connect_parses_session() {
     let server = server().await;
-    let c = client(&server).await;
+    let c = raw_client(&server).await;
 
     assert_eq!(c.session().account_id, "acc1");
     assert!(c.session().api_url.ends_with("/api"));
@@ -180,7 +185,7 @@ async fn connect_401_is_auth_error() {
 #[tokio::test]
 async fn call_one_maps_error_response() {
     let server = server().await;
-    let c = client(&server).await;
+    let c = raw_client(&server).await;
 
     reply_error(&server, "Foo/bar", json!({}), "unknownMethod").await;
 
@@ -257,6 +262,10 @@ async fn initial_sync_fills_store() -> Result<()> {
     assert_eq!(
         store.account_state("a", "mailbox_state")?.as_deref(),
         Some("m1")
+    );
+    assert_eq!(
+        store.account_state("a", "provider")?.as_deref(),
+        Some("jmap")
     );
 
     let e1 = store.email("a", "e1")?.unwrap();
@@ -564,7 +573,7 @@ async fn sync_all_isolates_failures() -> Result<()> {
         .await;
     mount_initial_sync(&server_a, &["e1", "e2"]).await;
 
-    let clients: HashMap<String, Arc<Client>> = HashMap::from([
+    let clients: HashMap<String, Arc<Connection>> = HashMap::from([
         ("a".to_string(), Arc::new(client(&server_a).await)),
         ("b".to_string(), Arc::new(client(&server_b).await)),
     ]);
@@ -745,6 +754,123 @@ async fn archive_action_patches_and_mirrors() -> Result<()> {
 
     assert_eq!(n, 1);
     assert_eq!(store.email("a", "e1")?.unwrap().mailbox_ids, ["mb-archive"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn move_mirror_drops_labels_on_jmap() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    store.upsert_mailboxes(&[
+        mailbox("inbox", "inbox"),
+        mailbox("archive", "archive"),
+        Mailbox {
+            role: None,
+            ..mailbox("promos", "promos")
+        },
+    ])?;
+    store.upsert_emails(&[email_in("e1", &["inbox", "promos"])])?;
+    reply(
+        &server,
+        "Email/set",
+        json!({}),
+        json!({ "updated": { "e1": null } }),
+        1,
+    )
+    .await;
+
+    let n = apply(&store, Some(&c), "a", &ids(&["e1"]), Action::Archive).await?;
+
+    assert_eq!(n, 1);
+    assert_eq!(store.email("a", "e1")?.unwrap().mailbox_ids, ["archive"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn proton_rules_apply_offline() -> Result<()> {
+    let store = Store::open_memory()?;
+    let mailbox_ids = |id: &str| store.email("a", id).unwrap().unwrap().mailbox_ids;
+
+    store.set_account_state("a", "provider", "proton")?;
+    store.upsert_mailboxes(&[
+        mailbox("inbox", "inbox"),
+        mailbox("archive", "archive"),
+        mailbox("work", "folder"),
+        Mailbox {
+            role: None,
+            ..mailbox("promos", "promos")
+        },
+    ])?;
+    store.upsert_emails(&[
+        email_in("e1", &["inbox", "promos"]),
+        email_in("e2", &["inbox"]),
+        email_in("e3", &["inbox", "promos"]),
+        email_in("e4", &["inbox"]),
+    ])?;
+
+    let n = apply(&store, None, "a", &ids(&["e1"]), Action::Archive).await?;
+
+    assert_eq!(n, 1);
+    assert_eq!(mailbox_ids("e1"), ["archive", "promos"]);
+
+    let err = apply(
+        &store,
+        None,
+        "a",
+        &ids(&["e2"]),
+        Action::Move {
+            mailbox_id: "promos".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    assert_eq!(mailbox_ids("e2"), ["inbox"]);
+
+    apply(
+        &store,
+        None,
+        "a",
+        &ids(&["e3"]),
+        Action::PatchMailboxes {
+            add: ids(&["work"]),
+            remove: vec![],
+        },
+    )
+    .await?;
+
+    assert_eq!(mailbox_ids("e3"), ["promos", "work"]);
+
+    apply(
+        &store,
+        None,
+        "a",
+        &ids(&["e4"]),
+        Action::PatchMailboxes {
+            add: ids(&["promos"]),
+            remove: ids(&["inbox"]),
+        },
+    )
+    .await?;
+
+    assert_eq!(mailbox_ids("e4"), ["promos"]);
+
+    let err = apply(&store, None, "a", &ids(&["e1"]), Action::Destroy)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    assert!(store.email("a", "e1")?.is_some());
+
+    store.set_account_state("a", "provider", "jmap")?;
+    apply(&store, None, "a", &ids(&["e3"]), Action::Archive).await?;
+
+    assert_eq!(mailbox_ids("e3"), ["archive"]);
 
     Ok(())
 }
@@ -973,8 +1099,8 @@ async fn save_attachment_downloads_and_dedupes() -> Result<()> {
         .mount(&server)
         .await;
 
-    let one = save_attachment(&c, &att, dir.path()).await?;
-    let two = save_attachment(&c, &att, dir.path()).await?;
+    let one = save_attachment(&c, "e1", &att, dir.path()).await?;
+    let two = save_attachment(&c, "e1", &att, dir.path()).await?;
 
     assert_eq!(one, dir.path().join("report.pdf"));
     assert_eq!(two, dir.path().join("report (2).pdf"));
@@ -1271,9 +1397,15 @@ async fn send_error_description_redacts_token() {
     )
     .await;
 
-    let err = send(&cfg_a(), &store, &c, "a", &Draft::default())
-        .await
-        .unwrap_err();
+    let err = send(
+        &cfg_a(),
+        &store,
+        &Connection::Jmap(c),
+        "a",
+        &Draft::default(),
+    )
+    .await
+    .unwrap_err();
     let text = format!("{err} {err:?}");
 
     assert!(!text.contains(SECRET), "send error leaked token: {text}");

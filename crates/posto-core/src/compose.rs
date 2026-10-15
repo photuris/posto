@@ -1,13 +1,12 @@
 //! Drafts: address parsing, replies, rendering and sending.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::actions::{self, Action};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::html;
-use crate::jmap::{Client, Identity};
+use crate::provider::{Connection, Identity};
 use crate::store::{Address, EmailBody, EmailSummary, Store};
 
 /// A message being composed.
@@ -208,18 +207,8 @@ pub fn render(draft: &Draft) -> (String, String) {
     (draft.body.clone(), html)
 }
 
-type Response = (String, Value, String);
-
-/// Finds the first response named `name` with call id `id`, with its index.
-fn find<'a>(rs: &'a [Response], name: &str, id: &str) -> Option<(usize, &'a Value)> {
-    rs.iter()
-        .enumerate()
-        .find(|(_, (n, _, i))| n == name && i == id)
-        .map(|(idx, (_, args, _))| (idx, args))
-}
-
-/// Creates the email in Drafts, submits it, and moves it to Sent, in one
-/// request. Marks the replied-to email `$answered`. Returns the new email id.
+/// Sends `draft` through `client` and files it under Sent. Marks the
+/// replied-to email `$answered`. Returns the new email id.
 ///
 /// `client` must be the connection of `account`. The sent email is not
 /// inserted into the store; the next sync picks it up.
@@ -227,14 +216,14 @@ fn find<'a>(rs: &'a [Response], name: &str, id: &str) -> Option<(usize, &'a Valu
 /// # Errors
 ///
 /// Returns [`Error::NotConfigured`] for an unknown account or without a sending identity,
-/// [`Error::NotFound`] when the Drafts or Sent mailbox is unknown, and
-/// [`Error::Jmap`] when the server refuses to create or submit the email.
+/// [`Error::NotFound`] when the Drafts or Sent mailbox is unknown, and a
+/// provider error when the server refuses to create or submit the email.
 /// Once the mail is submitted, a failed move to Sent is reported as
 /// [`Error::Other`]; callers must not resend then.
 pub async fn send(
     cfg: &Config,
     store: &Store,
-    client: &Client,
+    client: &Connection,
     account: &str,
     draft: &Draft,
 ) -> Result<String> {
@@ -255,73 +244,10 @@ pub async fn send(
             .or(identities.first())
             .ok_or_else(|| Error::NotConfigured("no sending identity".into()))?,
     };
-    let drafts = store
-        .mailbox_by_role(account, "drafts")?
-        .ok_or_else(|| Error::NotFound("drafts mailbox".into()))?;
-    let sent = store
-        .mailbox_by_role(account, "sent")?
-        .ok_or_else(|| Error::NotFound("sent mailbox".into()))?;
     let (text, html) = render(draft);
-    let server_account = &client.session().account_id;
-
-    let mut email = json!({
-        "mailboxIds": { &drafts.id: true },
-        "keywords": { "$seen": true, "$draft": true },
-        "from": [{ "name": identity.name, "email": identity.email }],
-        "to": draft.to,
-        "subject": draft.subject,
-        "bodyStructure": {
-            "type": "multipart/alternative",
-            "subParts": [
-                { "partId": "t", "type": "text/plain" },
-                { "partId": "h", "type": "text/html" },
-            ],
-        },
-        "bodyValues": { "t": { "value": text }, "h": { "value": html } },
-    });
-
-    if !draft.cc.is_empty() {
-        email["cc"] = json!(draft.cc);
-    }
-
-    if !draft.bcc.is_empty() {
-        email["bcc"] = json!(draft.bcc);
-    }
-
-    if let Some(id) = &draft.in_reply_to {
-        email["inReplyTo"] = json!([id]);
-    }
-
-    if !draft.references.is_empty() {
-        email["references"] = json!(draft.references);
-    }
-
-    let responses = client
-        .call(vec![
-            (
-                "Email/set".into(),
-                json!({ "accountId": server_account, "create": { "d": email } }),
-                "0".into(),
-            ),
-            (
-                "EmailSubmission/set".into(),
-                json!({
-                    "accountId": server_account,
-                    "create": { "s": { "identityId": identity.id, "emailId": "#d" } },
-                    "onSuccessUpdateEmail": { "#s": {
-                        format!("mailboxIds/{}", drafts.id): null,
-                        format!("mailboxIds/{}", sent.id): true,
-                        "keywords/$draft": null,
-                    } },
-                }),
-                "1".into(),
-            ),
-        ])
+    let id = client
+        .send(store, account, identity, draft, &text, &html)
         .await?;
-
-    let id = created_id(client, &responses)?;
-    check_submission(client, &responses)?;
-    check_moved_to_sent(client, &responses, &id)?;
 
     if let Some(reply_to) = &draft.reply_to_email_id
         && let Err(e) = actions::apply(
@@ -337,69 +263,6 @@ pub async fn send(
     }
 
     Ok(id)
-}
-
-/// Step (a): the id of the email created in Drafts.
-fn created_id(client: &Client, rs: &[Response]) -> Result<String> {
-    let Some((_, r)) = find(rs, "Email/set", "0") else {
-        return Err(Error::Jmap(match find(rs, "error", "0") {
-            Some((_, e)) => client.describe(e),
-            None => "no create response".into(),
-        }));
-    };
-
-    if let Some(e) = r["notCreated"].get("d") {
-        return Err(Error::Jmap(format!("create: {}", client.describe(e))));
-    }
-
-    r["created"]["d"]["id"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| Error::Jmap("create: no id returned".into()))
-}
-
-/// Step (b): the submission was accepted.
-fn check_submission(client: &Client, rs: &[Response]) -> Result<()> {
-    let Some((_, r)) = find(rs, "EmailSubmission/set", "1") else {
-        return Err(Error::Jmap(match find(rs, "error", "1") {
-            Some((_, e)) => client.redact(e["type"].as_str().unwrap_or("unknown")),
-            None => "no submission response".into(),
-        }));
-    };
-
-    match r["notCreated"].get("s") {
-        Some(e) => Err(Error::Jmap(format!("submit: {}", client.describe(e)))),
-        None => Ok(()),
-    }
-}
-
-/// Step (c): the implicit `Email/set` after the submission moved the email.
-/// The mail is already sent, so every failure here is [`Error::Other`].
-fn check_moved_to_sent(client: &Client, rs: &[Response], id: &str) -> Result<()> {
-    let fail = |detail: String| {
-        Err(Error::Other(format!(
-            "sent as {id}, but moving to Sent failed: {detail}"
-        )))
-    };
-    let submission = find(rs, "EmailSubmission/set", "1").map_or(0, |(idx, _)| idx);
-    let after = |name: &str| {
-        rs.iter()
-            .skip(submission + 1)
-            .find(|(n, _, i)| n == name && i == "1")
-            .map(|(_, args, _)| args)
-    };
-
-    if let Some(r) = after("Email/set") {
-        return match r["notUpdated"].get(id) {
-            Some(e) => fail(client.describe(e)),
-            None => Ok(()),
-        };
-    }
-
-    match after("error") {
-        Some(e) => fail(client.describe(e)),
-        None => fail("no update response".into()),
-    }
 }
 
 #[cfg(test)]

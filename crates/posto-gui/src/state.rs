@@ -8,7 +8,7 @@ use posto_core::actions::{self, Action};
 use posto_core::classify::state::state_for;
 use posto_core::classify::{Classification, Classifier, ClassifyReport, Tray};
 use posto_core::config::{Config, Secrets};
-use posto_core::jmap::Client;
+use posto_core::provider::Connection;
 use posto_core::store::{Classified, EmailBody, EmailSummary, MsgRef, Store};
 use posto_core::{Error, Result, fixtures};
 
@@ -171,7 +171,7 @@ pub struct Backend {
     pub store: Arc<Store>,
     /// One connection per account, made lazily on first use; empty offline, in
     /// UI test mode, or without tokens.
-    pub clients: HashMap<String, Arc<Client>>,
+    pub clients: HashMap<String, Arc<Connection>>,
     pub cfg: Config,
     /// `POSTO_UI_TEST=1`: in-memory fixtures, no network, nothing written to disk.
     pub ui_test: bool,
@@ -300,7 +300,7 @@ pub fn remote_allowed(cfg: &Config, from: &str) -> bool {
 /// The connected client of `account_id`, connecting with its stored token when needed.
 ///
 /// `Ok(None)` in UI test mode. `Error::NotConfigured` when there is no token.
-pub async fn client(backend: Signal<Backend>, account_id: &str) -> Result<Option<Arc<Client>>> {
+pub async fn client(backend: Signal<Backend>, account_id: &str) -> Result<Option<Arc<Connection>>> {
     let token = {
         let b = backend.read();
 
@@ -329,7 +329,7 @@ async fn connect(
     mut backend: Signal<Backend>,
     account_id: &str,
     token: &str,
-) -> Result<Arc<Client>> {
+) -> Result<Arc<Connection>> {
     let (session_url, rev) = {
         let b = backend.read();
         let account = b
@@ -339,7 +339,7 @@ async fn connect(
 
         (account.session_url.clone(), b.conn_rev)
     };
-    let client = Arc::new(Client::connect(&session_url, token).await?);
+    let client = Arc::new(Connection::connect_jmap(&session_url, token).await?);
     let mut b = backend.write();
 
     if b.conn_rev != rev {

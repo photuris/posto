@@ -1,12 +1,15 @@
 //! Provider-neutral types shared by the JMAP and Proton back ends.
 //!
-//! The rest of the core talks to one connection type, `Connection` (added by
-//! the provider seam), and never to `jmap::Client` or `proton::Session`
-//! directly. The types here are the vocabulary of that contract.
+//! The rest of the core talks to one connection type, [`Connection`], and never
+//! to `jmap::Client` or `proton::Session` directly. The types here are the
+//! vocabulary of that contract.
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::EmailSummary;
+use crate::compose::Draft;
+use crate::error::Result;
+use crate::jmap;
+use crate::store::{Attachment, EmailBody, EmailSummary, Mailbox, Store};
 
 /// A sending identity: a JMAP `Identity` or a Proton address that may send.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -67,4 +70,196 @@ pub enum Delta {
     /// The server cannot report changes from that cursor: the caller clears
     /// the account's emails and runs an initial sync.
     Resync,
+}
+
+/// One account's server connection; the only type the core talks to.
+pub enum Connection {
+    /// A JMAP account (Fastmail).
+    Jmap(jmap::Client),
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Connection::Jmap(c) => c.fmt(f),
+        }
+    }
+}
+
+impl Connection {
+    /// Connects a JMAP account from its session URL and bearer token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::Auth`] on 401/403,
+    /// [`crate::error::Error::Http`] on other failures and
+    /// [`crate::error::Error::Jmap`] when the session has no mail account.
+    pub async fn connect_jmap(session_url: &str, token: &str) -> Result<Connection> {
+        Ok(Connection::Jmap(
+            jmap::Client::connect(session_url, token).await?,
+        ))
+    }
+
+    /// The server's own id for the account (not the local slug).
+    pub fn server_account_id(&self) -> &str {
+        match self {
+            Connection::Jmap(c) => &c.session().account_id,
+        }
+    }
+
+    /// The provider name written into the account's sync state.
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Connection::Jmap(_) => "jmap",
+        }
+    }
+
+    /// True when the server reports no mailbox counts and the store computes
+    /// them from its cache after every sync.
+    pub fn local_counts(&self) -> bool {
+        match self {
+            Connection::Jmap(_) => false,
+        }
+    }
+
+    /// Lists the account's sending identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call fails or the list is malformed.
+    pub async fn identities(&self) -> Result<Vec<Identity>> {
+        match self {
+            Connection::Jmap(c) => c.identities().await,
+        }
+    }
+
+    /// Creates a top-level mailbox called `name`. The returned mailbox has an
+    /// empty `account_id`; the caller sets the local slug before storing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server refuses or the call fails.
+    pub async fn create_mailbox(&self, name: &str) -> Result<Mailbox> {
+        match self {
+            Connection::Jmap(c) => c.create_mailbox(name).await,
+        }
+    }
+
+    /// Brings the store's mailboxes of `account` up to date.
+    ///
+    /// # Errors
+    ///
+    /// Returns any network, server or database error.
+    pub async fn sync_mailboxes(&self, store: &Store, account: &str) -> Result<()> {
+        match self {
+            Connection::Jmap(c) => c.sync_mailboxes(store, account).await,
+        }
+    }
+
+    /// The `limit` newest emails, and the cursor captured before paging so
+    /// changes made during paging show up in the next [`Connection::delta`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any network or server error.
+    pub async fn initial(
+        &self,
+        account: &str,
+        limit: usize,
+    ) -> Result<(Vec<EmailSummary>, String)> {
+        match self {
+            Connection::Jmap(c) => c.initial(account, limit).await,
+        }
+    }
+
+    /// One page of changes after the cursor `since`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any network or server error.
+    pub async fn delta(&self, account: &str, since: &str) -> Result<Delta> {
+        match self {
+            Connection::Jmap(c) => c.delta(account, since).await,
+        }
+    }
+
+    /// The body of `email_id`; `None` when the server does not know the email.
+    ///
+    /// # Errors
+    ///
+    /// Returns any network or server error.
+    pub async fn body(&self, email_id: &str) -> Result<Option<EmailBody>> {
+        match self {
+            Connection::Jmap(c) => c.body(email_id).await,
+        }
+    }
+
+    /// Downloads attachment `att` of email `email_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the download fails.
+    pub async fn download(&self, email_id: &str, att: &Attachment) -> Result<Vec<u8>> {
+        match self {
+            // JMAP addresses blobs by id alone.
+            Connection::Jmap(c) => {
+                let _ = email_id;
+
+                c.download_blob(&att.blob_id, &att.name, &att.mime).await
+            }
+        }
+    }
+
+    /// Applies `change` to `ids`; the ids the server refused are in the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns any network or server error.
+    pub async fn update(&self, ids: &[String], change: &Change) -> Result<Updated> {
+        match self {
+            Connection::Jmap(c) => c.update(ids, change).await,
+        }
+    }
+
+    /// Permanently deletes `ids`; returns the ids that are gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns any network or server error.
+    pub async fn destroy(&self, ids: &[String]) -> Result<Vec<String>> {
+        match self {
+            Connection::Jmap(c) => c.destroy(ids).await,
+        }
+    }
+
+    /// Whether the email has a non-empty `List-Unsubscribe` header; a failed
+    /// fetch counts as no.
+    pub async fn has_unsubscribe(&self, email_id: &str) -> bool {
+        match self {
+            Connection::Jmap(c) => c.has_unsubscribe(email_id).await,
+        }
+    }
+
+    /// Sends `draft` as `identity` with the rendered `text` and `html` parts
+    /// and returns the new email id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::NotFound`] when the drafts or sent
+    /// mailbox is unknown and a provider error when the server refuses. A mail
+    /// that was sent but not filed under Sent is an
+    /// [`crate::error::Error::Other`]: callers must not resend then.
+    pub async fn send(
+        &self,
+        store: &Store,
+        account: &str,
+        identity: &Identity,
+        draft: &Draft,
+        text: &str,
+        html: &str,
+    ) -> Result<String> {
+        match self {
+            Connection::Jmap(c) => c.send(store, account, identity, draft, text, html).await,
+        }
+    }
 }
