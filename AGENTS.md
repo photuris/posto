@@ -12,7 +12,16 @@ Read `README.md` first. This file holds what the code does not say.
   `.overseer/runs/2026-10-12-posto-poc/PLAN.md` (gitignored ledger of the build
   run, present on the original machine). The doc comments in
   `crates/posto-core/src/*.rs` are the live contract.
-- JMAP only (RFC 8620/8621 + submission). No IMAP.
+- Two back ends behind one seam: `provider::Connection` is the only type the
+  rest of the core talks to; `jmap.rs` (RFC 8620/8621 + submission) and
+  `proton.rs` (`proton-mail-api`, pinned by git tag) implement its
+  operations and never leak past it. A new provider is a new arm plus a
+  module; sync/actions/body/compose/classify are written once. No IMAP.
+- Features are the lowest common denominator across providers. The binding
+  model mapping (roles, hidden Proton system ids, keywords, folder vs label
+  semantics, what is `Error::Unsupported`) is in
+  `.overseer/runs/2026-10-15-proton/PLAN.md` (gitignored ledger) and
+  summarised in README "Providers".
 - Multi-account: every store row, sync cursor and action is scoped by the local
   account slug (`account_id`, from `config.toml`; not the server's account id).
   The slug is the first parameter of every `Store` method that touches account
@@ -39,6 +48,21 @@ Read `README.md` first. This file holds what the code does not say.
 - `Store::apply_delta_page` is the only way a delta page lands: rows, deletes,
   queue rows and the `email_state` cursor in one transaction.
 
+- The sync writes `<account>/provider` into `sync_state`; `actions::apply`
+  and `classify::ensure_mailbox` read it to apply the Proton folder rules
+  with or without a connection (move keeps labels, move-to-label refused,
+  a folder added through a patch evicts the other folders, Destroy refused,
+  tray mailboxes must be labels). Without the state the JMAP rules apply.
+- Proton tokens rotate on 401. Every `proton::Session` operation (success
+  and error paths, including `create_mailbox`/`destroy` which make no
+  request) ends in `persist_if_changed`; `last_blob` advances only when the
+  callback returned `Ok`. `Secrets::set_proton_session` writes only while the
+  stored `generation` matches the one the connection was opened with
+  (`set_proton` issues a fresh one, never reused, high-water kept across
+  `clear_account`), and never writes a non-object blob.
+- `proton::map_err` uses the crate error's `Display` only. Never append
+  `server_message()` (unrestricted server text) and never `{:?}`-format the
+  crate error into anything a user, a log or a test failure can see.
 - Never put the bearer token in an error, log, or debug output. The client
   redacts it from server-controlled text; keep it that way and never format
   deserialisation errors that can embed response bodies.
@@ -46,6 +70,12 @@ Read `README.md` first. This file holds what the code does not say.
   `iframe` `srcdoc`. Never `dangerous_inner_html` mail content. With
   `allow_remote == false` every resource that is not `cid:` or `data:image/` is
   dropped and `had_remote` is set.
+- Tests never reach the network. A Proton test builds a `Session` against
+  wiremock (`Session::for_tests`, resumed blob) and generates its own PGP
+  keys; CLI tests validate `account login` inputs with an account that is
+  not Proton, an empty password or an empty app version. One mutation run
+  that inverted the provider guard sent a real login request (run
+  2026-10-15-proton); do not weaken a login guard while running CLI tests.
 - `std::env::set_var` only in a synchronous `main` before any runtime exists.
   Tests use the `_at` / `_with_lock` / `open_memory` entry points and
   `Command::env`, never in-process env mutation (except `config::tests`, which

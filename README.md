@@ -1,14 +1,14 @@
 # Posto
 
 A bespoke personal email client. Proof of concept: one or more Fastmail
-accounts over JMAP, with a Dioxus desktop GUI and a scriptable CLI over
-the same Rust core.
+(JMAP) and Proton Mail accounts, with a Dioxus desktop GUI and a
+scriptable CLI over the same Rust core.
 
 ## Layout
 
 | Crate | What it is |
 |---|---|
-| `crates/posto-core` | All logic: config, secrets, SQLite store (WAL + FTS5), JMAP client, sync, actions, body fetch, compose/send, HTML sanitising, Markdown, Omarchy theme hints, keyboard shortcut map, UI fixtures. |
+| `crates/posto-core` | All logic: config, secrets, SQLite store (WAL + FTS5), the provider seam (`provider::Connection`) with a JMAP client and a Proton back end (`proton-mail-api`), sync, actions, body fetch, compose/send, HTML sanitising, Markdown, Omarchy theme hints, keyboard shortcut map, UI fixtures. |
 | `crates/posto-cli` | `posto`, a noun-verb CLI. JSON on stdout, JSON errors on stderr, typed exit codes, no prompts. |
 | `crates/posto-gui` | `posto-gui`, a three-pane Dioxus 0.7 desktop app. |
 
@@ -26,6 +26,8 @@ Wayland or X11 session.
 
 ## First run
 
+Fastmail:
+
 1. Create a Fastmail API token (Settings, Privacy & Security, API tokens)
    with mail read/write and submission scopes.
 2. Store it and set your sender address:
@@ -38,8 +40,22 @@ Wayland or X11 session.
 
    The GUI Settings window does the same thing. A fresh install has one
    account, `default`.
-3. Start `posto-gui`. It syncs every 5 minutes (configurable, 0 = off)
-   and on `g`.
+
+Proton Mail:
+
+```sh
+posto account add --id pm --email you@proton.me --provider proton
+printf '%s\n' "$PASSWORD" | posto account login --account pm --password-stdin
+posto sync run --account pm
+```
+
+Add `--totp <code>` when two-factor authentication is on, and
+`--two-password` with the mailbox password on the second stdin line when
+the account uses a separate mailbox password. In the GUI, add the account
+with provider "Proton Mail", save, then use "Sign in…" on its row.
+
+Then start `posto-gui`. It syncs every 5 minutes (configurable, 0 = off)
+and on `g`.
 
 Data lives in `$POSTO_DATA_DIR`, default `~/.local/share/posto`:
 `config.toml`, `secrets.toml` (mode 0600; `POSTO_TOKEN` in the
@@ -49,8 +65,10 @@ database; sync is single-writer through the lock file.
 
 ## Accounts
 
-Each account is an `[[accounts]]` entry in `config.toml`; its token lives
-under `[tokens]` in `secrets.toml`, keyed by the account id:
+Each account is an `[[accounts]]` entry in `config.toml` with a
+`provider` (`jmap`, the default, or `proton`). A JMAP account's token
+lives under `[tokens]` in `secrets.toml`; a Proton account's session and
+mailbox password live under `[proton.<id>]`, keyed by the account id:
 
 ```toml
 # config.toml
@@ -58,20 +76,34 @@ under `[tokens]` in `secrets.toml`, keyed by the account id:
 id = "fastmail"            # a-z, 0-9, '-'; unique; used by --account
 name = "Fastmail"          # display name (optional)
 email = "me@fastmail.com"  # default sender address
+provider = "jmap"
 session_url = "https://api.fastmail.com/jmap/session"
 enabled = true
 
 [[accounts]]
-id = "work"
-email = "me@work.example"
+id = "pm"
+email = "me@proton.me"
+provider = "proton"
+username = "me"            # login name; empty means the email address
+
+[proton]
+app_version = "linux-bridge@3.27.1"   # x-pm-appversion; POSTO_PROTON_APP_VERSION overrides
 ```
 
 ```toml
 # secrets.toml
 [tokens]
 fastmail = "..."
-work = "..."
+
+[proton.pm]
+session = "..."            # the Proton session (tokens + derived key password), rewritten when the tokens rotate
+mailbox_password = "..."   # needed to unlock the mail keys at every start
+generation = 1760...       # identifies one sign-in; an older connection cannot overwrite a newer one
 ```
+
+`secrets.toml` is mode 0600. A Proton session can only be reopened with
+the mailbox password, which is why it is stored; sign in again in Settings
+or with `posto account login` after changing it.
 
 Files from the single-account version (`[account]`, top-level `token`)
 load as the account `default` and are rewritten in the new layout on the
@@ -85,9 +117,35 @@ the accounts. In the CLI, `--account <id>` picks an account. Reads
 (`email list`, `email search`, `mailbox list`) cover every account
 without it, and rows carry `account_id`. An email id given without
 `--account` is looked up in every account and is an error when more than
-one has it. `posto account list|add|remove|set|set-token|show|identities`
-manage the accounts; `posto sync run` syncs each enabled account and
+one has it. `posto account list|add|remove|set|set-token|login|show|identities`
+manage the accounts (`has_token` in their output means "has
+credentials": a token or a Proton login); `posto sync run` syncs each enabled account and
 reports each outcome (a failing account does not stop the others).
+
+## Providers and what is the same across them
+
+Every feature works the same on both providers, at the lowest common
+denominator, with these mappings and limits on Proton:
+
+- Proton *folders* are exclusive (a message sits in one), Proton *labels*
+  are additive. In Posto a folder shows with a folder role and a label as
+  a role-less mailbox. Moving a message to a folder keeps its labels;
+  moving to a *label* is refused on Proton (use Labels… instead);
+  adding a folder through Labels… leaves the previous folder. On JMAP a
+  move replaces the whole mailbox set, as before.
+- Starred is `$flagged`. All Mail, All Sent, All Drafts, Outbox,
+  Scheduled, Snoozed and other system views are hidden.
+- Proton gives no list previews (bodies are encrypted until opened), so
+  the preview column is empty. Unread counts are computed from the local
+  cache.
+- Permanent delete and creating mailboxes are not available on Proton
+  with the pinned `proton-mail-api` (they return "not available for this
+  account"). Classification on a Proton account therefore needs its tray
+  labels (and `Unsure`) created in Proton first, as labels, not folders.
+- Nested labels are never created anywhere (Proton labels cannot nest).
+- Sync uses Proton's event feed; a cursor the server no longer knows
+  triggers a full refetch of the cached window (`sync.initial_limit`
+  newest messages of All Mail).
 
 ## Classification
 
@@ -185,6 +243,8 @@ rejected, 5 server/transport, 6 not found, 7 sync lock held, 1 other.
 ```sh
 posto account add --id work --email me@work.example
 printf '%s' "$TOKEN" | posto account set-token --account work --token-stdin
+posto account add --id pm --email me@proton.me --provider proton
+printf '%s\n' "$PASSWORD" | posto account login --account pm --password-stdin --totp 123456
 posto email list --mailbox Inbox --unread --jsonl | jq -r .subject
 posto email show <id> --text
 posto email archive <id>...
@@ -221,4 +281,5 @@ as CSS variables; elsewhere it falls back to the system scheme.
 
 IMAP, moving mail between accounts, contacts, calendar, conversation view, push,
 offline action queue, outgoing attachments, HTML composer, keyring
-storage, packaging.
+storage, packaging, Proton attachments embedded in PGP/MIME bodies,
+`cid:` images, creating labels or deleting permanently on Proton.
