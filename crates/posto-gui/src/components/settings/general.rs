@@ -30,6 +30,15 @@ fn provider_label(provider: Provider) -> &'static str {
     }
 }
 
+/// A checked sign-in, ready to run.
+struct Job {
+    version: String,
+    password: String,
+    totp: Option<String>,
+    mailbox: Option<String>,
+    attempt: u32,
+}
+
 /// The Proton sign-in panel and the sign-in it may have running.
 ///
 /// `attempt` numbers sign-ins: it is bumped when one starts and whenever the
@@ -82,16 +91,20 @@ impl SignIn {
         self.open.set(!was_open);
     }
 
-    fn clear_inputs(mut self) {
+    fn clear_passwords(mut self) {
         self.password.set(String::new());
+        self.mailbox.set(String::new());
+    }
+
+    fn clear_inputs(mut self) {
+        self.clear_passwords();
         self.totp.set(String::new());
         self.separate.set(false);
-        self.mailbox.set(String::new());
     }
 
     /// Signs `account` in with what is typed; the result lands in the secrets
     /// file, unless the attempt was discarded meanwhile.
-    fn start(mut self, draft: Signal<Config>, account: Account) {
+    fn start(self, draft: Signal<Config>, account: Account) {
         if (self.busy)() {
             return;
         }
@@ -101,67 +114,106 @@ impl SignIn {
             return self.reset();
         }
 
-        let password = (self.password)();
-
-        if password.is_empty() {
-            return self.error.set(Some("Enter the password".into()));
-        }
-
-        let Some(version) = backend().peek().cfg.proton_app_version() else {
-            return self
-                .error
-                .set(Some("Set [proton] app_version in config.toml first".into()));
+        let Some(job) = self.prepare(backend().peek().cfg.proton_app_version()) else {
+            return;
         };
-        let totp = Some((self.totp)().trim().to_string()).filter(|t| !t.is_empty());
-        let mailbox = (self.separate)()
-            .then(|| (self.mailbox)())
-            .filter(|m| !m.is_empty());
-
-        self.attempt += 1;
-        self.busy.set(true);
-        self.error.set(None);
-
-        let mine = *self.attempt.peek();
 
         // Component-owned: closing Settings drops it before it can store anything.
         spawn(async move {
             let result = proton::login(
-                &version,
+                &job.version,
                 account.login_name(),
-                &password,
-                totp.as_deref(),
-                mailbox.as_deref(),
+                &job.password,
+                job.totp.as_deref(),
+                job.mailbox.as_deref(),
             )
             .await;
 
-            if *self.attempt.peek() != mine {
-                return;
+            self.finish(draft, &account.id, job.attempt, result, Secrets::set_proton);
+        });
+    }
+
+    /// Checks what is typed and, when a login can run, numbers it and marks
+    /// the panel busy. A refusal shows its error with the panel left open and
+    /// both passwords cleared.
+    fn prepare(mut self, version: Option<String>) -> Option<Job> {
+        match self.preflight(version) {
+            Ok(job) => {
+                self.attempt += 1;
+                self.busy.set(true);
+                self.error.set(None);
+
+                Some(Job {
+                    attempt: *self.attempt.peek(),
+                    ..job
+                })
             }
+            Err(e) => {
+                self.clear_passwords();
+                self.error.set(Some(e.into()));
+                None
+            }
+        }
+    }
 
-            self.busy.set(false);
-            self.clear_inputs();
+    fn preflight(self, version: Option<String>) -> std::result::Result<Job, &'static str> {
+        let password = (self.password)();
 
-            match result.and_then(|login| {
-                let Login {
+        if password.is_empty() {
+            return Err("Enter the password");
+        }
+
+        let version = version.ok_or("Set [proton] app_version in config.toml first")?;
+
+        Ok(Job {
+            version,
+            password,
+            totp: Some((self.totp)().trim().to_string()).filter(|t| !t.is_empty()),
+            mailbox: (self.separate)()
+                .then(|| (self.mailbox)())
+                .filter(|m| !m.is_empty()),
+            attempt: 0,
+        })
+    }
+
+    /// Lands the result of login number `attempt`: stores the login through
+    /// `store` and shows it, or shows the error. Does nothing when the
+    /// attempt was discarded meanwhile.
+    fn finish(
+        mut self,
+        draft: Signal<Config>,
+        id: &str,
+        attempt: u32,
+        result: posto_core::Result<Login>,
+        store: impl FnOnce(&str, &ProtonSecret) -> posto_core::Result<u64>,
+    ) {
+        if *self.attempt.peek() != attempt {
+            return;
+        }
+
+        self.busy.set(false);
+        self.clear_inputs();
+
+        match result.and_then(|login| {
+            let Login {
+                session,
+                mailbox_password,
+                email,
+            } = login;
+
+            store(
+                id,
+                &ProtonSecret {
                     session,
                     mailbox_password,
-                    email,
-                } = login;
-
-                Secrets::set_proton(
-                    &account.id,
-                    &ProtonSecret {
-                        session,
-                        mailbox_password,
-                        generation: 0,
-                    },
-                )
-                .map(|_| email)
-            }) {
-                Ok(email) => self.signed_in(draft, &account.id, &email),
-                Err(e) => self.error.set(Some(e.to_string())),
-            }
-        });
+                    generation: 0,
+                },
+            )
+            .map(|_| email)
+        }) {
+            Ok(email) => self.signed_in(draft, id, &email),
+            Err(e) => self.error.set(Some(e.to_string())),
+        }
     }
 
     /// After the login was stored: closes the panel, drops old connections
@@ -609,5 +661,178 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
             span { "minutes" }
         }
         div { class: "hint", "Set to 0 to disable background refresh." }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use posto_core::Error;
+    use posto_core::store::Store;
+
+    use super::*;
+    use crate::app::{App, STATUS};
+    use crate::state::Backend;
+
+    /// A headless `App` over an empty backend whose config has the Proton
+    /// account `pm` (no sender address). `config_error` is set so that a
+    /// sign-in can never write `config.toml`.
+    fn rendered() -> VirtualDom {
+        let mut cfg = Config::default();
+
+        cfg.accounts[0] = Account::proton("pm", "");
+
+        let mut dom = VirtualDom::new(App).with_root_context(Backend {
+            store: Arc::new(Store::open_memory().unwrap()),
+            clients: HashMap::new(),
+            cfg,
+            ui_test: false,
+            conn_rev: 0,
+            config_error: Some("test: never write config.toml".into()),
+        });
+
+        dom.rebuild_in_place();
+        dom
+    }
+
+    /// The sign-in signals of a mounted `GeneralPage`, with a password typed.
+    fn typed() -> SignIn {
+        fn new<T: 'static>(value: T) -> Signal<T> {
+            Signal::new_in_scope(value, ScopeId::ROOT)
+        }
+
+        let mut s = SignIn {
+            open: new(true),
+            password: new(String::new()),
+            totp: new("123456".to_string()),
+            separate: new(true),
+            mailbox: new(String::new()),
+            error: new(None),
+            busy: new(false),
+            attempt: new(0),
+            rev: new(0),
+        };
+
+        s.password.set("pw".into());
+        s.mailbox.set("mb".into());
+        s
+    }
+
+    fn login() -> posto_core::Result<Login> {
+        Ok(Login {
+            session: "{}".into(),
+            mailbox_password: "mb".into(),
+            email: "me@proton.example".into(),
+        })
+    }
+
+    fn draft() -> Signal<Config> {
+        Signal::new_in_scope(backend().peek().cfg.clone(), ScopeId::ROOT)
+    }
+
+    #[test]
+    fn a_refused_sign_in_clears_both_passwords() {
+        let dom = rendered();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let mut s = typed();
+
+            // No app version: refused before any login can run.
+            assert!(s.prepare(None).is_none());
+            assert_eq!(
+                (s.error)().as_deref(),
+                Some("Set [proton] app_version in config.toml first")
+            );
+            assert_eq!(
+                ((s.password)(), (s.mailbox)()),
+                (String::new(), String::new())
+            );
+            assert_eq!(
+                ((s.open)(), (s.busy)(), *s.attempt.peek()),
+                (true, false, 0)
+            );
+            assert_eq!((s.totp)(), "123456");
+
+            // No password, but a mailbox password typed.
+            s.mailbox.set("mb".into());
+
+            assert!(s.prepare(Some("v".into())).is_none());
+            assert_eq!((s.error)().as_deref(), Some("Enter the password"));
+            assert_eq!(
+                ((s.password)(), (s.mailbox)()),
+                (String::new(), String::new())
+            );
+            assert!((s.open)());
+        });
+    }
+
+    #[test]
+    fn a_stale_login_stores_nothing_and_changes_no_ui() {
+        let dom = rendered();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let (mut s, draft) = (typed(), draft());
+            let job = s.prepare(Some("v".into())).unwrap();
+
+            assert!(job.attempt > 0 && (s.busy)());
+
+            // The account selection changes while the login runs; the panel
+            // is opened again for the next account.
+            s.reset();
+            s.open.set(true);
+            s.password.set("next".into());
+            *crate::app::NEEDS_TOKEN.write() = true;
+
+            for result in [login(), Err(Error::Auth)] {
+                let stored = Cell::new(false);
+
+                s.finish(draft, "pm", job.attempt, result, |_, _| {
+                    stored.set(true);
+                    Ok(1)
+                });
+
+                assert!(!stored.get(), "a stale login was stored");
+            }
+
+            assert_eq!(((s.open)(), (s.busy)(), (s.rev)()), (true, false, 0));
+            assert_eq!((s.password)(), "next");
+            assert_eq!((s.error)(), None);
+            assert_eq!(draft.peek().accounts[0].email, "");
+            assert_eq!(backend().peek().cfg.accounts[0].email, "");
+            assert_eq!(backend().peek().conn_rev, 0);
+            assert_eq!(*STATUS.peek(), "");
+            assert!(*crate::app::NEEDS_TOKEN.peek());
+        });
+    }
+
+    #[test]
+    fn a_current_login_is_stored_and_shown() {
+        let dom = rendered();
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let (s, draft) = (typed(), draft());
+            let job = s.prepare(Some("v".into())).unwrap();
+            let stored = Cell::new(None);
+
+            *crate::app::NEEDS_TOKEN.write() = true;
+            s.finish(draft, "pm", job.attempt, login(), |id, secret| {
+                stored.set(Some((id.to_string(), secret.mailbox_password.clone())));
+                Ok(1)
+            });
+
+            assert_eq!(stored.take(), Some(("pm".to_string(), "mb".to_string())));
+            assert_eq!(((s.open)(), (s.busy)(), (s.rev)()), (false, false, 1));
+            assert_eq!(
+                ((s.password)(), (s.mailbox)()),
+                (String::new(), String::new())
+            );
+            assert_eq!(draft.peek().accounts[0].email, "me@proton.example");
+            assert_eq!(backend().peek().conn_rev, 1);
+            assert_eq!(*STATUS.peek(), "Signed in to me@proton.example");
+            assert!(!*crate::app::NEEDS_TOKEN.peek());
+        });
     }
 }
