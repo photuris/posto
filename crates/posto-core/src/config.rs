@@ -10,6 +10,10 @@ use crate::error::{Error, Result};
 /// Fastmail's JMAP session endpoint.
 const DEFAULT_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 
+/// `x-pm-appversion` sent to Proton unless `[proton] app_version` or
+/// `POSTO_PROTON_APP_VERSION` says otherwise.
+pub const DEFAULT_PROTON_APP_VERSION: &str = "linux-bridge@3.27.1";
+
 /// Id of the account that legacy single-account files migrate to.
 pub const DEFAULT_ACCOUNT_ID: &str = "default";
 
@@ -54,6 +58,24 @@ pub struct Config {
     pub remote_content: String,
     /// Senders whose remote content always loads: lower-case addresses or domains.
     pub trusted_senders: Vec<String>,
+    /// Proton API settings.
+    pub proton: ProtonConfig,
+}
+
+/// Settings shared by every Proton account.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProtonConfig {
+    /// Value of the `x-pm-appversion` header; empty means unset.
+    pub app_version: String,
+}
+
+impl Default for ProtonConfig {
+    fn default() -> Self {
+        ProtonConfig {
+            app_version: DEFAULT_PROTON_APP_VERSION.to_string(),
+        }
+    }
 }
 
 /// Column widths of the GUI, in pixels.
@@ -90,6 +112,42 @@ impl Default for Config {
             ui: UiConfig::default(),
             remote_content: "ask".to_string(),
             trusted_senders: Vec::new(),
+            proton: ProtonConfig::default(),
+        }
+    }
+}
+
+/// The mail protocol an account speaks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// JMAP (Fastmail and compatible servers).
+    #[default]
+    Jmap,
+    /// Proton Mail.
+    Proton,
+}
+
+impl Provider {
+    /// The name used in `config.toml` and on the command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Jmap => "jmap",
+            Provider::Proton => "proton",
+        }
+    }
+}
+
+impl std::str::FromStr for Provider {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Provider> {
+        match s {
+            "jmap" => Ok(Provider::Jmap),
+            "proton" => Ok(Provider::Proton),
+            _ => Err(Error::Config(format!(
+                "unknown provider {s:?}: use jmap or proton"
+            ))),
         }
     }
 }
@@ -104,6 +162,11 @@ pub struct Account {
     pub name: String,
     /// Sender identity; empty means unset.
     pub email: String,
+    /// Which protocol the account speaks.
+    pub provider: Provider,
+    /// Proton login name; empty means "use `email`".
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub username: String,
     /// JMAP session URL.
     pub session_url: String,
     /// Disabled accounts are neither synced nor shown.
@@ -119,6 +182,8 @@ impl Default for Account {
             id: DEFAULT_ACCOUNT_ID.to_string(),
             name: "Default".to_string(),
             email: String::new(),
+            provider: Provider::Jmap,
+            username: String::new(),
             session_url: DEFAULT_SESSION_URL.to_string(),
             enabled: true,
             classify: None,
@@ -134,6 +199,23 @@ impl Account {
             name: String::new(),
             email: email.to_string(),
             ..Account::default()
+        }
+    }
+
+    /// A new enabled Proton account.
+    pub fn proton(id: &str, email: &str) -> Account {
+        Account {
+            provider: Provider::Proton,
+            ..Account::new(id, email)
+        }
+    }
+
+    /// The Proton login name: `username`, else `email`.
+    pub fn login_name(&self) -> &str {
+        if self.username.is_empty() {
+            &self.email
+        } else {
+            &self.username
         }
     }
 
@@ -337,6 +419,15 @@ impl Config {
         Ok(())
     }
 
+    /// The `x-pm-appversion` to send: `$POSTO_PROTON_APP_VERSION`, else the
+    /// configured value, else `None`.
+    pub fn proton_app_version(&self) -> Option<String> {
+        std::env::var("POSTO_PROTON_APP_VERSION")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| Some(self.proton.app_version.clone()).filter(|v| !v.is_empty()))
+    }
+
     /// Path of the SQLite database.
     pub fn db_path() -> PathBuf {
         data_dir().join("posto.db")
@@ -417,6 +508,31 @@ struct SecretsFile {
     /// TypeSafe API key.
     #[serde(skip_serializing_if = "Option::is_none")]
     typesafe_key: Option<String>,
+    /// Proton sessions by account id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    proton: BTreeMap<String, ProtonSecret>,
+}
+
+/// What a Proton account keeps in `secrets.toml`.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProtonSecret {
+    /// Opaque JSON blob of the crate's persisted session.
+    pub session: String,
+    /// Mailbox password; the crate can only unlock keys from it.
+    pub mailbox_password: String,
+    /// Identifies one sign-in; see [`Secrets::set_proton_session`].
+    pub generation: u64,
+}
+
+impl std::fmt::Debug for ProtonSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtonSecret")
+            .field("session", &"<redacted>")
+            .field("mailbox_password", &"<redacted>")
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 /// Writes `text` to `path` through a fresh, uniquely named temporary file
@@ -587,6 +703,109 @@ impl Secrets {
         Self::update(|f| {
             f.tokens.remove(account_id);
         })
+    }
+
+    /// Forgets the token and the Proton login of `account_id`; a missing file
+    /// is fine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or written.
+    pub fn clear_account(account_id: &str) -> Result<()> {
+        if Self::read()?.is_none() {
+            return Ok(());
+        }
+
+        Self::update(|f| {
+            f.tokens.remove(account_id);
+            f.proton.remove(account_id);
+        })
+    }
+
+    /// The Proton login of `account_id`; `None` without a stored session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `secrets.toml` exists but cannot be read or
+    /// parsed.
+    pub fn proton(account_id: &str) -> Result<Option<ProtonSecret>> {
+        Ok(Self::read()?
+            .and_then(|mut f| f.proton.remove(account_id))
+            .filter(|s| !s.session.is_empty()))
+    }
+
+    /// Stores the Proton login of `account_id` as a new sign-in and returns
+    /// its generation. `secret.generation` is ignored: the new one is the
+    /// current time in nanoseconds, or one above the stored one if that is
+    /// not larger, so a generation is never reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or written.
+    pub fn set_proton(account_id: &str, secret: &ProtonSecret) -> Result<u64> {
+        let mut generation = 0;
+
+        Self::update(|f| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_nanos()).ok())
+                .unwrap_or(0);
+            let stored = f.proton.get(account_id).map_or(0, |s| s.generation);
+
+            generation = now.max(stored + 1);
+            f.proton.insert(
+                account_id.to_string(),
+                ProtonSecret {
+                    generation,
+                    ..secret.clone()
+                },
+            );
+        })?;
+
+        Ok(generation)
+    }
+
+    /// Replaces the session blob of `account_id` after a token refresh, but
+    /// only while the stored generation is still `generation`. `Ok(false)`
+    /// means a newer sign-in owns the entry and nothing was written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when `session` is not a JSON object,
+    /// [`Error::NotConfigured`] when the account has no Proton login, and an
+    /// error when the file cannot be read or written.
+    pub fn set_proton_session(account_id: &str, generation: u64, session: &str) -> Result<bool> {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(session)
+            .map_err(|_| Error::Config("proton session blob is not a JSON object".into()))?;
+
+        let mut outcome = Err(Error::NotConfigured(format!(
+            "proton login for account {account_id}"
+        )));
+
+        Self::update(|f| {
+            if let Some(entry) = f.proton.get_mut(account_id) {
+                outcome = Ok(entry.generation == generation);
+
+                if entry.generation == generation {
+                    entry.session = session.to_string();
+                }
+            }
+        })?;
+
+        outcome
+    }
+
+    /// Whether `account` has the credentials its provider needs.
+    ///
+    /// # Errors
+    ///
+    /// See [`Secrets::token_for`] and [`Secrets::proton`].
+    pub fn has_credentials(cfg: &Config, account: &Account) -> Result<bool> {
+        match account.provider {
+            Provider::Jmap => Ok(Self::token_for(cfg, &account.id)?.is_some()),
+            Provider::Proton => Ok(Self::proton(&account.id)?.is_some()),
+        }
     }
 
     /// `$TYPESAFE_API_KEY` if set, else the key in `secrets.toml`.
@@ -1041,5 +1260,153 @@ mod tests {
 
         // SAFETY: ENV_LOCK is held.
         unsafe { std::env::remove_var("POSTO_TOKEN") };
+    }
+
+    #[test]
+    fn provider_round_trips_and_defaults_to_jmap() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolate();
+        let mut cfg = Config::default();
+        let mut pm = Account::proton("pm", "me@proton.me");
+
+        pm.username = "me".into();
+        cfg.add_account(pm).unwrap();
+        cfg.save().unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+
+        assert_eq!(text.matches("provider = \"proton\"").count(), 1, "{text}");
+        assert_eq!(text.matches("username = \"me\"").count(), 1, "{text}");
+        assert_eq!(text.matches("provider = \"jmap\"").count(), 1, "{text}");
+        assert_eq!(Config::load().unwrap(), cfg);
+
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[accounts]]\nid = \"old\"\nemail = \"a@b.c\"\n",
+        )
+        .unwrap();
+
+        let old = Config::load().unwrap();
+
+        assert_eq!(old.accounts[0].provider, Provider::Jmap);
+        assert_eq!(old.accounts[0].login_name(), "a@b.c");
+        assert_eq!("proton".parse::<Provider>().unwrap(), Provider::Proton);
+        assert!(matches!("imap".parse::<Provider>(), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn proton_app_version_prefers_env_then_config() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _dir = isolate();
+        let mut cfg = Config::default();
+
+        // SAFETY: ENV_LOCK is held.
+        unsafe { std::env::remove_var("POSTO_PROTON_APP_VERSION") };
+
+        cfg.proton.app_version = String::new();
+        assert_eq!(cfg.proton_app_version(), None);
+
+        cfg.proton.app_version = "web-mail@5.0.0".into();
+        assert_eq!(cfg.proton_app_version().as_deref(), Some("web-mail@5.0.0"));
+
+        // SAFETY: ENV_LOCK is held.
+        unsafe { std::env::set_var("POSTO_PROTON_APP_VERSION", "x") };
+        assert_eq!(cfg.proton_app_version().as_deref(), Some("x"));
+
+        // SAFETY: ENV_LOCK is held.
+        unsafe { std::env::remove_var("POSTO_PROTON_APP_VERSION") };
+    }
+
+    #[test]
+    fn proton_secrets_live_beside_tokens() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolate();
+        let secret = ProtonSecret {
+            session: "{\"uid\":\"u\"}".into(),
+            mailbox_password: "pw".into(),
+            ..ProtonSecret::default()
+        };
+        let session_of = || Secrets::proton("pm").unwrap().unwrap().session;
+
+        Secrets::set_token("fm", "t1").unwrap();
+
+        let g1 = Secrets::set_proton("pm", &secret).unwrap();
+
+        assert!(g1 > 0);
+        assert_eq!(Secrets::token("fm").unwrap().as_deref(), Some("t1"));
+        assert_eq!(
+            Secrets::proton("pm").unwrap(),
+            Some(ProtonSecret {
+                generation: g1,
+                ..secret.clone()
+            })
+        );
+
+        let a2 = "{\"uid\":\"u\",\"access_token\":\"a2\"}";
+
+        assert!(Secrets::set_proton_session("pm", g1, a2).unwrap());
+        assert_eq!(session_of(), a2);
+        assert_eq!(
+            Secrets::proton("pm").unwrap().unwrap().mailbox_password,
+            "pw"
+        );
+
+        // A stale generation, a non-object and non-JSON leave the entry alone.
+        assert!(!Secrets::set_proton_session("pm", g1 + 1, "{\"uid\":\"x\"}").unwrap());
+        assert_eq!(session_of(), a2);
+
+        for bad in ["[1,2]", "not json"] {
+            assert!(matches!(
+                Secrets::set_proton_session("pm", g1, bad),
+                Err(Error::Config(_))
+            ));
+            assert_eq!(session_of(), a2);
+        }
+
+        // A fresh sign-in invalidates the old generation, also after clear_account.
+        let g2 = Secrets::set_proton("pm", &secret).unwrap();
+
+        assert!(g2 > g1);
+        assert!(!Secrets::set_proton_session("pm", g1, a2).unwrap());
+
+        Secrets::clear_account("pm").unwrap();
+
+        let g3 = Secrets::set_proton("pm", &secret).unwrap();
+
+        assert!(g3 > g2);
+        assert!(!Secrets::set_proton_session("pm", g1, a2).unwrap());
+        assert!(Secrets::set_proton_session("pm", g3, a2).unwrap());
+        assert!(matches!(
+            Secrets::set_proton_session("ghost", g1, a2),
+            Err(Error::NotConfigured(_))
+        ));
+
+        let cfg = Config::default();
+
+        assert!(Secrets::has_credentials(&cfg, &Account::proton("pm", "")).unwrap());
+        assert!(!Secrets::has_credentials(&cfg, &Account::proton("other", "")).unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(dir.path().join("secrets.toml"))
+                .unwrap()
+                .permissions()
+                .mode();
+
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let shown = format!("{secret:?}");
+
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(!shown.contains("pw") && !shown.contains("uid"), "{shown}");
+
+        Secrets::clear_account("pm").unwrap();
+        Secrets::clear_account("fm").unwrap();
+
+        assert_eq!(Secrets::proton("pm").unwrap(), None);
+        assert_eq!(Secrets::token("fm").unwrap(), None);
     }
 }
