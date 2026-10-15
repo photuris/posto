@@ -4759,14 +4759,17 @@ name = "posto-core"
 version = "0.1.0"
 dependencies = [
  "ammonia",
+ "base64 0.22.1",
  "chrono",
  "dirs 7.0.0",
  "fd-lock",
  "html2text",
  "notify",
  "percent-encoding",
+ "pgp",
  "proton-mail-api",
  "pulldown-cmark",
+ "rand 0.8.8",
  "reqwest",
  "rusqlite",
  "serde",

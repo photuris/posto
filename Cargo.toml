@@ -30,4 +30,7 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wiremock = "0.6"
+pgp = "0.21"
+base64 = "0.22"
+rand = "0.8"
 tempfile = "3"
