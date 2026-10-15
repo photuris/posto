@@ -83,6 +83,15 @@ impl Drop for Sandbox {
     }
 }
 
+/// The `error` field of the JSON a failed command printed on stderr.
+fn error_text(out: &Output) -> String {
+    let err = String::from_utf8_lossy(&out.stderr);
+    let v: Value = serde_json::from_str(err.trim())
+        .unwrap_or_else(|_| panic!("stderr is not one JSON object: {err}"));
+
+    v["error"].as_str().expect("error field").to_owned()
+}
+
 #[test]
 fn account_show_defaults() {
     let sb = Sandbox::new();
@@ -213,10 +222,9 @@ fn proton_account_add_show_and_sync_without_login() {
     let sync = sb.run_with(&["sync", "run", "--account", "pm"], None);
 
     assert_eq!(sync.status.code(), Some(3));
-    assert!(
-        String::from_utf8_lossy(&sync.stderr).contains("proton login"),
-        "{}",
-        String::from_utf8_lossy(&sync.stderr)
+    assert_eq!(
+        error_text(&sync),
+        "not configured: proton login for account pm"
     );
 
     let set = sb.run_with(
@@ -225,6 +233,10 @@ fn proton_account_add_show_and_sync_without_login() {
     );
 
     assert_eq!(set.status.code(), Some(3));
+    assert_eq!(
+        error_text(&set),
+        "config: account pm is a Proton account: use `account login`"
+    );
 
     let bad = sb.run_with(
         &[
@@ -267,7 +279,7 @@ fn proton_login_validates_inputs_before_any_network() {
         "proton",
     ]);
 
-    // (args, stdin, expected stderr text)
+    // (args, stdin, expected `error` text)
     let cases: [(&[&str], &str, &str); 3] = [
         (
             &[
@@ -278,12 +290,12 @@ fn proton_login_validates_inputs_before_any_network() {
                 "--password-stdin",
             ],
             "pw\n",
-            "not a Proton account",
+            "config: account default is not a Proton account",
         ),
         (
             &["account", "login", "--account", "pm", "--password-stdin"],
             "",
-            "empty password on stdin",
+            "config: empty password on stdin",
         ),
         (
             &[
@@ -295,7 +307,7 @@ fn proton_login_validates_inputs_before_any_network() {
                 "--two-password",
             ],
             "pw\n",
-            "mailbox password missing",
+            "config: mailbox password missing: give it on the second stdin line",
         ),
     ];
 
@@ -304,7 +316,7 @@ fn proton_login_validates_inputs_before_any_network() {
         let err = String::from_utf8_lossy(&out.stderr);
 
         assert_eq!(out.status.code(), Some(3), "{args:?}: {err}");
-        assert!(err.contains(expected), "{args:?}: {err}");
+        assert_eq!(error_text(&out), expected, "{args:?}");
         assert!(!err.contains("transport") && !err.contains("http"), "{err}");
     }
 
@@ -322,7 +334,7 @@ fn proton_login_validates_inputs_before_any_network() {
     let err = String::from_utf8_lossy(&out.stderr);
 
     assert_eq!(out.status.code(), Some(3), "{err}");
-    assert!(err.contains("proton.app_version"), "{err}");
+    assert_eq!(error_text(&out), "not configured: proton.app_version");
     assert!(!err.contains("transport") && !err.contains("http"), "{err}");
     assert!(
         started.elapsed().as_secs() < 10,
@@ -955,5 +967,66 @@ fn destroy_requires_yes_and_mirrors_offline() {
     assert_eq!(
         sb.run_with(&["email", "show", "fx-01"], None).status.code(),
         Some(6)
+    );
+}
+
+/// Each provider connects with its own stored credentials. Both runs stay on
+/// the machine: the JMAP session URL is a closed loopback port and the Proton
+/// session blob is unreadable, so no request leaves the process.
+#[test]
+fn credentialed_accounts_connect_with_their_own_provider() {
+    let sb = Sandbox::new();
+    let env = [("POSTO_PROTON_APP_VERSION", "posto-test@0.0.0")];
+
+    sb.json(&[
+        "account",
+        "add",
+        "--id",
+        "jm",
+        "--email",
+        "j@x.io",
+        "--session-url",
+        "http://127.0.0.1:1/session",
+    ]);
+    sb.json(&[
+        "account",
+        "add",
+        "--id",
+        "pm",
+        "--email",
+        "me@proton.me",
+        "--provider",
+        "proton",
+    ]);
+    std::fs::write(
+        sb.0.join("secrets.toml"),
+        "[tokens]\njm = \"tok\"\n\n[proton.pm]\nsession = \"not json\"\nmailbox_password = \"mp\"\ngeneration = 1\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        sb.json(&["account", "show", "--account", "jm"])["has_token"],
+        true
+    );
+    assert_eq!(
+        sb.json(&["account", "show", "--account", "pm"])["has_token"],
+        true
+    );
+
+    let jmap = sb.run_env(&["sync", "run", "--account", "jm"], None, &env);
+
+    assert_eq!(jmap.status.code(), Some(5), "{}", error_text(&jmap));
+    assert!(
+        error_text(&jmap).starts_with("http: "),
+        "{}",
+        error_text(&jmap)
+    );
+
+    let proton = sb.run_env(&["sync", "run", "--account", "pm"], None, &env);
+
+    assert_eq!(proton.status.code(), Some(3));
+    assert_eq!(
+        error_text(&proton),
+        "not configured: proton session for this account is unreadable; sign in again"
     );
 }

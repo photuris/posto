@@ -3,9 +3,9 @@
 //! empty keys and no operation here decrypts.
 
 use posto_core::actions::{self, Action};
-use posto_core::config::{Account, Config};
+use posto_core::config::{Account, Config, ProtonSecret};
 use posto_core::proton::Session;
-use posto_core::provider::Connection;
+use posto_core::provider::{Connection, Credentials, Identity, connect_with_credentials};
 use posto_core::store::{ListQuery, Store};
 use posto_core::sync::sync_account;
 use posto_core::{Error, Result};
@@ -18,6 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const LABELS_1: &str = include_str!("fixtures/proton/labels_1.json");
 const LABELS_FOLDERS: &str = include_str!("fixtures/proton/labels_folders.json");
 const LABELS_SYSTEM_FULL: &str = include_str!("fixtures/proton/labels_system_full.json");
+const SESSION: &str = include_str!("fixtures/session.json");
 const ADDRESSES: &str = include_str!("fixtures/proton/addresses.json");
 
 /// The first user label in `labels_1.json`.
@@ -167,6 +168,23 @@ async fn proton_sync_through_the_core() {
     assert!(report.initial);
     assert_eq!(state(&store, "provider").as_deref(), Some("proton"));
     assert_eq!(state(&store, "email_state").as_deref(), Some("ev0"));
+    assert_eq!(state(&store, "account_id").as_deref(), Some("user-1"));
+
+    // The sending addresses of the fixture, through this connection.
+    let identity = |id: &str, email: &str| Identity {
+        id: id.into(),
+        name: "<scrubbed>".into(),
+        email: email.into(),
+    };
+
+    assert_eq!(report.identities, 2);
+    assert_eq!(
+        store.identities("a").unwrap(),
+        [
+            identity("id-4", "user1@example.invalid"),
+            identity("id-7", "user2@example.invalid"),
+        ]
+    );
 
     for role in ["inbox", "drafts", "sent", "archive", "junk", "trash"] {
         assert!(
@@ -378,4 +396,90 @@ async fn proton_actions_through_the_core() {
             .keywords
             .contains(&"$flagged".to_owned())
     );
+}
+
+/// A Proton login whose session blob is not JSON, so connecting fails before
+/// any request.
+fn broken_login() -> ProtonSecret {
+    ProtonSecret {
+        session: "not json".into(),
+        mailbox_password: "mp".into(),
+        generation: 1,
+    }
+}
+
+fn config_with_app_version(version: &str) -> Config {
+    let mut cfg = cfg_a();
+
+    cfg.proton.app_version = version.into();
+
+    cfg
+}
+
+fn error_of(result: Result<Connection>) -> String {
+    result.expect_err("connecting must fail").to_string()
+}
+
+#[tokio::test]
+async fn connect_dispatches_on_the_account_provider() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(SESSION.replace("{{base}}", &server.uri()))
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut jmap = Account::new("j", "j@x.io");
+
+    jmap.session_url = format!("{}/session", server.uri());
+
+    let proton = Account::proton("p", "p@proton.me");
+    let cfg = config_with_app_version("posto-test@0");
+
+    // A JMAP account with a token is a JMAP connection.
+    let conn = connect_with_credentials(&cfg, &jmap, Credentials::Token("tok".into()))
+        .await
+        .unwrap();
+
+    assert!(matches!(conn, Connection::Jmap(_)));
+
+    // Each account refuses the other provider's credentials, without asking
+    // the server.
+    let before = server.received_requests().await.unwrap().len();
+    let wrong_kind =
+        connect_with_credentials(&cfg, &jmap, Credentials::Proton(broken_login())).await;
+
+    assert_eq!(error_of(wrong_kind), "not configured: token for account j");
+
+    let wrong_kind =
+        connect_with_credentials(&cfg, &proton, Credentials::Token("tok".into())).await;
+
+    assert_eq!(
+        error_of(wrong_kind),
+        "not configured: proton login for account p"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+
+    // A Proton account reads the session blob and reports an unreadable one.
+    let broken = connect_with_credentials(&cfg, &proton, Credentials::Proton(broken_login())).await;
+
+    assert_eq!(
+        error_of(broken),
+        "not configured: proton session for this account is unreadable; sign in again"
+    );
+
+    // Without an app version (config and environment) it cannot connect. The
+    // test cannot clear the environment, so it skips this case if it is set.
+    if std::env::var_os("POSTO_PROTON_APP_VERSION").is_none() {
+        let unset = config_with_app_version("");
+        let missing =
+            connect_with_credentials(&unset, &proton, Credentials::Proton(broken_login())).await;
+
+        assert_eq!(error_of(missing), "not configured: proton.app_version");
+    }
 }

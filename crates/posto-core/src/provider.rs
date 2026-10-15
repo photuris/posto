@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compose::Draft;
-use crate::config::{Account, Config, Provider, Secrets};
+use crate::config::{Account, Config, ProtonSecret, Provider, Secrets};
 use crate::error::{Error, Result};
 use crate::jmap;
 use crate::proton;
@@ -291,6 +291,15 @@ impl Connection {
     }
 }
 
+/// The stored credentials of one account.
+#[doc(hidden)]
+pub enum Credentials {
+    /// A JMAP bearer token.
+    Token(String),
+    /// A Proton login.
+    Proton(ProtonSecret),
+}
+
 /// Connects `account` with its stored credentials; `Ok(None)` when it has
 /// none, so callers that work offline can carry on.
 ///
@@ -304,23 +313,40 @@ pub async fn connect(cfg: &Config, account: &Account) -> Result<Option<Connectio
         return Ok(None);
     }
 
-    match account.provider {
-        Provider::Jmap => {
-            let Some(token) = Secrets::token_for(cfg, &account.id)? else {
-                return Ok(None);
-            };
+    let credentials = match account.provider {
+        Provider::Jmap => Secrets::token_for(cfg, &account.id)?.map(Credentials::Token),
+        Provider::Proton => Secrets::proton(&account.id)?.map(Credentials::Proton),
+    };
 
-            Ok(Some(Connection::Jmap(
-                jmap::Client::connect(&account.session_url, &token).await?,
-            )))
-        }
-        Provider::Proton => {
+    match credentials {
+        Some(credentials) => connect_with_credentials(cfg, account, credentials)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+/// [`connect`] with the credentials supplied instead of read from the secrets
+/// file.
+///
+/// # Errors
+///
+/// As for [`connect`]; credentials of the other provider are
+/// [`Error::NotConfigured`] (see [`credential_error`]).
+#[doc(hidden)]
+pub async fn connect_with_credentials(
+    cfg: &Config,
+    account: &Account,
+    credentials: Credentials,
+) -> Result<Connection> {
+    match (account.provider, credentials) {
+        (Provider::Jmap, Credentials::Token(token)) => Ok(Connection::Jmap(
+            jmap::Client::connect(&account.session_url, &token).await?,
+        )),
+        (Provider::Proton, Credentials::Proton(secret)) => {
             let app_version = cfg
                 .proton_app_version()
                 .ok_or_else(|| Error::NotConfigured("proton.app_version".into()))?;
-            let Some(secret) = Secrets::proton(&account.id)? else {
-                return Ok(None);
-            };
             let id = account.id.clone();
             let generation = secret.generation;
             let session = proton::connect(
@@ -333,8 +359,9 @@ pub async fn connect(cfg: &Config, account: &Account) -> Result<Option<Connectio
             )
             .await?;
 
-            Ok(Some(Connection::Proton(session)))
+            Ok(Connection::Proton(session))
         }
+        _ => Err(credential_error(account)),
     }
 }
 
