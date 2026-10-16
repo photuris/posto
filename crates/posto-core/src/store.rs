@@ -2270,14 +2270,24 @@ mod tests {
         assert_eq!(ids(&both, 0, 0), ["e13", "e12", "e11", "e10"]);
         assert_eq!(ids(&both, 2, 1), ["e12", "e11"]);
 
+        // Equal timestamps: account id breaks the tie, then email id. The
+        // members are listed against that order (b before a, m1 before m2) so
+        // a timestamp-only sort would give t1, t2, u2, u1.
+        store
+            .upsert_mailboxes(&[mailbox_of("a", "m2", "Two", None)])
+            .unwrap();
         store
             .upsert_emails(&[
                 email_in("b", "t1", "2026-10-01T09:00:00Z", "s", &["x1"]),
                 email_in("a", "t2", "2026-10-01T09:00:00Z", "s", &["m1"]),
+                email_in("a", "u2", "2026-10-01T08:00:00Z", "s", &["m1"]),
+                email_in("a", "u1", "2026-10-01T08:00:00Z", "s", &["m2"]),
             ])
             .unwrap();
 
-        assert_eq!(ids(&both, 0, 0)[4..], ["t2", "t1"]);
+        let ties = members(&[("b", "x1"), ("a", "m1"), ("a", "m2")]);
+
+        assert_eq!(ids(&ties, 0, 0)[4..], ["t2", "t1", "u1", "u2"]);
 
         // A second fixture: 202 emails in one mailbox, to pin the default cap
         // and the saturating page size.
