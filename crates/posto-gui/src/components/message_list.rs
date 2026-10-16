@@ -155,7 +155,11 @@ pub fn MessageList() -> Element {
                                 let shown = name.filter(|n| {
                                     !chips.iter().any(|(c, _)| c.eq_ignore_ascii_case(n))
                                         && mailbox.as_ref().is_none_or(|m| !m.name.eq_ignore_ascii_case(n))
-                                        && group.as_ref().is_none_or(|g| !g.name.eq_ignore_ascii_case(n))
+                                        && group.as_ref().is_none_or(|g| {
+                                            // Grouping trims and lower-cases names; so does this.
+                                            g.key != format!("name:{}", n.trim().to_lowercase())
+                                                && !g.name.eq_ignore_ascii_case(n)
+                                        })
                                 });
 
                                 (shown, *unsure)

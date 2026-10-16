@@ -3375,7 +3375,8 @@ mod tests {
         let (mut dom, store) = two_accounts();
         let _guard = RuntimeGuard::new(dom.runtime());
 
-        // Tray `updates` is filed under a mailbox called Promos.
+        // Tray `updates` is filed under a mailbox called Promos; the first
+        // account spells it with spaces, which grouping ignores.
         dom.in_scope(ScopeId::ROOT, || {
             backend()
                 .write()
@@ -3387,12 +3388,13 @@ mod tests {
         store
             .upsert_mailboxes(&[
                 named_box("default", "inbox", "Inbox", Some("inbox"), None),
-                named_box("default", "promos", "Promos", None, None),
+                named_box("default", "promos", " Promos ", None, None),
                 named_box("work", "inbox", "Inbox", Some("inbox"), None),
+                named_box("work", "promos", "Promos", None, None),
             ])
             .unwrap();
         store
-            .upsert_emails(&[labelled_in("default", "p1", &["promos"])])
+            .upsert_emails(&[labelled_in("work", "p1", &["promos"])])
             .unwrap();
         reload_mailboxes();
         *SELECTED_MAILBOX.write() = Some(Folder::Merged {
@@ -3401,12 +3403,12 @@ mod tests {
         reload_list().await;
         edits(&mut dom);
 
-        assert_eq!(list_order(), ["default/p1"]);
+        assert_eq!(list_order(), ["work/p1"]);
 
         // Classified as `updates`, which this config files under Promos.
         store
             .put_classification(&Classified {
-                account_id: "default".into(),
+                account_id: "work".into(),
                 email_id: "p1".into(),
                 tray: "updates".into(),
                 probs: Default::default(),
@@ -3423,7 +3425,7 @@ mod tests {
             .unwrap();
         reload_list().await;
 
-        assert!(CLASSIFIED.peek().contains_key("default/p1"));
+        assert!(CLASSIFIED.peek().contains_key("work/p1"));
 
         let reappeared = edits(&mut dom)
             .into_iter()
