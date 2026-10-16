@@ -101,10 +101,12 @@ input.invalid { border-color: #d33; }
 .row:hover .icon, .row.selected .icon { color: var(--fg); }
 .flag, .flag .icon { color: var(--posto-accent); }
 .flag, .clip { display: inline-flex; }
-.sidebar-group {
-  padding: 12px 8px 4px; font-size: 11px; letter-spacing: 0.06em;
-  text-transform: uppercase; color: var(--posto-muted);
+.mailbox.member { padding-left: 32px; }
+.disclosure {
+  flex: none; width: 16px; padding: 0; border: 0; background: none;
+  font-size: 11px; line-height: 1; color: var(--posto-muted); cursor: pointer;
 }
+.disclosure:hover { color: var(--fg); }
 .mailbox .name { flex: 1; }
 .badge { font-size: 12px; color: var(--posto-muted); }
 

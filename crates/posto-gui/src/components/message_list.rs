@@ -2,10 +2,11 @@
 
 use dioxus::prelude::*;
 use posto_core::classify::Tray;
+use posto_core::store::mailbox_groups;
 
 use crate::app::{
     CLASSIFIED, EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION,
-    SIDEBAR_OPEN, backend, click_email, dispatch, load_more, tray_label,
+    SIDEBAR_OPEN, backend, click_email, dispatch, enabled_ids, load_more, tray_label,
 };
 use crate::components::Icon;
 use crate::format;
@@ -32,22 +33,24 @@ pub fn MessageList() -> Element {
             .cloned(),
         _ => None,
     };
-    let unified = current == Some(Folder::AllInboxes);
+    let group = match &current {
+        Some(Folder::Merged { key }) => mailbox_groups(&mailboxes, &enabled_ids(&cfg))
+            .into_iter()
+            .find(|g| g.key == *key),
+        _ => None,
+    };
     let accounts: Vec<(String, String)> = cfg
         .accounts_enabled()
         .map(|a| (a.id.clone(), a.display_name().to_string()))
         .collect();
     // Rows of several accounts say which account they belong to.
-    let tag_accounts = accounts.len() > 1 && (unified || searching);
-    let inboxes = || {
-        mailboxes
-            .iter()
-            .filter(|m| m.role.as_deref() == Some("inbox"))
-    };
+    let tag_accounts = accounts.len() > 1 && (group.is_some() || searching);
     // Sent and drafts are about who the mail went to.
-    let show_recipient = mailbox
+    let folder_role = mailbox
         .as_ref()
-        .is_some_and(|m| matches!(m.role.as_deref(), Some("sent" | "drafts")));
+        .and_then(|m| m.role.as_deref())
+        .or(group.as_ref().and_then(|g| g.role.as_deref()));
+    let show_recipient = matches!(folder_role, Some("sent" | "drafts"));
     let (title, counts) = match (&mailbox, searching) {
         (_, true) => ("Search".to_string(), format!("{} results", emails.len())),
         (None, _) => match &current {
@@ -63,15 +66,13 @@ pub fn MessageList() -> Element {
                     format!("{} messages to review", emails.len()),
                 )
             }
-            _ if unified => (
-                "All inboxes".to_string(),
-                format!(
-                    "{} messages, {} unread",
-                    inboxes().map(|m| m.total).sum::<i64>(),
-                    inboxes().map(|m| m.unread).sum::<i64>()
+            _ => match &group {
+                Some(g) => (
+                    g.name.clone(),
+                    format!("{} messages, {} unread", g.total, g.unread),
                 ),
-            ),
-            _ => ("Posto".to_string(), String::new()),
+                None => ("Posto".to_string(), String::new()),
+            },
         },
         (Some(m), _) => (
             m.name.clone(),
@@ -139,9 +140,9 @@ pub fn MessageList() -> Element {
                                         Some(Folder::Mailbox { account_id, id }) => {
                                             !(m.account_id == *account_id && m.id == *id)
                                         }
-                                        Some(Folder::AllInboxes) => {
-                                            m.role.as_deref() != Some("inbox")
-                                        }
+                                        Some(Folder::Merged { .. }) => !group.as_ref().is_some_and(|g| {
+                                            g.members.iter().any(|(a, id)| *a == m.account_id && *id == m.id)
+                                        }),
                                         Some(Folder::Unsure { .. }) | None => true,
                                     })
                                     .map(|m| (m.name.clone(), format::avatar_hue(&m.name))),

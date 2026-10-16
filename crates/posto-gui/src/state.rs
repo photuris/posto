@@ -15,8 +15,12 @@ use posto_core::{Error, Result, fixtures};
 /// What the message list shows when no search is active.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Folder {
-    /// The inbox of every enabled account, merged (only offered with several accounts).
-    AllInboxes,
+    /// A mailbox group (see `posto_core::store::mailbox_groups`) listed as one:
+    /// the members are looked up from the current mailboxes by `key`.
+    Merged {
+        /// Group key, `role:<role>` or `name:<name>`.
+        key: String,
+    },
     /// One mailbox of one account.
     Mailbox {
         /// Local account slug.

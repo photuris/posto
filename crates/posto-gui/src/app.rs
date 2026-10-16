@@ -1,7 +1,7 @@
 //! Root component, global signals, action dispatch and background work.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,10 @@ use posto_core::classify::{self, Classifier, ClassifyReport, JEV_BASE_URL, JevCl
 use posto_core::config::{Account, Config, Secrets, UiConfig};
 use posto_core::provider::{Connection, Identity};
 use posto_core::shortcuts::{Action, Keymap};
-use posto_core::store::{Attachment, EmailBody, EmailSummary, ListQuery, Mailbox, MsgRef};
+use posto_core::store::{
+    Attachment, EmailBody, EmailSummary, ListQuery, Mailbox, MailboxGroup, MsgRef, mailbox_groups,
+    mailbox_path,
+};
 use posto_core::theme::{self, Theme, Watcher};
 use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -78,6 +81,8 @@ const TOAST: Duration = Duration::from_secs(6);
 pub static SELECTED_MAILBOX: GlobalSignal<Option<Folder>> = Signal::global(|| None);
 /// The mailboxes of every enabled account.
 pub static MAILBOXES: GlobalSignal<Vec<Mailbox>> = Signal::global(Vec::new);
+/// Keys of the mailbox groups whose per-account members the sidebar lists.
+pub static EXPANDED: GlobalSignal<BTreeSet<String>> = Signal::global(BTreeSet::new);
 /// Each account's sending identities, as last synced.
 pub static IDENTITIES: GlobalSignal<BTreeMap<String, Vec<Identity>>> =
     Signal::global(BTreeMap::new);
@@ -511,24 +516,12 @@ pub fn dispatch(action: Action) {
         Action::ToggleRead => toggle(true),
         Action::ToggleFlag => toggle(false),
         Action::Move => {
-            let refs = selected_refs();
-
-            if refs.is_empty() {
-                // Nothing to move.
-            } else if group_by_account(&refs).len() > 1 {
-                set_status("Select messages from one account to move them.");
-            } else {
+            if !selected_refs().is_empty() {
                 *SHOW_MOVE_PICKER.write() = true;
             }
         }
         Action::Label => {
-            let refs = selected_refs();
-
-            if refs.is_empty() {
-                // Nothing to label.
-            } else if group_by_account(&refs).len() > 1 {
-                set_status("Select messages from one account to label them.");
-            } else {
+            if !selected_refs().is_empty() {
                 *SHOW_LABEL_PICKER.write() = true;
             }
         }
@@ -804,24 +797,34 @@ pub async fn get_client(account_id: &str) -> Result<Option<Arc<Connection>>> {
 /// Applies `action` to the server and store, account by account, and mirrors
 /// it in the mailbox badges.
 async fn apply_local(refs: &[MsgRef], action: actions::Action) -> Result<usize> {
-    let b = backend().peek().clone();
     let mut applied = 0;
 
     for (account, ids) in group_by_account(refs) {
-        let client = get_client(&account).await?;
-        let before: Vec<EmailSummary> = ids
-            .iter()
-            .filter_map(|id| b.store.email(&account, id).ok().flatten())
-            .collect();
+        applied += apply_one_account(&account, &ids, action.clone()).await?;
+    }
 
-        applied +=
-            actions::apply(&b.store, client.as_deref(), &account, &ids, action.clone()).await?;
+    Ok(applied)
+}
 
-        for old in &before {
-            let new = b.store.email(&account, &old.id).ok().flatten();
+/// Applies `action` to `ids` of one `account` and mirrors it in the mailbox
+/// badges; returns how many emails the core reports as changed.
+async fn apply_one_account(
+    account: &str,
+    ids: &[String],
+    action: actions::Action,
+) -> Result<usize> {
+    let b = backend().peek().clone();
+    let client = get_client(account).await?;
+    let before: Vec<EmailSummary> = ids
+        .iter()
+        .filter_map(|id| b.store.email(account, id).ok().flatten())
+        .collect();
+    let applied = actions::apply(&b.store, client.as_deref(), account, ids, action).await?;
 
-            bump_counts(old, new.as_ref());
-        }
+    for old in &before {
+        let new = b.store.email(account, &old.id).ok().flatten();
+
+        bump_counts(old, new.as_ref());
     }
 
     Ok(applied)
@@ -874,9 +877,11 @@ pub fn reload_identities() {
 
 /// The folder to start on: the merged inbox with several accounts, else the
 /// first inbox (or first mailbox).
-fn default_folder(mailboxes: &[Mailbox], accounts: usize) -> Option<Folder> {
-    if accounts > 1 {
-        return Some(Folder::AllInboxes);
+fn default_folder(mailboxes: &[Mailbox], accounts: &[String]) -> Option<Folder> {
+    if accounts.len() > 1 {
+        return Some(Folder::Merged {
+            key: "role:inbox".into(),
+        });
     }
 
     mailboxes
@@ -889,10 +894,12 @@ fn default_folder(mailboxes: &[Mailbox], accounts: usize) -> Option<Folder> {
         })
 }
 
-/// True when `folder` still exists among `mailboxes` (or is offered at all).
-fn folder_exists(folder: &Folder, mailboxes: &[Mailbox], accounts: usize) -> bool {
+/// True when `folder` still exists among `mailboxes` of the enabled `accounts`.
+fn folder_exists(folder: &Folder, mailboxes: &[Mailbox], accounts: &[String]) -> bool {
     match folder {
-        Folder::AllInboxes => accounts > 1,
+        Folder::Merged { key } => mailbox_groups(mailboxes, accounts)
+            .iter()
+            .any(|g| g.key == *key),
         Folder::Mailbox { account_id, id } => mailboxes
             .iter()
             .any(|m| m.account_id == *account_id && m.id == *id),
@@ -900,11 +907,114 @@ fn folder_exists(folder: &Folder, mailboxes: &[Mailbox], accounts: usize) -> boo
     }
 }
 
+/// The ids of the enabled accounts, in config order.
+pub fn enabled_ids(cfg: &Config) -> Vec<String> {
+    cfg.accounts_enabled().map(|a| a.id.clone()).collect()
+}
+
+/// The mailbox group with `key` among the enabled accounts' current mailboxes.
+fn group_by_key(key: &str) -> Option<MailboxGroup> {
+    let accounts = enabled_ids(&backend().peek().cfg);
+
+    mailbox_groups(&MAILBOXES.peek(), &accounts)
+        .into_iter()
+        .find(|g| g.key == key)
+}
+
+/// Shows or hides the per-account members of the group with `key`.
+pub fn toggle_expanded(key: &str) {
+    let mut expanded = EXPANDED.write();
+
+    if !expanded.remove(key) {
+        expanded.insert(key.to_string());
+    }
+}
+
+/// One line of the multi-account sidebar's group section.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SidebarRow {
+    /// A mailbox group with its summed unread count.
+    Group {
+        /// Group key.
+        key: String,
+        /// Group display name.
+        name: String,
+        /// The group's role, for its icon.
+        role: Option<String>,
+        /// Unread messages in all members.
+        unread: i64,
+        /// Whether the members follow.
+        expanded: bool,
+    },
+    /// One member of an expanded group.
+    Member {
+        /// The folder a click selects.
+        folder: Folder,
+        /// Account name, plus the mailbox path when the account has several members.
+        label: String,
+        /// Unread messages in the member.
+        unread: i64,
+    },
+}
+
+/// The rows of the multi-account sidebar: one per group, each followed by its
+/// members when `expanded` holds its key. `accounts` are `(id, display name)`.
+pub fn sidebar_rows(
+    groups: &[MailboxGroup],
+    expanded: &BTreeSet<String>,
+    accounts: &[(String, String)],
+    mailboxes: &[Mailbox],
+) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+
+    for g in groups {
+        let open = expanded.contains(&g.key);
+
+        rows.push(SidebarRow::Group {
+            key: g.key.clone(),
+            name: g.name.clone(),
+            role: g.role.clone(),
+            unread: g.unread,
+            expanded: open,
+        });
+
+        if !open {
+            continue;
+        }
+
+        for (account, id) in &g.members {
+            let name = accounts
+                .iter()
+                .find(|(a, _)| a == account)
+                .map_or(account.as_str(), |(_, name)| name.as_str());
+            let several = g.members.iter().filter(|(a, _)| a == account).count() > 1;
+            let label = match mailbox_path(mailboxes, account, id) {
+                Some(path) if several => format!("{name} › {path}"),
+                _ => name.to_string(),
+            };
+
+            rows.push(SidebarRow::Member {
+                folder: Folder::Mailbox {
+                    account_id: account.clone(),
+                    id: id.clone(),
+                },
+                label,
+                unread: mailboxes
+                    .iter()
+                    .find(|m| m.account_id == *account && m.id == *id)
+                    .map_or(0, |m| m.unread),
+            });
+        }
+    }
+
+    rows
+}
+
 /// Re-reads the mailbox list (and server counts) of every enabled account;
 /// selects a default folder when none is selected or the selection is gone.
 pub fn reload_mailboxes() {
     let b = backend().peek().clone();
-    let accounts = b.cfg.accounts_enabled().count();
+    let accounts = enabled_ids(&b.cfg);
     let mut all = Vec::new();
 
     for a in b.cfg.accounts_enabled() {
@@ -918,9 +1028,9 @@ pub fn reload_mailboxes() {
 
     if !current
         .as_ref()
-        .is_some_and(|f| folder_exists(f, &all, accounts))
+        .is_some_and(|f| folder_exists(f, &all, &accounts))
     {
-        let next = default_folder(&all, accounts);
+        let next = default_folder(&all, &accounts);
 
         if next != current {
             *SELECTED_MAILBOX.write() = next;
@@ -978,6 +1088,10 @@ pub async fn reload_list() {
     let limit = *LIST_LIMIT.peek();
     let store = b.store.clone();
     let (q, f) = (query.clone(), folder.clone());
+    let members = match &folder {
+        Some(Folder::Merged { key }) => group_by_key(key).map(|g| g.members).unwrap_or_default(),
+        _ => Vec::new(),
+    };
 
     let loaded = tokio::task::spawn_blocking(move || {
         if !q.is_empty() {
@@ -985,10 +1099,9 @@ pub async fn reload_list() {
         }
 
         match f {
-            Some(Folder::AllInboxes) => store.list_emails(
-                None,
+            Some(Folder::Merged { .. }) => store.list_emails_in(
+                &members,
                 &ListQuery {
-                    role: Some("inbox".into()),
                     limit,
                     ..Default::default()
                 },
@@ -1197,12 +1310,27 @@ pub fn selected_emails<'a>(
         .collect()
 }
 
-/// Whether `selected` are in `mailbox_id`: all, some or none of them.
-pub fn label_state(selected: &[&EmailSummary], mailbox_id: &str) -> LabelState {
-    let has = selected
+/// The mailbox ids of `account` among the group `members`.
+fn account_members<'a>(
+    members: &'a [(String, String)],
+    account: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    members
         .iter()
-        .filter(|e| e.mailbox_ids.iter().any(|m| m == mailbox_id))
-        .count();
+        .filter(move |(a, _)| a == account)
+        .map(|(_, id)| id.as_str())
+}
+
+/// True when `email` is in any member of the group in its own account.
+fn has_label(email: &EmailSummary, members: &[(String, String)]) -> bool {
+    account_members(members, &email.account_id).any(|id| email.mailbox_ids.iter().any(|m| m == id))
+}
+
+/// Whether `selected` have the group `members`: all, some or none of them,
+/// each message judged by the members of its own account (a message of an
+/// account with no member does not have it).
+pub fn label_state(selected: &[&EmailSummary], members: &[(String, String)]) -> LabelState {
+    let has = selected.iter().filter(|e| has_label(e, members)).count();
 
     if has == 0 {
         LabelState::None
@@ -1213,90 +1341,281 @@ pub fn label_state(selected: &[&EmailSummary], mailbox_id: &str) -> LabelState {
     }
 }
 
-/// False when removing `mailbox_id` would leave one of `selected` in no mailbox.
-pub fn label_removable(selected: &[&EmailSummary], mailbox_id: &str) -> bool {
-    !selected
+/// What toggling the group would do to the messages that can take it (those
+/// whose account has a member): `None` when no message can, else `Some(true)`
+/// to add it and `Some(false)` to remove it because every such message has it.
+pub fn label_intent(selected: &[&EmailSummary], members: &[(String, String)]) -> Option<bool> {
+    let mut eligible = selected
         .iter()
-        .any(|e| e.mailbox_ids.iter().all(|m| m == mailbox_id) && !e.mailbox_ids.is_empty())
+        .filter(|e| account_members(members, &e.account_id).next().is_some())
+        .peekable();
+
+    eligible.peek()?;
+
+    Some(!eligible.all(|e| has_label(e, members)))
 }
 
-/// The toast after labelling (`add`) or unlabelling `applied` of `selected` messages.
-pub fn label_toast(applied: usize, selected: usize, add: bool) -> String {
-    let what = if add {
-        "Labelled"
-    } else {
-        "Removed label from"
-    };
-    let s = if selected == 1 { "" } else { "s" };
+/// False when removing every member of the group from its account would leave
+/// one of `selected` in no mailbox.
+pub fn label_removable(selected: &[&EmailSummary], members: &[(String, String)]) -> bool {
+    !selected.iter().any(|e| {
+        let own: Vec<&str> = account_members(members, &e.account_id).collect();
 
-    if applied == selected {
-        format!("{what} {applied} message{s}")
-    } else {
-        format!("{what} {applied} of {selected} message{s}")
+        !own.is_empty()
+            && !e.mailbox_ids.is_empty()
+            && e.mailbox_ids.iter().all(|m| own.contains(&m.as_str()))
+    })
+}
+
+/// An account, its first group member and the email ids to act on there.
+type Target = (String, String, Vec<String>);
+
+/// The selected messages split by account: for each account in first-seen
+/// order its first member of the group and its email ids, then the ids of the
+/// selection's accounts that have no member, in `accounts` order.
+pub fn member_targets(
+    members: &[(String, String)],
+    refs: &[MsgRef],
+    accounts: &[String],
+) -> (Vec<Target>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut without = Vec::new();
+
+    for (account, ids) in group_by_account(refs) {
+        let first = account_members(members, &account).next().map(String::from);
+
+        match first {
+            Some(first) => targets.push((account, first, ids)),
+            None => without.push(account),
+        }
     }
+
+    let missing = accounts
+        .iter()
+        .filter(|a| without.contains(a))
+        .cloned()
+        .collect();
+
+    (targets, missing)
 }
 
-/// Toggles `mailbox_id` on every selected message and keeps the picker open
-/// (see [`label_selected`]).
-pub fn toggle_label(mailbox_id: String) {
-    run(label_selected(mailbox_id));
+/// The toast after a group action: `verb` ("Moved", "Labelled", …) over how many
+/// of `total` selected messages were `applied`; `attempted` counts those whose
+/// account had a member of group `name`, `missing` names the accounts without
+/// one and `failures` the `(account, error text)` of refused ones.
+pub fn action_toast(
+    verb: &str,
+    applied: usize,
+    total: usize,
+    attempted: usize,
+    missing: &[String],
+    failures: &[(String, String)],
+    name: &str,
+) -> String {
+    let s = if total == 1 { "" } else { "s" };
+
+    if applied == total && missing.is_empty() && failures.is_empty() {
+        return format!("{verb} {applied} message{s}");
+    }
+
+    if attempted == 0 && failures.is_empty() {
+        return format!("No \"{name}\" in {}", missing.join(", "));
+    }
+
+    let mut toast = format!("{verb} {applied} of {total} message{s}");
+
+    if !missing.is_empty() {
+        toast.push_str(&format!("; no \"{name}\" in {}", missing.join(", ")));
+    }
+
+    for (account, error) in failures {
+        toast.push_str(&format!("; {account}: {error}"));
+    }
+
+    toast
 }
 
-/// Adds `mailbox_id` to the selected messages unless all have it, in which case
-/// it is removed from all; ignored while another action is pending. The
-/// picker closes only when the selection ends up empty or in another account.
-pub async fn label_selected(mailbox_id: String) {
+/// What a group action did, summed over the accounts it was sent to.
+#[derive(Default)]
+struct GroupOutcome {
+    /// Emails the core reports as changed.
+    applied: usize,
+    /// Messages whose account was attempted.
+    attempted: usize,
+    /// `(account display name, error text)` of each account that failed.
+    failures: Vec<(String, String)>,
+}
+
+/// The display name of account `id`.
+fn account_name(id: &str) -> String {
+    let b = backend();
+    let b = b.peek();
+
+    b.cfg
+        .account(id)
+        .map_or(id, Account::display_name)
+        .to_string()
+}
+
+/// Display names of account ids, in order.
+fn account_names(ids: &[String]) -> Vec<String> {
+    ids.iter().map(|id| account_name(id)).collect()
+}
+
+/// Applies each `(account, email ids, action)` on its own: a failing account
+/// does not stop the others and is recorded in the outcome.
+async fn apply_to_accounts(jobs: Vec<(String, Vec<String>, actions::Action)>) -> GroupOutcome {
+    let mut outcome = GroupOutcome::default();
+
+    for (account, ids, action) in jobs {
+        outcome.attempted += ids.len();
+
+        match apply_one_account(&account, &ids, action).await {
+            Ok(n) => outcome.applied += n,
+            Err(e) => {
+                if matches!(e, Error::Auth) {
+                    backend().write().reset_client();
+                }
+
+                outcome
+                    .failures
+                    .push((account_name(&account), e.to_string()));
+            }
+        }
+    }
+
+    outcome
+}
+
+/// The group `key` and the selected messages, unless nothing is selected or
+/// the group is gone.
+fn group_selection(key: &str) -> Option<(MailboxGroup, Vec<MsgRef>)> {
+    let refs = selected_refs();
+
+    if refs.is_empty() {
+        return None;
+    }
+
+    Some((group_by_key(key)?, refs))
+}
+
+/// Toggles the group `key` on every selected message and keeps the picker
+/// open (see [`label_group`]).
+pub fn toggle_label(key: String) {
+    run(label_group(key));
+}
+
+/// Adds the group `key` to the selected messages unless every message that can
+/// take it has it, in which case it is removed from them; ignored while
+/// another action is pending. Each account is handled on its own, through its
+/// first member (add) or all its members (remove). The picker closes only when
+/// the selection ends up empty.
+pub async fn label_group(key: String) {
     let Some(_busy) = Flag::take(&BUSY) else {
         return;
     };
-    let refs = selected_refs();
-    let Some(account) = refs.first().map(|r| r.account_id.clone()) else {
+    let Some((group, refs)) = group_selection(&key) else {
         return;
     };
-    let (add, removable) = {
+    let (intent, removable) = {
         let (emails, selection) = (EMAILS.peek(), SELECTION.peek());
         let picked = selected_emails(&emails, &selection);
 
         (
-            label_state(&picked, &mailbox_id) != LabelState::All,
-            label_removable(&picked, &mailbox_id),
+            label_intent(&picked, &group.members),
+            label_removable(&picked, &group.members),
         )
     };
 
-    if !add && !removable {
+    if intent == Some(false) && !removable {
         return set_status("A message must keep at least one label.");
     }
 
-    let patch = if add {
-        (vec![mailbox_id.clone()], vec![])
+    let add = intent.unwrap_or(true);
+    let (targets, missing) =
+        member_targets(&group.members, &refs, &enabled_ids(&backend().peek().cfg));
+    let jobs = targets
+        .into_iter()
+        .map(|(account, first, ids)| {
+            let patch = if add {
+                (vec![first], vec![])
+            } else {
+                let all = account_members(&group.members, &account);
+
+                (vec![], all.map(String::from).collect())
+            };
+
+            (
+                account,
+                ids,
+                actions::Action::PatchMailboxes {
+                    add: patch.0,
+                    remove: patch.1,
+                },
+            )
+        })
+        .collect();
+    let verb = if add {
+        "Labelled"
     } else {
-        (vec![], vec![mailbox_id.clone()])
-    };
-    let action = actions::Action::PatchMailboxes {
-        add: patch.0,
-        remove: patch.1,
+        "Removed label from"
     };
 
-    match settle_selection(apply_local(&refs, action)).await {
-        Ok(applied) => set_status(label_toast(applied, refs.len(), add)),
+    match settle_selection(async { Ok(apply_to_accounts(jobs).await) }).await {
+        Ok(o) => set_status(action_toast(
+            verb,
+            o.applied,
+            refs.len(),
+            o.attempted,
+            &account_names(&missing),
+            &o.failures,
+            &group.name,
+        )),
         Err(e) => fail("Action failed", e),
     }
 
-    let left = selected_refs()
-        .first()
-        .is_none_or(|r| r.account_id != account);
-
-    if left {
+    if selected_refs().is_empty() {
         *SHOW_LABEL_PICKER.write() = false;
         focus_root();
     }
 }
 
-/// Moves the selected emails to `mailbox_id` and closes the picker.
-pub fn move_selected(mailbox_id: String) {
+/// Moves the selected emails to the group `key` and closes the picker.
+pub fn move_selected(key: String) {
     *SHOW_MOVE_PICKER.write() = false;
     focus_root();
-    run(act_on_selected(actions::Action::Move { mailbox_id }));
+    run(move_to_group(key));
+}
+
+/// Moves each selected email to the first member of the group `key` in its own
+/// account. Accounts without a member are named in the toast, never given one;
+/// a refusing account does not stop the others.
+pub async fn move_to_group(key: String) {
+    let Some(_busy) = Flag::take(&BUSY) else {
+        return;
+    };
+    let Some((group, refs)) = group_selection(&key) else {
+        return;
+    };
+    let (targets, missing) =
+        member_targets(&group.members, &refs, &enabled_ids(&backend().peek().cfg));
+    let jobs = targets
+        .into_iter()
+        .map(|(account, mailbox_id, ids)| (account, ids, actions::Action::Move { mailbox_id }))
+        .collect();
+
+    match settle_selection(async { Ok(apply_to_accounts(jobs).await) }).await {
+        Ok(o) => set_status(action_toast(
+            "Moved",
+            o.applied,
+            refs.len(),
+            o.attempted,
+            &account_names(&missing),
+            &o.failures,
+            &group.name,
+        )),
+        Err(e) => fail("Action failed", e),
+    }
 }
 
 /// Files every selected email under `tray` by the user's decision and closes
@@ -2294,32 +2613,50 @@ mod tests {
         }
     }
 
+    /// Account ids for tests.
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn default_folder_is_unified_only_with_several_accounts() {
+    fn default_folder_is_merged_inbox_with_several_accounts() {
         let boxes = [
             mailbox_of("a", "a-arch", Some("archive")),
             mailbox_of("a", "a-in", Some("inbox")),
             mailbox_of("b", "b-in", Some("inbox")),
         ];
+        let inbox = Folder::Merged {
+            key: "role:inbox".into(),
+        };
 
-        assert_eq!(default_folder(&boxes, 2), Some(Folder::AllInboxes));
         assert_eq!(
-            default_folder(&boxes, 1),
+            default_folder(&boxes, &ids(&["a", "b"])),
+            Some(inbox.clone())
+        );
+        assert_eq!(
+            default_folder(&boxes, &ids(&["a"])),
             Some(Folder::Mailbox {
                 account_id: "a".into(),
                 id: "a-in".into()
             })
         );
-        assert_eq!(default_folder(&[], 1), None);
-        assert!(folder_exists(&Folder::AllInboxes, &boxes, 2));
-        assert!(!folder_exists(&Folder::AllInboxes, &boxes, 1));
+        assert_eq!(default_folder(&[], &ids(&["a"])), None);
+        assert!(folder_exists(&inbox, &boxes, &ids(&["a", "b"])));
+        assert!(folder_exists(&inbox, &boxes, &ids(&["a"])));
+        assert!(!folder_exists(
+            &Folder::Merged {
+                key: "name:nope".into()
+            },
+            &boxes,
+            &ids(&["a", "b"])
+        ));
         assert!(!folder_exists(
             &Folder::Mailbox {
                 account_id: "b".into(),
                 id: "a-in".into()
             },
             &boxes,
-            2
+            &ids(&["a", "b"])
         ));
     }
 
@@ -2524,6 +2861,13 @@ mod tests {
         assert_eq!(email("work", "e2").mailbox_ids, ["inbox"]);
     }
 
+    /// Group members `(account, mailbox)` for tests.
+    fn members(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(a, m)| (a.to_string(), m.to_string()))
+            .collect()
+    }
+
     #[test]
     fn label_state_and_removable() {
         let (e1, e2, e3) = (
@@ -2531,24 +2875,200 @@ mod tests {
             labelled("e2", &["promos"]),
             labelled("e3", &["inbox"]),
         );
+        let promos = members(&[("default", "promos")]);
+        let inbox = members(&[("default", "inbox")]);
 
-        assert_eq!(label_state(&[&e1, &e2], "promos"), LabelState::All);
-        assert_eq!(label_state(&[&e1, &e3], "promos"), LabelState::Some);
-        assert_eq!(label_state(&[&e3], "promos"), LabelState::None);
-        assert_eq!(label_state(&[], "promos"), LabelState::None);
-        assert!(!label_removable(&[&e1, &e2], "promos"));
-        assert!(!label_removable(&[&e1, &e3], "inbox"));
-        assert!(label_removable(&[&e1], "promos"));
-        assert_eq!(label_toast(2, 2, true), "Labelled 2 messages");
+        assert_eq!(label_state(&[&e1, &e2], &promos), LabelState::All);
+        assert_eq!(label_state(&[&e1, &e3], &promos), LabelState::Some);
+        assert_eq!(label_state(&[&e3], &promos), LabelState::None);
+        assert_eq!(label_state(&[], &promos), LabelState::None);
+        assert!(!label_removable(&[&e1, &e2], &promos));
+        assert!(!label_removable(&[&e1, &e3], &inbox));
+        assert!(label_removable(&[&e1], &promos));
+    }
+
+    #[test]
+    fn label_state_intent_and_removable_use_each_accounts_members() {
+        let group = members(&[("a", "a-l1"), ("a", "a-l2"), ("b", "b-l")]);
+        let a1 = labelled_in("a", "1", &["a-l2", "a-in"]);
+        let b2 = labelled_in("b", "2", &["b-l"]);
+        let b3 = labelled_in("b", "3", &["b-in"]);
+        let c4 = labelled_in("c", "4", &["b-l"]);
+
+        assert_eq!(label_state(&[&a1, &b2], &group), LabelState::All);
+        assert_eq!(label_state(&[&a1, &b2, &b3], &group), LabelState::Some);
+        assert_eq!(label_state(&[&c4], &group), LabelState::None);
+        assert_eq!(label_intent(&[&a1, &b2, &b3], &group), Some(true));
+        assert_eq!(label_intent(&[&a1, &b2], &group), Some(false));
+        assert_eq!(label_intent(&[&a1, &c4], &group), Some(false));
+        assert_eq!(label_intent(&[&c4], &group), None);
+        assert!(!label_removable(&[&a1, &b2], &group));
+        assert!(label_removable(&[&a1], &group));
+        assert!(label_removable(&[&b3], &group));
+    }
+
+    #[test]
+    fn member_targets_split_by_account() {
+        let group = members(&[("a", "a-r1"), ("a", "a-r2"), ("b", "b-r")]);
+        let refs = [
+            MsgRef::new("c", "1"),
+            MsgRef::new("b", "2"),
+            MsgRef::new("a", "3"),
+            MsgRef::new("a", "4"),
+            MsgRef::new("d", "5"),
+        ];
+        let (targets, missing) = member_targets(&group, &refs, &ids(&["a", "b", "d", "c"]));
+
         assert_eq!(
-            label_toast(1, 2, false),
-            "Removed label from 1 of 2 messages"
+            targets,
+            [
+                ("b".to_string(), "b-r".to_string(), ids(&["2"])),
+                ("a".to_string(), "a-r1".to_string(), ids(&["3", "4"])),
+            ]
         );
-        assert_eq!(label_toast(1, 1, true), "Labelled 1 message");
+        assert_eq!(missing, ids(&["d", "c"]));
+    }
+
+    #[test]
+    fn action_toast_covers_partial_missing_and_failed() {
+        let refused = "not available for this account: moving to a label on Proton accounts";
+        let names = |list: &[&str]| ids(list);
+        let fail = |account: &str, text: &str| vec![(account.to_string(), text.to_string())];
+
+        assert_eq!(
+            action_toast("Moved", 5, 5, 5, &[], &[], "Receipts"),
+            "Moved 5 messages"
+        );
+        assert_eq!(
+            action_toast("Moved", 1, 1, 1, &[], &[], "X"),
+            "Moved 1 message"
+        );
+        assert_eq!(
+            action_toast("Moved", 3, 5, 5, &[], &[], "R"),
+            "Moved 3 of 5 messages"
+        );
+        assert_eq!(
+            action_toast("Moved", 0, 5, 5, &[], &[], "R"),
+            "Moved 0 of 5 messages"
+        );
+        assert_eq!(
+            action_toast("Moved", 3, 5, 3, &names(&["Work"]), &[], "Receipts"),
+            "Moved 3 of 5 messages; no \"Receipts\" in Work"
+        );
+        assert_eq!(
+            action_toast(
+                "Labelled",
+                0,
+                2,
+                0,
+                &names(&["Work", "Proton"]),
+                &[],
+                "Receipts"
+            ),
+            "No \"Receipts\" in Work, Proton"
+        );
+        assert_eq!(
+            action_toast("Moved", 0, 2, 0, &names(&["Work"]), &[], "Receipts"),
+            "No \"Receipts\" in Work"
+        );
+        assert_eq!(
+            action_toast("Moved", 0, 2, 1, &names(&["Work"]), &[], "Receipts"),
+            "Moved 0 of 2 messages; no \"Receipts\" in Work"
+        );
+        assert_eq!(
+            action_toast("Moved", 1, 2, 2, &[], &fail("Proton", refused), "Receipts"),
+            format!("Moved 1 of 2 messages; Proton: {refused}")
+        );
+        assert_eq!(
+            action_toast(
+                "Moved",
+                0,
+                3,
+                2,
+                &names(&["Home"]),
+                &fail("Proton", "boom"),
+                "R"
+            ),
+            "Moved 0 of 3 messages; no \"R\" in Home; Proton: boom"
+        );
+    }
+
+    #[test]
+    fn sidebar_rows_list_groups_then_expanded_members() {
+        let boxed = |account: &str,
+                     id: &str,
+                     name: &str,
+                     role: Option<&str>,
+                     parent: Option<&str>,
+                     order,
+                     unread| Mailbox {
+            name: name.into(),
+            parent_id: parent.map(String::from),
+            sort_order: order,
+            unread,
+            ..mailbox_of(account, id, role)
+        };
+        let boxes = [
+            boxed("a", "a-in", "Inbox", Some("inbox"), None, 0, 2),
+            boxed("b", "b-in", "Inbox", Some("inbox"), None, 0, 3),
+            boxed("a", "a-r1", "Receipts", None, None, 0, 0),
+            boxed("a", "a-r2", "Receipts", None, Some("a-in"), 1, 0),
+            boxed("b", "b-r", "Receipts", None, None, 0, 0),
+        ];
+        let accounts = [
+            ("a".to_string(), "Home".to_string()),
+            ("b".to_string(), "Work".to_string()),
+        ];
+        let groups = mailbox_groups(&boxes, &ids(&["a", "b"]));
+        let rows = sidebar_rows(&groups, &BTreeSet::new(), &accounts, &boxes);
+
+        assert_eq!(
+            rows,
+            [
+                SidebarRow::Group {
+                    key: "role:inbox".into(),
+                    name: "Inbox".into(),
+                    role: Some("inbox".into()),
+                    unread: 5,
+                    expanded: false,
+                },
+                SidebarRow::Group {
+                    key: "name:receipts".into(),
+                    name: "Receipts".into(),
+                    role: None,
+                    unread: 0,
+                    expanded: false,
+                },
+            ]
+        );
+
+        let open = BTreeSet::from(["name:receipts".to_string()]);
+        let rows = sidebar_rows(&groups, &open, &accounts, &boxes);
+        let member = |account: &str, id: &str, label: &str| SidebarRow::Member {
+            folder: Folder::Mailbox {
+                account_id: account.into(),
+                id: id.into(),
+            },
+            label: label.into(),
+            unread: 0,
+        };
+
+        assert_eq!(rows.len(), 5);
+        assert!(
+            matches!(&rows[1], SidebarRow::Group { key, expanded: true, .. } if key == "name:receipts")
+        );
+        assert_eq!(
+            rows[2..],
+            [
+                member("a", "a-r1", "Home › Receipts"),
+                member("a", "a-r2", "Home › Inbox / Receipts"),
+                member("b", "b-r", "Work"),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn label_selected_refreshes_rows_and_closes_when_selection_leaves() {
+    async fn label_group_refreshes_rows_and_closes_when_selection_leaves() {
         let mut ui = backend_with(Config::default());
 
         ui.ui_test = true;
@@ -2594,10 +3114,13 @@ mod tests {
         let state_of = |mailbox: &str| {
             let (emails, selection) = (EMAILS.peek(), SELECTION.peek());
 
-            label_state(&selected_emails(&emails, &selection), mailbox)
+            label_state(
+                &selected_emails(&emails, &selection),
+                &members(&[("default", mailbox)]),
+            )
         };
 
-        in_root(&dom, label_selected("promos".into())).await;
+        in_root(&dom, label_group("name:promos".into())).await;
 
         for e in EMAILS.peek().iter() {
             assert_eq!(e.mailbox_ids, ["inbox", "promos"], "{}", e.id);
@@ -2606,7 +3129,7 @@ mod tests {
         assert_eq!(state_of("promos"), LabelState::All);
         assert!(*SHOW_LABEL_PICKER.peek());
 
-        in_root(&dom, label_selected("inbox".into())).await;
+        in_root(&dom, label_group("role:inbox".into())).await;
 
         assert!(EMAILS.peek().is_empty(), "{:?}", EMAILS.peek());
         assert!(selected_refs().is_empty());
@@ -2630,7 +3153,7 @@ mod tests {
 
         let busy = Flag::take(&BUSY).unwrap();
 
-        in_root(&dom, label_selected("inbox".into())).await;
+        in_root(&dom, label_group("role:inbox".into())).await;
 
         drop(busy);
 
@@ -2640,6 +3163,202 @@ mod tests {
 
         assert_eq!(SELECTION.peek().ids.len(), 2);
         assert!(*SHOW_LABEL_PICKER.peek());
+    }
+
+    /// A rendered UI-test backend with accounts `default` (Home) and `work` (Work).
+    fn two_accounts() -> (VirtualDom, Arc<posto_core::store::Store>) {
+        let mut cfg = Config::default();
+
+        cfg.accounts[0].name = "Home".into();
+        cfg.add_account(Account::new("work", "w@x.io")).unwrap();
+        cfg.accounts[1].name = "Work".into();
+
+        let mut ui = backend_with(cfg);
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let store = dom.in_scope(ScopeId::ROOT, || backend().peek().store.clone());
+
+        (dom, store)
+    }
+
+    /// A named mailbox of `account` for group tests.
+    fn named_box(
+        account: &str,
+        id: &str,
+        name: &str,
+        role: Option<&str>,
+        parent: Option<&str>,
+    ) -> Mailbox {
+        Mailbox {
+            name: name.into(),
+            parent_id: parent.map(String::from),
+            ..mailbox_of(account, id, role)
+        }
+    }
+
+    /// Opens the merged view `key`, loads it and selects every row (in `reverse` order if asked).
+    async fn select_merged(key: &str, reverse: bool) {
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Merged { key: key.into() });
+        reload_list().await;
+
+        let mut order = list_order();
+
+        if reverse {
+            order.reverse();
+        }
+
+        *SELECTION.write() = Selection {
+            anchor: order.first().cloned(),
+            focus: order.first().cloned(),
+            ids: order,
+        };
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn move_from_merged_view_attempts_every_account_and_settles() {
+        let (dom, store) = two_accounts();
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        store
+            .upsert_mailboxes(&[
+                named_box("default", "inbox", "Inbox", Some("inbox"), None),
+                named_box("default", "receipts", "Receipts", None, None),
+                named_box("work", "inbox", "Inbox", Some("inbox"), None),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                labelled_in("default", "e1", &["inbox"]),
+                labelled_in("work", "e1", &["inbox"]),
+            ])
+            .unwrap();
+        select_merged("role:inbox", false).await;
+
+        assert_eq!(selected_refs().len(), 2);
+
+        in_root(&dom, move_to_group("name:receipts".into())).await;
+
+        let email = |account: &str| store.email(account, "e1").unwrap().unwrap();
+
+        assert_eq!(email("default").mailbox_ids, ["receipts"]);
+        assert_eq!(email("work").mailbox_ids, ["inbox"]);
+        assert_eq!(
+            *STATUS.peek(),
+            "Moved 1 of 2 messages; no \"Receipts\" in Work"
+        );
+
+        let listed = list_order();
+
+        assert_eq!(listed, ["work/e1"]);
+        assert!(!SELECTION.peek().is_selected("default/e1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn move_from_merged_view_reports_a_refused_account_in_either_order() {
+        let (dom, store) = two_accounts();
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        for account in ["default", "work"] {
+            store
+                .upsert_mailboxes(&[
+                    named_box(account, "inbox", "Inbox", Some("inbox"), None),
+                    named_box(account, "receipts", "Receipts", None, None),
+                ])
+                .unwrap();
+            store
+                .upsert_emails(&[labelled_in(account, "e1", &["inbox"])])
+                .unwrap();
+        }
+
+        store
+            .set_account_state("work", "provider", "proton")
+            .unwrap();
+
+        for reverse in [false, true] {
+            store
+                .upsert_emails(&[labelled_in("default", "e1", &["inbox"])])
+                .unwrap();
+            STATUS.write().clear();
+            select_merged("role:inbox", reverse).await;
+
+            let first = if reverse { "work/e1" } else { "default/e1" };
+
+            assert_eq!(SELECTION.peek().ids[0], first);
+
+            in_root(&dom, move_to_group("name:receipts".into())).await;
+
+            let email = |account: &str| store.email(account, "e1").unwrap().unwrap();
+
+            assert_eq!(email("default").mailbox_ids, ["receipts"], "{reverse}");
+            assert_eq!(email("work").mailbox_ids, ["inbox"], "{reverse}");
+            assert_eq!(
+                *STATUS.peek(),
+                "Moved 1 of 2 messages; Work: not available for this account: moving to a label on Proton accounts",
+                "{reverse}"
+            );
+
+            let listed = list_order();
+
+            assert_eq!(listed, ["work/e1"], "{reverse}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn label_from_merged_view_removes_every_member_and_names_missing_accounts() {
+        let (dom, store) = two_accounts();
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        store
+            .upsert_mailboxes(&[
+                named_box("default", "inbox", "Inbox", Some("inbox"), None),
+                named_box("default", "rc1", "Receipts", None, None),
+                named_box("default", "rc2", "Receipts", None, Some("inbox")),
+                named_box("work", "inbox", "Inbox", Some("inbox"), None),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                labelled_in("default", "e1", &["inbox", "rc1", "rc2"]),
+                labelled_in("default", "e2", &["rc1"]),
+                labelled_in("work", "e1", &["inbox"]),
+            ])
+            .unwrap();
+        select_merged("role:inbox", false).await;
+        *SHOW_LABEL_PICKER.write() = true;
+
+        in_root(&dom, label_group("name:receipts".into())).await;
+
+        let email = |account: &str, id: &str| store.email(account, id).unwrap().unwrap();
+
+        assert_eq!(email("default", "e1").mailbox_ids, ["inbox"]);
+        assert_eq!(email("work", "e1").mailbox_ids, ["inbox"]);
+        assert_eq!(
+            *STATUS.peek(),
+            "Removed label from 1 of 2 messages; no \"Receipts\" in Work"
+        );
+        assert!(*SHOW_LABEL_PICKER.peek());
+
+        *SELECTED_MAILBOX.write() = Some(Folder::Mailbox {
+            account_id: "default".into(),
+            id: "rc1".into(),
+        });
+        reload_list().await;
+
+        let only = "default/e2".to_string();
+
+        *SELECTION.write() = Selection {
+            anchor: Some(only.clone()),
+            focus: Some(only.clone()),
+            ids: vec![only],
+        };
+
+        in_root(&dom, label_group("name:receipts".into())).await;
+
+        assert_eq!(email("default", "e2").mailbox_ids, ["rc1"]);
+        assert_eq!(*STATUS.peek(), "A message must keep at least one label.");
     }
 }
 

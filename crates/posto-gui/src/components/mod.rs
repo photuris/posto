@@ -22,12 +22,12 @@ pub use toolbar::Toolbar;
 
 use crate::app::{
     EMAILS, LabelState, MAILBOXES, SELECTION, SHOW_CLASSIFY_PICKER, SHOW_LABEL_PICKER,
-    SHOW_MOVE_PICKER, TYPING, backend, classify_selected, focus_root, label_removable, label_state,
-    move_selected, selected_emails, selected_refs, toggle_label, tray_label,
+    SHOW_MOVE_PICKER, TYPING, backend, classify_selected, enabled_ids, focus_root, label_intent,
+    label_removable, label_state, move_selected, selected_emails, toggle_label, tray_label,
 };
 use crate::format;
 use posto_core::classify::Tray;
-use posto_core::store::mailbox_path;
+use posto_core::store::mailbox_groups;
 
 /// `onfocusin` for inputs: shortcuts are suspended while typing.
 pub fn focus_in(_: FocusEvent) {
@@ -72,15 +72,14 @@ pub fn reader_frame_doc(inner: &str) -> String {
     )
 }
 
-/// Small filterable list of mailboxes to move the selected emails to; only
-/// the mailboxes of their account (a move never crosses accounts).
+/// Small filterable list of mailbox groups to move the selected emails to;
+/// each message goes to the group's mailbox in its own account.
 #[component]
 pub fn MovePicker() -> Element {
-    let account = selected_refs().first().map(|r| r.account_id.clone());
-    let items: Vec<(String, String)> = MAILBOXES()
+    let ids = enabled_ids(&backend().read().cfg);
+    let items: Vec<(String, String)> = mailbox_groups(&MAILBOXES(), &ids)
         .into_iter()
-        .filter(|m| Some(&m.account_id) == account.as_ref())
-        .map(|m| (m.id, m.name))
+        .map(|g| (g.key, g.name))
         .collect();
 
     rsx! {
@@ -94,9 +93,9 @@ pub fn MovePicker() -> Element {
     }
 }
 
-/// A checkbox per label (a mailbox without a role, or the inbox) of the
-/// selected messages' account; a click or Enter toggles it on every selected
-/// message and the picker stays open. Reads the emails, selection and
+/// A checkbox per label group (every member a mailbox without a role, or an
+/// inbox); a click or Enter toggles it on every selected message, each in its
+/// own account, and the picker stays open. Reads the emails, selection and
 /// mailboxes during render, so a settled action refreshes the checkboxes.
 #[component]
 pub fn LabelPicker() -> Element {
@@ -104,27 +103,30 @@ pub fn LabelPicker() -> Element {
     let mut index = use_signal(|| 0usize);
     let (emails, selection, mailboxes) = (EMAILS(), SELECTION(), MAILBOXES());
     let selected = selected_emails(&emails, &selection);
-    let account = selected.first().map(|e| e.account_id.clone());
+    let ids = enabled_ids(&backend().read().cfg);
     let needle = query().to_lowercase();
-    let rows: Vec<(String, String, u16, LabelState, bool)> = mailboxes
-        .iter()
-        .filter(|m| Some(&m.account_id) == account.as_ref())
-        .filter(|m| m.role.as_deref().is_none_or(|r| r == "inbox"))
-        .filter_map(|m| {
-            let path = mailbox_path(&mailboxes, &m.account_id, &m.id)?;
-
-            path.to_lowercase().contains(&needle).then(|| {
-                let state = label_state(&selected, &m.id);
-                let blocked = state == LabelState::All && !label_removable(&selected, &m.id);
-
-                (
-                    m.id.clone(),
-                    path,
-                    format::avatar_hue(&m.name),
-                    state,
-                    blocked,
-                )
+    let rows: Vec<(String, String, u16, LabelState, bool)> = mailbox_groups(&mailboxes, &ids)
+        .into_iter()
+        .filter(|g| {
+            g.members.iter().all(|(account, id)| {
+                mailboxes
+                    .iter()
+                    .find(|m| m.account_id == *account && m.id == *id)
+                    .is_some_and(|m| m.role.as_deref().is_none_or(|r| r == "inbox"))
             })
+        })
+        .filter(|g| g.name.to_lowercase().contains(&needle))
+        .map(|g| {
+            let blocked = label_intent(&selected, &g.members) == Some(false)
+                && !label_removable(&selected, &g.members);
+
+            (
+                g.key,
+                g.name.clone(),
+                format::avatar_hue(&g.name),
+                label_state(&selected, &g.members),
+                blocked,
+            )
         })
         .collect();
     let last = rows.len().saturating_sub(1);
