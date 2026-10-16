@@ -238,9 +238,16 @@ pub fn Composer() -> Element {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use dioxus::core::{AttributeValue, Mutation, RuntimeGuard};
     use posto_core::config::Account;
+    use posto_core::store::Store;
 
     use super::*;
+    use crate::app::App;
+    use crate::state::Backend;
 
     fn identity(name: &str, email: &str) -> Identity {
         Identity {
@@ -344,5 +351,74 @@ mod tests {
                 .as_deref(),
             Some("work/w@x.io")
         );
+    }
+
+    /// The real composer, in an app of two accounts, shows the identity of a
+    /// `from` that belongs to the other account as selected, and sends from it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn composer_selects_the_from_of_another_account() {
+        let mut cfg = Config::default();
+
+        cfg.add_account(Account::new("work", "w@x.io")).unwrap();
+
+        let store = Arc::new(Store::open_memory().unwrap());
+
+        // The app reloads the identities from the store when it starts.
+        store
+            .set_identities("default", &[identity("Home", "h@x.io")])
+            .unwrap();
+        store
+            .set_identities("work", &[identity("Work", "w@x.io")])
+            .unwrap();
+
+        let mut dom = VirtualDom::new(App).with_root_context(Backend {
+            store,
+            clients: Default::default(),
+            cfg,
+            ui_test: true,
+            conn_rev: 0,
+            config_error: None,
+        });
+
+        dom.rebuild_in_place();
+
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        *COMPOSER.write() = Some(Draft {
+            account_id: "default".into(),
+            reply_to_email_id: Some("e1".into()),
+            reply_to_account_id: Some("default".into()),
+            from: Some(Address {
+                name: None,
+                email: "w@x.io".into(),
+            }),
+            ..Draft::default()
+        });
+
+        let _ = tokio::time::timeout(Duration::from_millis(200), dom.wait_for_work()).await;
+
+        let selected: Vec<_> = dom
+            .render_immediate_to_vec()
+            .edits
+            .into_iter()
+            .filter_map(|m| match m {
+                Mutation::SetAttribute {
+                    name: "selected",
+                    value,
+                    ..
+                } => Some(value),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            selected,
+            [AttributeValue::Bool(false), AttributeValue::Bool(true)]
+        );
+
+        // The effect makes the From's account the sender.
+        let _ = tokio::time::timeout(Duration::from_millis(200), dom.wait_for_work()).await;
+
+        assert_eq!(COMPOSER.peek().as_ref().unwrap().account_id, "work");
     }
 }
