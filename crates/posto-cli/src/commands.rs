@@ -476,32 +476,19 @@ pub fn email_list(
     };
 
     // A name such as "Inbox" matches in several accounts: merge their rows.
-    let mut rows: Vec<EmailSummary> = Vec::new();
-    let mut matched = false;
+    let mut members = Vec::new();
 
     for id in &accounts {
         if let Some(m) = find_mailbox(&store, id, &name)? {
-            matched = true;
-            rows.extend(store.list_emails(
-                Some(id),
-                &query(Some(m.id), limit.saturating_add(offset), 0),
-            )?);
+            members.push((id.clone(), m.id));
         }
     }
 
-    if !matched {
+    if members.is_empty() {
         return Err(Error::NotFound(format!("mailbox {name}")));
     }
 
-    rows.sort_by(|a, b| b.received_at.cmp(&a.received_at));
-
-    to_json(
-        &rows
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect::<Vec<_>>(),
-    )
+    to_json(&store.list_emails_in(&members, &query(None, limit, offset))?)
 }
 
 pub async fn email_show(account: Option<&str>, id: &str, text: bool) -> Result<Value> {

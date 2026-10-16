@@ -376,6 +376,93 @@ pub fn mailbox_path(all: &[Mailbox], account: &str, id: &str) -> Option<String> 
     Some(names.join(" / "))
 }
 
+/// Roles that merge across accounts by role, in sidebar order.
+const GROUP_ROLES: [&str; 6] = ["inbox", "drafts", "sent", "archive", "junk", "trash"];
+
+/// The mailboxes of every account that share one role or one name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MailboxGroup {
+    /// `role:<role>` for the six roles, else `name:<name lower-cased, trimmed>`.
+    pub key: String,
+    /// Display name: the name of the first member in `accounts` order.
+    pub name: String,
+    /// `Some(role)` for a `role:` group, `None` otherwise.
+    pub role: Option<String>,
+    /// `(account_id, mailbox id)`, in `accounts` order, then by mailbox
+    /// `sort_order`, then id.
+    pub members: Vec<(String, String)>,
+    /// Sum of the members' total counts.
+    pub total: i64,
+    /// Sum of the members' unread counts.
+    pub unread: i64,
+}
+
+/// Groups the mailboxes of `accounts` into merged views.
+///
+/// A mailbox whose role is inbox, drafts, sent, archive, junk or trash groups by
+/// role; every other mailbox groups by trimmed, lower-cased name, ignoring
+/// nesting. Role groups come first in that order, then name groups sorted by
+/// name. Mailboxes of accounts not in `accounts` are ignored.
+pub fn mailbox_groups(mailboxes: &[Mailbox], accounts: &[String]) -> Vec<MailboxGroup> {
+    let mut groups: Vec<MailboxGroup> = Vec::new();
+
+    for account in accounts {
+        let mut own: Vec<&Mailbox> = mailboxes
+            .iter()
+            .filter(|m| &m.account_id == account)
+            .collect();
+
+        own.sort_by(|a, b| (a.sort_order, &a.id).cmp(&(b.sort_order, &b.id)));
+
+        for m in own {
+            let role = m
+                .role
+                .as_deref()
+                .filter(|r| GROUP_ROLES.contains(r))
+                .map(String::from);
+            let key = match &role {
+                Some(r) => format!("role:{r}"),
+                None => format!("name:{}", m.name.trim().to_lowercase()),
+            };
+            let at = match groups.iter().position(|g| g.key == key) {
+                Some(at) => at,
+                None => {
+                    groups.push(MailboxGroup {
+                        key,
+                        name: m.name.clone(),
+                        role,
+                        members: Vec::new(),
+                        total: 0,
+                        unread: 0,
+                    });
+                    groups.len() - 1
+                }
+            };
+            let group = &mut groups[at];
+
+            group.members.push((m.account_id.clone(), m.id.clone()));
+            group.total += m.total;
+            group.unread += m.unread;
+        }
+    }
+
+    let rank = |g: &MailboxGroup| {
+        g.role
+            .as_deref()
+            .and_then(|r| GROUP_ROLES.iter().position(|x| *x == r))
+    };
+
+    groups.sort_by_cached_key(|g| {
+        (
+            rank(g).unwrap_or(GROUP_ROLES.len()),
+            g.name.to_lowercase(),
+            g.key.clone(),
+        )
+    });
+
+    groups
+}
+
 fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -1712,6 +1799,53 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Lists the emails of several mailboxes as one list, newest first.
+    ///
+    /// `members` are `(account_id, mailbox id)` pairs. Each goes through
+    /// [`Store::list_emails`] (so the label-view rule applies), the rows are
+    /// merged by `received_at` descending, then account id, then email id, an
+    /// email in two members of one account is listed once, and `q.offset` /
+    /// `q.limit` page the merged list. `q.mailbox_id` and `q.role` are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn list_emails_in(
+        &self,
+        members: &[(String, String)],
+        q: &ListQuery,
+    ) -> Result<Vec<EmailSummary>> {
+        let limit = if q.limit == 0 { DEFAULT_LIMIT } else { q.limit };
+        let mut rows: Vec<EmailSummary> = Vec::new();
+
+        for (account, mailbox_id) in members {
+            rows.extend(self.list_emails(
+                Some(account),
+                &ListQuery {
+                    mailbox_id: Some(mailbox_id.clone()),
+                    role: None,
+                    limit: limit.saturating_add(q.offset),
+                    offset: 0,
+                    unread_only: q.unread_only,
+                },
+            )?);
+        }
+
+        rows.sort_by(|a, b| {
+            (&b.received_at, &a.account_id, &a.id).cmp(&(&a.received_at, &b.account_id, &b.id))
+        });
+
+        let mut seen = std::collections::HashSet::new();
+
+        rows.retain(|e| seen.insert((e.account_id.clone(), e.id.clone())));
+
+        Ok(rows
+            .into_iter()
+            .skip(q.offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
     /// Fetches one email of `account`.
     ///
     /// # Errors
@@ -1995,6 +2129,221 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    /// A mailbox of `account` with the given counts, for grouping tests.
+    fn mailbox_of(account: &str, id: &str, name: &str, role: Option<&str>) -> Mailbox {
+        Mailbox {
+            account_id: account.into(),
+            ..mailbox(id, name, role)
+        }
+    }
+
+    fn members(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(a, m)| (a.to_string(), m.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn mailbox_groups_merge_roles_and_names() {
+        let accounts = ["a".to_string(), "b".to_string()];
+        let groups = mailbox_groups(
+            &[
+                mailbox_of("a", "a-inbox", "Inbox", Some("inbox")),
+                mailbox_of("b", "b-inbox", "INBOX", Some("inbox")),
+                mailbox_of("a", "a-rec", "Receipts", None),
+                mailbox_of("b", "b-rec", "receipts ", None),
+                mailbox_of("b", "b-work", "Work", Some("folder")),
+                mailbox_of("a", "a-work", "Work", None),
+                mailbox_of("c", "c-inbox", "Inbox", Some("inbox")),
+            ],
+            &accounts,
+        );
+
+        assert_eq!(
+            groups.iter().map(|g| g.key.as_str()).collect::<Vec<_>>(),
+            ["role:inbox", "name:receipts", "name:work"]
+        );
+        assert_eq!(
+            groups[0].members,
+            members(&[("a", "a-inbox"), ("b", "b-inbox")])
+        );
+        assert_eq!(groups[0].role.as_deref(), Some("inbox"));
+        assert_eq!(groups[1].name, "Receipts");
+        assert_eq!(groups[1].role, None);
+        assert_eq!(groups[1].members.len(), 2);
+        assert_eq!(
+            groups[2].members,
+            members(&[("a", "a-work"), ("b", "b-work")])
+        );
+        assert!(
+            groups
+                .iter()
+                .all(|g| g.members.iter().all(|(a, _)| a != "c"))
+        );
+    }
+
+    #[test]
+    fn mailbox_groups_order_members_and_counts() {
+        let accounts = ["b".to_string(), "a".to_string()];
+        let mut all = Vec::new();
+
+        for account in ["a", "b"] {
+            for role in ["trash", "sent", "inbox", "drafts", "archive", "junk"] {
+                all.push(mailbox_of(
+                    account,
+                    &format!("{account}-{role}"),
+                    role,
+                    Some(role),
+                ));
+            }
+        }
+
+        all.push(mailbox_of("a", "a-zeta", "Zeta", None));
+        all.push(mailbox_of("b", "b-alpha", "alpha", None));
+
+        for m in &mut all {
+            match m.id.as_str() {
+                "a-inbox" => (m.total, m.unread) = (3, 1),
+                "b-inbox" => (m.total, m.unread) = (4, 2),
+                _ => {}
+            }
+        }
+
+        let groups = mailbox_groups(&all, &accounts);
+
+        assert_eq!(
+            groups.iter().map(|g| g.key.as_str()).collect::<Vec<_>>(),
+            [
+                "role:inbox",
+                "role:drafts",
+                "role:sent",
+                "role:archive",
+                "role:junk",
+                "role:trash",
+                "name:alpha",
+                "name:zeta",
+            ]
+        );
+        assert_eq!(groups[0].members[0].0, "b");
+        assert_eq!((groups[0].total, groups[0].unread), (7, 3));
+    }
+
+    #[test]
+    fn list_emails_in_merges_newest_first_with_paging() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .upsert_mailboxes(&[
+                mailbox_of("a", "m1", "One", None),
+                mailbox_of("b", "x1", "One", None),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                email_in("a", "e10", "2026-10-01T10:00:00Z", "s", &["m1"]),
+                email_in("a", "e12", "2026-10-01T12:00:00Z", "s", &["m1"]),
+                email_in("b", "e11", "2026-10-01T11:00:00Z", "s", &["x1"]),
+                email_in("b", "e13", "2026-10-01T13:00:00Z", "s", &["x1"]),
+            ])
+            .unwrap();
+
+        let both = members(&[("a", "m1"), ("b", "x1")]);
+        let ids = |members: &[(String, String)], limit, offset| {
+            store
+                .list_emails_in(
+                    members,
+                    &ListQuery {
+                        limit,
+                        offset,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&both, 0, 0), ["e13", "e12", "e11", "e10"]);
+        assert_eq!(ids(&both, 2, 1), ["e12", "e11"]);
+
+        store
+            .upsert_emails(&[
+                email_in("b", "t1", "2026-10-01T09:00:00Z", "s", &["x1"]),
+                email_in("a", "t2", "2026-10-01T09:00:00Z", "s", &["m1"]),
+            ])
+            .unwrap();
+
+        assert_eq!(ids(&both, 0, 0)[4..], ["t2", "t1"]);
+
+        // A second fixture: 202 emails in one mailbox, to pin the default cap
+        // and the saturating page size.
+        let store = Store::open_memory().unwrap();
+        let big = members(&[("a", "m1")]);
+        let many: Vec<EmailSummary> = (0..202)
+            .map(|i| {
+                email_in(
+                    "a",
+                    &format!("r{i:03}"),
+                    &format!("2026-11-01T{:02}:{:02}:00Z", i / 60, i % 60),
+                    "s",
+                    &["m1"],
+                )
+            })
+            .collect();
+
+        store
+            .upsert_mailboxes(&[mailbox_of("a", "m1", "One", None)])
+            .unwrap();
+        store.upsert_emails(&many).unwrap();
+
+        let count = |limit, offset| {
+            store
+                .list_emails_in(
+                    &big,
+                    &ListQuery {
+                        limit,
+                        offset,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .len()
+        };
+
+        assert_eq!(count(0, 1), 200);
+        assert_eq!(count(u32::MAX, 1), 201);
+    }
+
+    #[test]
+    fn list_emails_in_dedupes_and_keeps_label_hiding() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .upsert_mailboxes(&[
+                mailbox("l1", "Receipts", None),
+                mailbox("l2", "Receipts", None),
+                mailbox("trash", "Trash", Some("trash")),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                email("both", "2026-10-02T10:00:00Z", "both", &["l1", "l2"]),
+                email("gone", "2026-10-01T10:00:00Z", "gone", &["l1", "trash"]),
+            ])
+            .unwrap();
+
+        let rows = store
+            .list_emails_in(&members(&[("a", "l1"), ("a", "l2")]), &ListQuery::default())
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["both"]
+        );
     }
 
     #[test]
