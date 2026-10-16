@@ -5,7 +5,7 @@ use posto_core::store::mailbox_groups;
 
 use crate::app::{
     EXPANDED, MAILBOXES, SELECTED_MAILBOX, SidebarRow, UNSURE, backend, enabled_ids,
-    select_mailbox, sidebar_rows, toggle_expanded,
+    open_empty_menu, select_mailbox, sidebar_rows, toggle_expanded,
 };
 use crate::components::Icon;
 use crate::state::Folder;
@@ -23,7 +23,24 @@ fn icon(role: Option<&str>) -> &'static str {
     }
 }
 
+/// The name a Trash or Spam row's "Empty …" menu shows; `None` for other roles.
+fn emptyable(role: Option<&str>, name: &str) -> Option<String> {
+    matches!(role, Some("trash" | "junk")).then(|| name.to_string())
+}
+
+/// Opens the "Empty …" menu for `folder` at the pointer.
+fn on_context_menu(evt: MouseEvent, folder: &Folder, name: &Option<String>) {
+    if let Some(name) = name {
+        let at = evt.client_coordinates();
+
+        evt.prevent_default();
+        evt.stop_propagation();
+        open_empty_menu(folder.clone(), name.clone(), at.x, at.y);
+    }
+}
+
 /// One clickable sidebar row; `member` rows sit under an expanded group.
+/// `empty_name` (Trash and Spam only) enables the right-click "Empty …" menu.
 #[component]
 fn Entry(
     icon: &'static str,
@@ -32,6 +49,7 @@ fn Entry(
     selected: bool,
     folder: Folder,
     #[props(default)] member: bool,
+    #[props(default)] empty_name: Option<String>,
 ) -> Element {
     let class = match (selected, member) {
         (true, true) => "mailbox member selected",
@@ -39,12 +57,14 @@ fn Entry(
         (false, true) => "mailbox member",
         (false, false) => "mailbox",
     };
+    let target = folder.clone();
 
     rsx! {
         div {
             class,
             onmousedown: |evt| evt.prevent_default(),
             onclick: move |_| select_mailbox(folder.clone()),
+            oncontextmenu: move |evt| on_context_menu(evt, &target, &empty_name),
             Icon { name: icon }
             span { class: "name", "{name}" }
             if unread > 0 {
@@ -64,16 +84,19 @@ fn GroupEntry(
     unread: i64,
     selected: bool,
     expanded: bool,
+    #[props(default)] empty_name: Option<String>,
 ) -> Element {
     let folder = Folder::Merged {
         key: group_key.clone(),
     };
+    let target = folder.clone();
 
     rsx! {
         div {
             class: if selected { "mailbox selected" } else { "mailbox" },
             onmousedown: |evt| evt.prevent_default(),
             onclick: move |_| select_mailbox(folder.clone()),
+            oncontextmenu: move |evt| on_context_menu(evt, &target, &empty_name),
             button {
                 class: "disclosure",
                 title: if expanded { "Hide accounts" } else { "Show accounts" },
@@ -99,7 +122,7 @@ fn GroupEntry(
 
 /// Left pane: mailboxes with unread badges. With one account the list is
 /// flat; with several, one row per mailbox group (expandable into the
-/// accounts' own mailboxes) is followed by each account's Unsure row.
+/// accounts' own mailboxes). One Unsure row covers every account.
 #[component]
 pub fn Sidebar() -> Element {
     let selected = SELECTED_MAILBOX();
@@ -154,6 +177,7 @@ pub fn Sidebar() -> Element {
                                 selected: selected == Some(Folder::Merged { key: key.clone() }),
                                 group_key: key,
                                 icon: icon(role.as_deref()),
+                                empty_name: emptyable(role.as_deref(), &name),
                                 name,
                                 unread,
                                 expanded,
@@ -161,6 +185,13 @@ pub fn Sidebar() -> Element {
                         },
                         SidebarRow::Member { folder, label, unread } => {
                             let key = format!("{folder:?}");
+                            let empty_name = match &folder {
+                                Folder::Mailbox { account_id, id } => mailboxes
+                                    .iter()
+                                    .find(|m| m.account_id == *account_id && m.id == *id)
+                                    .and_then(|m| emptyable(m.role.as_deref(), &label)),
+                                _ => None,
+                            };
 
                             rsx! {
                                 Entry {
@@ -171,15 +202,16 @@ pub fn Sidebar() -> Element {
                                     selected: selected.as_ref() == Some(&folder),
                                     folder,
                                     member: true,
+                                    empty_name,
                                 }
                             }
                         }
                     }
                 }
             }
-            for (account_id , account_name , classifying) in accounts {
+            for (account_id , _ , _) in accounts.iter() {
                 if !multi {
-                    for m in mailboxes.iter().filter(|m| m.account_id == account_id) {
+                    for m in mailboxes.iter().filter(|m| m.account_id == *account_id) {
                         {
                             let folder = Folder::Mailbox {
                                 account_id: m.account_id.clone(),
@@ -194,32 +226,25 @@ pub fn Sidebar() -> Element {
                                     unread: m.unread,
                                     selected: selected.as_ref() == Some(&folder),
                                     folder,
+                                    empty_name: emptyable(m.role.as_deref(), &m.name),
                                 }
                             }
                         }
                     }
                 }
-                {
-                    let count = unsure.get(&account_id).copied().unwrap_or(0);
-                    let folder = Folder::Unsure {
-                        account_id: account_id.clone(),
-                    };
-                    let name = if multi {
-                        format!("Unsure — {account_name}")
-                    } else {
-                        "Unsure".to_string()
-                    };
+            }
+            {
+                let count: usize = unsure.values().sum();
+                let classifying = accounts.iter().any(|(_, _, on)| *on);
 
-                    rsx! {
-                        if classifying || count > 0 {
-                            Entry {
-                                key: "{account_id}/unsure",
-                                icon: "flag",
-                                name,
-                                unread: count as i64,
-                                selected: selected.as_ref() == Some(&folder),
-                                folder,
-                            }
+                rsx! {
+                    if classifying || count > 0 {
+                        Entry {
+                            icon: "flag",
+                            name: "Unsure",
+                            unread: count as i64,
+                            selected: selected == Some(Folder::Unsure),
+                            folder: Folder::Unsure,
                         }
                     }
                 }

@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 
-use crate::app::{CONFIRM, dispatch, focus_root};
+use crate::app::{CONFIRM, accept as run_accept, focus_root};
 
 /// Closes the dialog; `accept` also runs its action.
 fn finish(accept: bool) {
@@ -11,7 +11,7 @@ fn finish(accept: bool) {
     focus_root();
 
     if let (true, Some(confirm)) = (accept, pending) {
-        dispatch(confirm.on_accept);
+        run_accept(confirm.on_accept);
     }
 }
 

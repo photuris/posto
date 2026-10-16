@@ -3,6 +3,7 @@
 mod composer;
 mod confirm;
 mod icons;
+mod menu;
 mod message_list;
 mod reader;
 mod settings;
@@ -14,6 +15,7 @@ use dioxus::prelude::*;
 pub use composer::Composer;
 pub use confirm::ConfirmDialog;
 pub use icons::Icon;
+pub use menu::ContextMenu;
 pub use message_list::MessageList;
 pub use reader::Reader;
 pub use settings::Settings;

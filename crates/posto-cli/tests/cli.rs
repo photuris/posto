@@ -970,6 +970,37 @@ fn destroy_requires_yes_and_mirrors_offline() {
     );
 }
 
+#[test]
+fn mailbox_empty_requires_yes_and_destroys_the_trash() {
+    let sb = Sandbox::seeded();
+    let refused = sb.run_with(&["mailbox", "empty", "Trash"], None);
+
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--yes"));
+
+    let before = sb.json(&["email", "list", "--mailbox", "Trash"]);
+    let trashed = before.as_array().unwrap().len();
+
+    assert!(trashed > 0);
+
+    let done = sb.json(&["mailbox", "empty", "Trash", "--yes"]);
+
+    assert_eq!(done["applied"], trashed);
+    assert_eq!(done["offline"], true);
+    assert!(
+        sb.json(&["email", "list", "--mailbox", "Trash"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Other mail is untouched; a missing mailbox is skipped, not an error.
+    assert!(!sb.json(&["email", "list"]).as_array().unwrap().is_empty());
+    assert_eq!(
+        sb.json(&["mailbox", "empty", "Nope", "--yes"])["applied"],
+        0
+    );
+}
+
 /// Each provider connects with its own stored credentials. Both runs stay on
 /// the machine: the JMAP session URL is a closed loopback port and the Proton
 /// session blob is unreadable, so no request leaves the process.

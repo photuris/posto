@@ -54,18 +54,10 @@ pub fn MessageList() -> Element {
     let (title, counts) = match (&mailbox, searching) {
         (_, true) => ("Search".to_string(), format!("{} results", emails.len())),
         (None, _) => match &current {
-            Some(Folder::Unsure { account_id }) => {
-                let name = accounts
-                    .iter()
-                    .find(|(id, _)| id == account_id)
-                    .filter(|_| accounts.len() > 1)
-                    .map_or(String::new(), |(_, name)| format!(" — {name}"));
-
-                (
-                    format!("Unsure{name}"),
-                    format!("{} messages to review", emails.len()),
-                )
-            }
+            Some(Folder::Unsure) => (
+                "Unsure".to_string(),
+                format!("{} messages to review", emails.len()),
+            ),
             _ => match &group {
                 Some(g) => (
                     g.name.clone(),
@@ -143,7 +135,7 @@ pub fn MessageList() -> Element {
                                         Some(Folder::Merged { .. }) => !group.as_ref().is_some_and(|g| {
                                             g.members.iter().any(|(a, id)| *a == m.account_id && *id == m.id)
                                         }),
-                                        Some(Folder::Unsure { .. }) | None => true,
+                                        Some(Folder::Unsure) | None => true,
                                     })
                                     .map(|m| (m.name.clone(), format::avatar_hue(&m.name))),
                             )

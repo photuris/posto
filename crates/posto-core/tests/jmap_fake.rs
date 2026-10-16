@@ -1,6 +1,6 @@
 //! Integration tests against a wiremock fake JMAP server.
 
-use posto_core::actions::{Action, apply, in_trash};
+use posto_core::actions::{self, Action, apply, in_trash};
 use posto_core::body::{fetch_body, save_attachment};
 use posto_core::compose::{Draft, send};
 use posto_core::config::{Account, Config};
@@ -860,12 +860,12 @@ async fn proton_rules_apply_offline() -> Result<()> {
 
     assert_eq!(mailbox_ids("e4"), ["promos"]);
 
-    let err = apply(&store, None, "a", &ids(&["e1"]), Action::Destroy)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
-    assert!(store.email("a", "e1")?.is_some());
+    // Permanent delete is allowed on Proton too.
+    assert_eq!(
+        apply(&store, None, "a", &ids(&["e1"]), Action::Destroy).await?,
+        1
+    );
+    assert!(store.email("a", "e1")?.is_none());
 
     store.set_account_state("a", "provider", "jmap")?;
     apply(&store, None, "a", &ids(&["e3"]), Action::Archive).await?;
@@ -1497,6 +1497,43 @@ async fn destroy_removes_locally_and_skips_not_destroyed() -> Result<()> {
     assert!(store.email("a", "e1")?.is_none());
     assert!(store.body("a", "e1")?.is_none());
     assert!(store.email("a", "e2")?.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_mailbox_destroys_what_the_store_lists_there() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    store.upsert_mailboxes(&[mailbox("mb-trash", "trash"), mailbox("mb-inbox", "inbox")])?;
+    store.upsert_emails(&[
+        email("e1", "mb-trash"),
+        email("e2", "mb-trash"),
+        email("e3", "mb-inbox"),
+    ])?;
+    reply(
+        &server,
+        "Email/set",
+        json!({ "destroy": ["e1", "e2"] }),
+        json!({ "destroyed": ["e1", "e2"] }),
+        1,
+    )
+    .await;
+
+    let n = actions::empty_mailbox(&store, Some(&c), "a", "mb-trash").await?;
+
+    assert_eq!(n, 2);
+    assert!(store.email("a", "e1")?.is_none());
+    assert!(store.email("a", "e2")?.is_none());
+    assert!(store.email("a", "e3")?.is_some());
+
+    // An empty mailbox sends nothing (the mock above would 500 on a second call).
+    assert_eq!(
+        actions::empty_mailbox(&store, Some(&c), "a", "mb-trash").await?,
+        0
+    );
 
     Ok(())
 }

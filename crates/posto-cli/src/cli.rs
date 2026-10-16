@@ -180,6 +180,17 @@ pub enum MailboxCmd {
     ///
     /// Output: [{"account_id": string, "id": string, "name": string, "role": string|null, "parent_id": string|null, "sort_order": number, "total": number, "unread": number}]
     List,
+    /// Permanently delete every message in a mailbox (meant for Trash and
+    /// Spam), in every account that has it or only `--account`.
+    ///
+    /// Output: {"applied": number, "offline": bool}
+    Empty {
+        /// Mailbox name or id.
+        mailbox: String,
+        /// Required: this cannot be undone.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// One or more email ids.

@@ -42,7 +42,11 @@ Read `README.md` first. This file holds what the code does not say.
   reported, never auto-created (`action_toast`). A reply records
   `Draft.reply_to_account_id`; `compose::send` marks the original answered
   only in that account, and the GUI's `finish_send` does it through the
-  original account's connection when the sender differs.
+  original account's connection when the sender differs. The Unsure row is one
+  view over every account. Right-clicking a Trash or Spam row (group or single)
+  offers "Empty …", which runs `actions::empty_mailbox` per account (destroys
+  what the store lists there; `Confirm.on_accept` is an `Accept`, not only a
+  key action).
 
 ## Rules that bit us
 
@@ -62,7 +66,7 @@ Read `README.md` first. This file holds what the code does not say.
 - The sync writes `<account>/provider` into `sync_state`; `actions::apply`
   and `classify::ensure_mailbox` read it to apply the Proton folder rules
   with or without a connection (move keeps labels, move-to-label refused,
-  a folder added through a patch evicts the other folders, Destroy refused,
+  a folder added through a patch evicts the other folders,
   tray mailboxes must be labels). Without the state the JMAP rules apply.
 - Proton tokens rotate on 401. Every `proton::Session` operation (success
   and error paths, including `create_mailbox`/`destroy` which make no

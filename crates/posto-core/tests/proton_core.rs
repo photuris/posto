@@ -322,7 +322,7 @@ async fn proton_actions_through_the_core() {
     mount_initial(&server).await;
     sync(&store, &conn).await.unwrap();
 
-    for p in ["label", "unlabel"] {
+    for p in ["label", "unlabel", "delete"] {
         Mock::given(method("PUT"))
             .and(path(format!("/mail/v4/messages/{p}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Code": 1000})))
@@ -373,13 +373,14 @@ async fn proton_actions_through_the_core() {
     assert_eq!(patched.unwrap(), 1);
     assert_eq!(mailbox_ids(&store, "m4"), [LABEL, "f1"]);
 
-    let destroyed = apply("m4", Action::Destroy).await;
+    // Permanent delete is one PUT and drops the local row.
+    assert_eq!(apply("m4", Action::Destroy).await.unwrap(), 1);
 
-    assert!(
-        matches!(destroyed, Err(Error::Unsupported(_))),
-        "{destroyed:?}"
-    );
-    assert!(store.email("a", "m4").unwrap().is_some());
+    let seen = puts(&server).await;
+
+    assert_eq!(seen.last().unwrap().0, "/mail/v4/messages/delete");
+    assert_eq!(seen.last().unwrap().1["IDs"], json!(["m4"]));
+    assert!(store.email("a", "m4").unwrap().is_none());
 
     // Flag is the starred label.
     assert_eq!(apply("m0", Action::Flag).await.unwrap(), 1);

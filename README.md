@@ -154,10 +154,10 @@ denominator, with these mappings and limits on Proton:
 - Proton gives no list previews (bodies are encrypted until opened), so
   the preview column is empty. Unread counts are computed from the local
   cache.
-- Permanent delete and creating mailboxes are not available on Proton
-  with the pinned `proton-mail-api` (they return "not available for this
-  account"). Classification on a Proton account therefore needs its tray
-  labels (and `Unsure`) created in Proton first, as labels, not folders.
+- Creating mailboxes is not available on Proton with the pinned
+  `proton-mail-api` (it returns "not available for this account").
+  Classification on a Proton account therefore needs its tray labels (and
+  `Unsure`) created in Proton first, as labels, not folders.
 - Nested labels are never created anywhere (Proton labels cannot nest).
 - Sync uses Proton's event feed; a cursor the server no longer knows
   triggers a full refetch of the cached window (`sync.initial_limit`
@@ -209,7 +209,7 @@ one account has classification on and a key exists; a toast reports
 key, the model, the thresholds, the tray mailbox names, keep-in-inbox and
 the per-account opt-in (click cycles follow global, on, off). The message
 list shows a muted chip with the tray's mailbox name and an accent
-`Unsure` chip. The sidebar's `Unsure` entry lists an account's unsure,
+`Unsure` chip. The sidebar's `Unsure` entry lists every account's unsure,
 uncorrected messages. `t` (or "Classify as…" in the reader and the bulk
 panel) files the selected messages under a tray by your decision; it moves
 them by the same rules and marks them corrected.
@@ -239,7 +239,9 @@ next `classify run` or classifying sync.
 `e` archive, `#` delete, `!` junk, `r` reply, `a` reply all, `c` compose,
 `u` toggle read, `s` toggle flag, `m` move, `l` labels, `t` classify as, `/` search, `g` sync,
 `Ctrl+Enter` send. Delete moves a message to Trash; deleting a message that is
-already in Trash deletes it permanently, after a confirmation. Labels are mailboxes;
+already in Trash deletes it permanently, after a confirmation. Right-click Trash or
+Spam in the sidebar for "Empty …", which permanently deletes everything the app
+has synced there, in every account, after a confirmation. Labels are mailboxes;
 a message can be in several. Override any of
 them in Settings or in `config.toml`:
 
@@ -267,6 +269,7 @@ posto email archive <id>...
 posto email label Promos <id>...
 posto email unlabel Promos <id>...
 posto email destroy <id>... --yes   # permanent; `email delete` only moves to Trash
+posto mailbox empty Trash --yes     # permanent, every account that has the mailbox
 posto email reply <id> --body-file reply.md --markdown
 ```
 
@@ -298,4 +301,4 @@ as CSS variables; elsewhere it falls back to the system scheme.
 IMAP, moving mail between accounts, contacts, calendar, conversation view, push,
 offline action queue, outgoing attachments, HTML composer, keyring
 storage, packaging, Proton attachments embedded in PGP/MIME bodies,
-`cid:` images, creating labels or deleting permanently on Proton.
+`cid:` images, creating labels on Proton.

@@ -1465,6 +1465,24 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Ids of every email of `account` in `mailbox_id`, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn email_ids_in_mailbox(&self, account: &str, mailbox_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT e.id FROM emails e \
+             JOIN email_mailboxes em ON em.account_id = e.account_id AND em.email_id = e.id \
+             WHERE e.account_id = ?1 AND em.mailbox_id = ?2 \
+             ORDER BY e.received_at DESC, e.id",
+        )?;
+        let rows = stmt.query_map([account, mailbox_id], |r| r.get(0))?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The emails of `account` with these ids, newest first; unknown ids are
     /// skipped.
     ///

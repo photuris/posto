@@ -450,6 +450,35 @@ pub fn mailbox_list(account: Option<&str>) -> Result<Value> {
     to_json(&all)
 }
 
+/// Permanently deletes everything in `mailbox` of every account in scope that
+/// has it; without `yes` it exits 2 as a usage error.
+pub async fn mailbox_empty(account: Option<&str>, mailbox: &str, yes: bool) -> Result<Value> {
+    if !yes {
+        crate::cli::Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "refusing to empty a mailbox without --yes",
+            )
+            .exit();
+    }
+
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let (mut applied, mut offline) = (0, false);
+
+    for id in scope(&cfg, account)? {
+        let Some(m) = find_mailbox(&store, &id, mailbox)? else {
+            continue;
+        };
+        let client = optional_client(&cfg, configured(&cfg, &id)?).await?;
+
+        offline |= client.is_none();
+        applied += actions::empty_mailbox(&store, client.as_ref(), &id, &m.id).await?;
+    }
+
+    Ok(json!({ "applied": applied, "offline": offline }))
+}
+
 pub fn email_list(
     account: Option<&str>,
     mailbox: Option<String>,

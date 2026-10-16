@@ -28,11 +28,8 @@ pub enum Folder {
         /// Server mailbox id.
         id: String,
     },
-    /// The classifier's unsure, uncorrected messages of one account.
-    Unsure {
-        /// Local account slug.
-        account_id: String,
-    },
+    /// The classifier's unsure, uncorrected messages of every account.
+    Unsure,
 }
 
 /// Stands in for Jev in UI test mode, so no key and no network are needed: a

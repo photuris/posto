@@ -72,6 +72,9 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
         },
         Noun::Sync(SyncCmd::Run) => c::sync_run(account).await,
         Noun::Mailbox(MailboxCmd::List) => c::mailbox_list(account),
+        Noun::Mailbox(MailboxCmd::Empty { mailbox, yes }) => {
+            c::mailbox_empty(account, &mailbox, yes).await
+        }
         Noun::Email(cmd) => match cmd {
             EmailCmd::List {
                 mailbox,

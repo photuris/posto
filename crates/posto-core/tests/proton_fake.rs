@@ -780,14 +780,43 @@ async fn unsupported_operations() {
     let session = plain(&server, None);
 
     assert!(matches!(
-        session.destroy(&["m1".to_owned()]).await,
-        Err(Error::Unsupported(_))
-    ));
-    assert!(matches!(
         session.create_mailbox("Tray").await,
         Err(Error::Unsupported(_))
     ));
     assert_eq!(count(&server).await, 0);
+}
+
+#[tokio::test]
+async fn destroy_deletes_and_skips_refused_ids() {
+    let server = MockServer::start().await;
+    let refusal = json!({"Code": 1001, "Responses": [{"ID": "m2", "Response": {"Code": 2000}}]});
+
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/delete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(refusal))
+        .mount(&server)
+        .await;
+
+    let gone = plain(&server, None)
+        .destroy(&["m1".to_owned(), "m2".to_owned()])
+        .await
+        .unwrap();
+
+    assert_eq!(gone, ["m1"]);
+
+    let puts: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .collect();
+
+    assert_eq!(puts.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&puts[0].body).unwrap()["IDs"],
+        json!(["m1", "m2"])
+    );
 }
 
 #[tokio::test]
@@ -1176,10 +1205,11 @@ async fn operations_without_a_request_still_persist() {
         "create_mailbox retries the write"
     );
 
+    // Destroying nothing sends nothing, so it too only retries the write.
     let (session, calls) = rotated_with_unsaved_blob().await;
-    let result = session.destroy(&["m1".to_owned()]).await;
+    let result = session.destroy(&[]).await;
 
-    assert!(matches!(result, Err(Error::Unsupported(_))));
+    assert!(result.unwrap().is_empty());
     assert_eq!(calls.lock().unwrap().len(), 2, "destroy retries the write");
 }
 

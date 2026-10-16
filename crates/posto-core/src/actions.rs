@@ -101,6 +101,25 @@ fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
         .ok_or_else(|| Error::NotFound(format!("{role} mailbox")))
 }
 
+/// Permanently deletes every email the store lists in `mailbox_id` of
+/// `account` (meant for Trash and Spam), as [`apply`] with
+/// [`Action::Destroy`] would; returns how many went. Mail the store has not
+/// synced yet stays until the next sync shows it.
+///
+/// # Errors
+///
+/// Any network, server or database error.
+pub async fn empty_mailbox(
+    store: &Store,
+    client: Option<&Connection>,
+    account: &str,
+    mailbox_id: &str,
+) -> Result<usize> {
+    let ids = store.email_ids_in_mailbox(account, mailbox_id)?;
+
+    destroy(store, client, account, &ids).await
+}
+
 /// Applies `action` to `ids` of `account` on the server (when `client` is given)
 /// and in the store. `client` must be the connection of `account`.
 ///
@@ -117,15 +136,15 @@ fn role_mailbox(store: &Store, account: &str, role: &str) -> Result<Change> {
 /// An account whose sync state says `provider = proton` (connection or not)
 /// follows Proton's folder rules. A message sits in at most one folder (a
 /// mailbox with a role) and any number of labels (no role); an id unknown to
-/// the store counts as a folder. [`Action::Destroy`] is refused, and so is a
-/// move to a label, both before anything is sent. A move to a folder keeps the
+/// the store counts as a folder. A move to a label is refused before anything
+/// is sent. A move to a folder keeps the
 /// message's labels. A patch that adds a folder drops every other folder from
 /// the mirror (the last folder in `add` wins), as the server does.
 ///
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] when a required role mailbox is missing,
-/// [`Error::Unsupported`] for the refused Proton actions, and any network,
+/// [`Error::Unsupported`] for a Proton move to a label, and any network,
 /// server or database error.
 pub async fn apply(
     store: &Store,
@@ -141,12 +160,6 @@ pub async fn apply(
         Vec::new()
     };
     let is_label = |id: &str| mailboxes.iter().any(|m| m.id == id && m.role.is_none());
-
-    if proton && action == Action::Destroy {
-        return Err(Error::Unsupported(
-            "permanent delete on Proton accounts".into(),
-        ));
-    }
 
     let change = match action {
         Action::Destroy => return destroy(store, client, account, ids).await,

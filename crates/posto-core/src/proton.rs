@@ -931,16 +931,22 @@ impl Session {
         .await
     }
 
-    /// Not available on Proton.
+    /// Permanently deletes `ids`; returns those the server did not refuse.
     ///
     /// # Errors
     ///
-    /// Always `Error::Unsupported`.
-    pub async fn destroy(&self, _ids: &[String]) -> Result<Vec<String>> {
+    /// Any transport or server error; a refusal of some ids is not an error.
+    pub async fn destroy(&self, ids: &[String]) -> Result<Vec<String>> {
         self.tracked(async {
-            Err(Error::Unsupported(
-                "permanent delete on Proton accounts".into(),
-            ))
+            let mut refused = Vec::new();
+
+            absorb(self.inner.delete_messages(ids).await, &mut refused)?;
+
+            Ok(ids
+                .iter()
+                .filter(|id| !refused.contains(id))
+                .cloned()
+                .collect())
         })
         .await
     }

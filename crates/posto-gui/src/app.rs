@@ -20,8 +20,8 @@ use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::components::{
-    ClassifyPicker, Composer, ConfirmDialog, LabelPicker, MessageList, MovePicker, Reader,
-    Settings, Sidebar, Toolbar,
+    ClassifyPicker, Composer, ConfirmDialog, ContextMenu, LabelPicker, MessageList, MovePicker,
+    Reader, Settings, Sidebar, Toolbar,
 };
 use crate::selection::{Click, Selection};
 use crate::state::{self, Backend, Folder, group_by_account, row_key};
@@ -33,7 +33,133 @@ pub struct Confirm {
     pub title: String,
     pub body: String,
     pub accept_label: String,
-    pub on_accept: Action,
+    pub on_accept: Accept,
+}
+
+/// What accepting a [`Confirm`] does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Accept {
+    /// Runs a keyboard action.
+    Action(Action),
+    /// Permanently deletes everything in a Trash or Spam folder.
+    Empty(Folder),
+}
+
+/// Runs what an accepted [`Confirm`] asked for.
+pub fn accept(what: Accept) {
+    match what {
+        Accept::Action(a) => dispatch(a),
+        Accept::Empty(folder) => run(empty_folder(folder)),
+    }
+}
+
+/// A right-click menu on a Trash or Spam row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Menu {
+    /// Viewport position of the click.
+    pub x: f64,
+    pub y: f64,
+    /// The folder to empty and its display name.
+    pub folder: Folder,
+    pub name: String,
+}
+
+/// Opens the right-click menu for a Trash or Spam row.
+pub fn open_empty_menu(folder: Folder, name: String, x: f64, y: f64) {
+    *MENU.write() = Some(Menu { x, y, folder, name });
+}
+
+/// The question to ask before emptying `name`, which holds `total` messages.
+pub fn empty_prompt(folder: Folder, name: &str, total: i64) -> Confirm {
+    Confirm {
+        title: format!("Empty {name}?"),
+        body: format!(
+            "{total} message{} will be deleted permanently. This cannot be undone.",
+            if total == 1 { "" } else { "s" }
+        ),
+        accept_label: format!("Empty {name}"),
+        on_accept: Accept::Empty(folder),
+    }
+}
+
+/// The `(account, mailbox)` pairs a folder stands for; none for Unsure.
+fn folder_members(folder: &Folder) -> Vec<(String, String)> {
+    match folder {
+        Folder::Merged { key } => group_by_key(key).map(|g| g.members).unwrap_or_default(),
+        Folder::Mailbox { account_id, id } => vec![(account_id.clone(), id.clone())],
+        Folder::Unsure => Vec::new(),
+    }
+}
+
+/// Closes the menu and asks before emptying its folder.
+pub fn confirm_empty() {
+    let Some(menu) = MENU.write().take() else {
+        return;
+    };
+    let members = folder_members(&menu.folder);
+    let total = MAILBOXES
+        .peek()
+        .iter()
+        .filter(|m| {
+            members
+                .iter()
+                .any(|(a, id)| *a == m.account_id && *id == m.id)
+        })
+        .map(|m| m.total)
+        .sum();
+
+    *CONFIRM.write() = Some(empty_prompt(menu.folder, &menu.name, total));
+}
+
+/// Permanently deletes everything in `folder`, account by account; every
+/// account is attempted even when one fails.
+async fn empty_folder(folder: Folder) {
+    let Some(_busy) = Flag::take(&BUSY) else {
+        return;
+    };
+    let b = backend().peek().clone();
+    let (mut deleted, mut failures) = (0, Vec::new());
+
+    for (account, mailbox) in folder_members(&folder) {
+        let before: Vec<EmailSummary> = b
+            .store
+            .email_ids_in_mailbox(&account, &mailbox)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| b.store.email(&account, id).ok().flatten())
+            .collect();
+        let result = match get_client(&account).await {
+            Ok(client) => {
+                actions::empty_mailbox(&b.store, client.as_deref(), &account, &mailbox).await
+            }
+            Err(e) => Err(e),
+        };
+
+        for old in &before {
+            let new = b.store.email(&account, &old.id).ok().flatten();
+
+            bump_counts(old, new.as_ref());
+        }
+
+        match result {
+            Ok(n) => deleted += n,
+            Err(e) => failures.push(format!("{account}: {e}")),
+        }
+    }
+
+    change_selection(|s| *s = Selection::default());
+    reload_list().await;
+
+    let done = format!(
+        "Permanently deleted {deleted} message{}",
+        if deleted == 1 { "" } else { "s" }
+    );
+
+    if failures.is_empty() {
+        set_status(done);
+    } else {
+        set_status(format!("{done}; failed in {}", failures.join("; ")));
+    }
 }
 
 /// The question to ask before deleting `selected` messages, `destroying` of
@@ -67,7 +193,7 @@ pub fn delete_prompt(selected: usize, destroying: usize) -> Option<Confirm> {
         title,
         body,
         accept_label: accept_label.into(),
-        on_accept: Action::DeleteConfirmed,
+        on_accept: Accept::Action(Action::DeleteConfirmed),
     })
 }
 
@@ -112,6 +238,8 @@ pub static CLASSIFIED: GlobalSignal<HashMap<String, (String, bool)>> = Signal::g
 /// Unsure, uncorrected messages per account.
 pub static UNSURE: GlobalSignal<BTreeMap<String, usize>> = Signal::global(BTreeMap::new);
 pub static CONFIRM: GlobalSignal<Option<Confirm>> = Signal::global(|| None);
+/// The open right-click menu, if any.
+pub static MENU: GlobalSignal<Option<Menu>> = Signal::global(|| None);
 pub static STATUS: GlobalSignal<String> = Signal::global(String::new);
 pub static KEYMAP: GlobalSignal<Keymap> = Signal::global(Keymap::defaults);
 pub static THEME_CSS: GlobalSignal<String> = Signal::global(|| {
@@ -464,6 +592,9 @@ pub fn App() -> Element {
             if CONFIRM.read().is_some() {
                 ConfirmDialog {}
             }
+            if MENU.read().is_some() {
+                ContextMenu {}
+            }
             if !STATUS.read().is_empty() {
                 div { class: "toast", {STATUS()} }
             }
@@ -478,7 +609,8 @@ pub fn dispatch(action: Action) {
         || *SHOW_MOVE_PICKER.peek()
         || *SHOW_LABEL_PICKER.peek()
         || *SHOW_CLASSIFY_PICKER.peek()
-        || CONFIRM.peek().is_some();
+        || CONFIRM.peek().is_some()
+        || MENU.peek().is_some();
 
     if !modal && action == Action::Delete {
         let (destroy, trash) = split_trash(selected_refs());
@@ -603,6 +735,8 @@ fn close_top() {
         *SHOW_CLASSIFY_PICKER.write() = false;
     } else if CONFIRM.peek().is_some() {
         *CONFIRM.write() = None;
+    } else if MENU.peek().is_some() {
+        *MENU.write() = None;
     }
 
     // Removed inputs never send focusout, so reset the flag here.
@@ -903,7 +1037,7 @@ fn folder_exists(folder: &Folder, mailboxes: &[Mailbox], accounts: &[String]) ->
         Folder::Mailbox { account_id, id } => mailboxes
             .iter()
             .any(|m| m.account_id == *account_id && m.id == *id),
-        Folder::Unsure { account_id } => mailboxes.iter().any(|m| m.account_id == *account_id),
+        Folder::Unsure => true,
     }
 }
 
@@ -1092,6 +1226,7 @@ pub async fn reload_list() {
         Some(Folder::Merged { key }) => group_by_key(key).map(|g| g.members).unwrap_or_default(),
         _ => Vec::new(),
     };
+    let accounts = enabled_ids(&b.cfg);
 
     let loaded = tokio::task::spawn_blocking(move || {
         if !q.is_empty() {
@@ -1114,10 +1249,26 @@ pub async fn reload_list() {
                     ..Default::default()
                 },
             ),
-            Some(Folder::Unsure { account_id }) => {
-                let ids = store.unsure_email_ids(&account_id)?;
+            Some(Folder::Unsure) => {
+                let mut all = Vec::new();
 
-                store.list_emails_by_ids(&account_id, &ids[..ids.len().min(limit as usize)])
+                for account in &accounts {
+                    let ids = store.unsure_email_ids(account)?;
+
+                    all.extend(
+                        store.list_emails_by_ids(account, &ids[..ids.len().min(limit as usize)])?,
+                    );
+                }
+
+                all.sort_by(|a, b| {
+                    b.received_at
+                        .cmp(&a.received_at)
+                        .then_with(|| a.account_id.cmp(&b.account_id))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                all.truncate(limit as usize);
+
+                Ok(all)
             }
             None => store.list_emails(
                 None,
@@ -2275,7 +2426,7 @@ mod tests {
         assert_eq!(permanent.title, "Permanently delete 1 message?");
         assert_eq!(permanent.body, "This cannot be undone.");
         assert_eq!(permanent.accept_label, "Delete permanently");
-        assert_eq!(permanent.on_accept, Action::DeleteConfirmed);
+        assert_eq!(permanent.on_accept, Accept::Action(Action::DeleteConfirmed));
 
         let mixed = delete_prompt(3, 2).unwrap();
 
@@ -2421,6 +2572,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn empty_menu_asks_then_destroys_the_folder() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        let trash = b
+            .store
+            .mailbox_by_role("default", "trash")
+            .unwrap()
+            .unwrap();
+        let trashed = b.store.email_ids_in_mailbox("default", &trash.id).unwrap();
+        let folder = Folder::Mailbox {
+            account_id: "default".into(),
+            id: trash.id.clone(),
+        };
+
+        assert_eq!(trashed.len(), 1, "the fixture has one trashed message");
+
+        open_empty_menu(folder.clone(), "Trash".into(), 1.0, 2.0);
+        confirm_empty();
+
+        let prompt = CONFIRM.peek().clone().unwrap();
+
+        assert!(MENU.peek().is_none());
+        assert_eq!(prompt.title, "Empty Trash?");
+        assert_eq!(
+            prompt.body,
+            "1 message will be deleted permanently. This cannot be undone."
+        );
+        assert_eq!(prompt.accept_label, "Empty Trash");
+        assert_eq!(prompt.on_accept, Accept::Empty(folder.clone()));
+        assert_eq!(
+            empty_prompt(Folder::Unsure, "Spam", 3).body,
+            "3 messages will be deleted permanently. This cannot be undone."
+        );
+
+        empty_folder(folder).await;
+
+        assert!(
+            b.store
+                .email_ids_in_mailbox("default", &trash.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(b.store.email("default", "fx-01").unwrap().is_some());
+        assert_eq!(
+            MAILBOXES
+                .peek()
+                .iter()
+                .find(|m| m.id == trash.id)
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(*STATUS.peek(), "Permanently deleted 1 message");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn unsure_folder_lists_unsure_mail_until_corrected() {
         let dom = rendered(backend_with(Config::default()));
         let _guard = RuntimeGuard::new(dom.runtime());
@@ -2431,9 +2647,7 @@ mod tests {
 
         assert_eq!(UNSURE.peek().get("default"), Some(&1));
 
-        *SELECTED_MAILBOX.write() = Some(Folder::Unsure {
-            account_id: "default".into(),
-        });
+        *SELECTED_MAILBOX.write() = Some(Folder::Unsure);
         reload_list().await;
 
         let ids: Vec<String> = EMAILS.peek().iter().map(|e| e.id.clone()).collect();

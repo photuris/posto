@@ -299,6 +299,13 @@ input.number { width: 80px; }
 .label-row { display: flex; align-items: center; gap: 8px; }
 .label-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: hsl(var(--hue) 60% 55%); }
 
+.menu-overlay { background: none; }
+.menu {
+  position: fixed; min-width: 160px; padding: 4px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.3);
+}
+
 .toast {
   position: fixed; right: 16px; bottom: 16px; z-index: 20;
   max-width: 60vw; padding: 8px 14px; border-radius: 8px;
