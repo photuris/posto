@@ -133,6 +133,9 @@ denominator, with these mappings and limits on Proton:
   moving to a *label* is refused on Proton (use Labels… instead);
   adding a folder through Labels… leaves the previous folder. On JMAP a
   move replaces the whole mailbox set, as before.
+- A label view hides mail that is in Trash or Spam. Deleting from a label
+  keeps the label on the server (so restoring in Proton puts the message
+  back), but the message shows only in Trash until then.
 - Starred is `$flagged`. All Mail, All Sent, All Drafts, Outbox,
   Scheduled, Snoozed and other system views are hidden.
 - Proton gives no list previews (bodies are encrypted until opened), so

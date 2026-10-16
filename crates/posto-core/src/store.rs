@@ -1669,6 +1669,10 @@ impl Store {
 
     /// Lists emails newest first; `account` `None` lists every account.
     ///
+    /// A label view (a `mailbox_id` without a role) hides mail that also sits
+    /// in a trash or junk mailbox: Proton keeps labels on trashed mail, and a
+    /// deleted message belongs in Trash, not in the label it came from.
+    ///
     /// # Errors
     ///
     /// Returns an error on database failure.
@@ -1686,6 +1690,13 @@ impl Store {
              AND (?2 IS NULL OR EXISTS (SELECT 1 FROM email_mailboxes em \
                  WHERE em.account_id = e.account_id AND em.email_id = e.id \
                  AND em.mailbox_id = ?2)) \
+             AND (?2 IS NULL \
+                 OR EXISTS (SELECT 1 FROM mailboxes l \
+                     WHERE l.account_id = e.account_id AND l.id = ?2 AND l.role IS NOT NULL) \
+                 OR NOT EXISTS (SELECT 1 FROM email_mailboxes em \
+                     JOIN mailboxes m ON m.account_id = em.account_id AND m.id = em.mailbox_id \
+                     WHERE em.account_id = e.account_id AND em.email_id = e.id \
+                     AND m.role IN ('trash', 'junk'))) \
              AND (?3 IS NULL OR EXISTS (SELECT 1 FROM email_mailboxes em \
                  JOIN mailboxes m ON m.account_id = em.account_id AND m.id = em.mailbox_id \
                  WHERE em.account_id = e.account_id AND em.email_id = e.id \
@@ -2120,6 +2131,56 @@ mod tests {
             all.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
             ["b", "a"]
         );
+    }
+
+    #[test]
+    fn label_view_hides_trashed_and_junk_mail() {
+        let store = Store::open_memory().unwrap();
+
+        store
+            .upsert_mailboxes(&[
+                mailbox("label", "Receipts", None),
+                mailbox("folder", "Work", Some("folder")),
+                mailbox("trash", "Trash", Some("trash")),
+                mailbox("junk", "Spam", Some("junk")),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                email("kept", "2026-10-03T10:00:00Z", "kept", &["label", "folder"]),
+                email(
+                    "trashed",
+                    "2026-10-02T10:00:00Z",
+                    "trashed",
+                    &["label", "folder", "trash"],
+                ),
+                email(
+                    "junked",
+                    "2026-10-01T10:00:00Z",
+                    "junked",
+                    &["label", "junk"],
+                ),
+            ])
+            .unwrap();
+
+        let ids = |mailbox_id: &str| {
+            store
+                .list_emails(
+                    Some("a"),
+                    &ListQuery {
+                        mailbox_id: Some(mailbox_id.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids("label"), ["kept"]);
+        assert_eq!(ids("folder"), ["kept", "trashed"]);
+        assert_eq!(ids("trash"), ["trashed"]);
     }
 
     #[test]
