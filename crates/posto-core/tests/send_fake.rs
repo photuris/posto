@@ -315,10 +315,8 @@ async fn send_reports_not_created() {
     );
 }
 
-#[tokio::test]
-async fn send_marks_replied_answered() {
-    let server = server().await;
-    let store = store();
+/// Stores the email `e1` of account `a` that the reply tests answer.
+fn seed_original(store: &Store) {
     store
         .upsert_emails(&[EmailSummary {
             account_id: "a".into(),
@@ -336,6 +334,16 @@ async fn send_marks_replied_answered() {
             keywords: vec!["$seen".into()],
         }])
         .unwrap();
+}
+
+/// Sends a reply to `e1` (recorded as belonging to `reply_account`) as account `a`.
+/// The `$answered` update is mounted `answered_times` times; returns the server
+/// and the store.
+async fn send_reply(reply_account: Option<&str>, answered_times: u64) -> (MockServer, Store) {
+    let server = server().await;
+    let store = store();
+
+    seed_original(&store);
     identities(&server, two_identities()).await;
     mount(
         &server,
@@ -344,24 +352,65 @@ async fn send_marks_replied_answered() {
         1,
     )
     .await;
-    mount(
-        &server,
-        r#""keywords/$answered":true"#,
-        json!([["Email/set", { "updated": { "e1": null } }, "0"]]),
-        1,
-    )
-    .await;
+
+    if answered_times > 0 {
+        mount(
+            &server,
+            r#""keywords/$answered":true"#,
+            json!([["Email/set", { "updated": { "e1": null } }, "0"]]),
+            answered_times,
+        )
+        .await;
+    }
 
     let draft = Draft {
         reply_to_email_id: Some("e1".into()),
+        reply_to_account_id: reply_account.map(String::from),
         ..draft()
     };
+
     send(&cfg(), &store, &client(&server).await, "a", &draft)
         .await
         .unwrap();
 
+    (server, store)
+}
+
+/// Whether a request body that marks something answered reached `server`.
+async fn marked_answered(server: &MockServer) -> bool {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| String::from_utf8_lossy(&r.body).contains("keywords/$answered"))
+}
+
+#[tokio::test]
+async fn send_marks_replied_answered() {
+    let (server, store) = send_reply(None, 1).await;
+
     let keywords = store.email("a", "e1").unwrap().unwrap().keywords;
     assert!(keywords.contains(&"$answered".to_string()), "{keywords:?}");
+    assert!(marked_answered(&server).await);
+}
+
+#[tokio::test]
+async fn send_marks_replied_answered_for_the_same_account() {
+    let (server, store) = send_reply(Some("a"), 1).await;
+
+    let keywords = store.email("a", "e1").unwrap().unwrap().keywords;
+    assert!(keywords.contains(&"$answered".to_string()), "{keywords:?}");
+    assert!(marked_answered(&server).await);
+}
+
+#[tokio::test]
+async fn send_skips_mark_answered_for_another_account() {
+    let (server, store) = send_reply(Some("other"), 0).await;
+
+    let keywords = store.email("a", "e1").unwrap().unwrap().keywords;
+    assert!(!keywords.contains(&"$answered".to_string()), "{keywords:?}");
+    assert!(!marked_answered(&server).await);
 }
 
 #[tokio::test]

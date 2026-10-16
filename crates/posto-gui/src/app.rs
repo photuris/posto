@@ -1578,24 +1578,75 @@ async fn send_draft(archive: bool) {
         "Sent"
     });
 
-    let replied_to = draft
-        .reply_to_email_id
+    let replied_to = replied_to(&draft);
+    let cross_account = draft
+        .reply_to_account_id
         .as_deref()
-        .map(|id| MsgRef::new(&draft.account_id, id));
+        .is_some_and(|a| a != draft.account_id);
+    let toast = finish_send(
+        replied_to.clone(),
+        cross_account,
+        archive,
+        async |r: &MsgRef, action| {
+            act_on_emails(std::slice::from_ref(r), action)
+                .await
+                .inspect_err(|e| {
+                    if matches!(e, Error::Auth) {
+                        backend().write().reset_client();
+                    }
+                })
+        },
+    )
+    .await;
 
-    match replied_to.clone().filter(|_| archive) {
-        Some(r) => {
-            if let Err(e) = act_on_emails(std::slice::from_ref(&r), actions::Action::Archive).await
-            {
-                fail("Sent, but archiving failed", e);
-            }
-        }
-        None => {
-            if let Some(r) = &replied_to {
-                refresh_row(r);
-            }
-        }
+    if !archive && let Some(r) = &replied_to {
+        refresh_row(r);
     }
+
+    if toast != SENT {
+        set_status(toast);
+    }
+}
+
+/// The toast of a send whose follow-ups all worked.
+const SENT: &str = "Sent";
+
+/// The message `draft` replies to: its id in the account it was received by,
+/// which is not the sending account for a reply from another identity.
+fn replied_to(draft: &compose::Draft) -> Option<MsgRef> {
+    let id = draft.reply_to_email_id.as_deref()?;
+    let account = draft
+        .reply_to_account_id
+        .as_deref()
+        .unwrap_or(&draft.account_id);
+
+    Some(MsgRef::new(account, id))
+}
+
+/// What follows a submitted mail, through `act`: a reply from another account
+/// marks the original answered (`compose::send` only does so in its own
+/// account), then `archive` archives it. A failed step does not stop the next
+/// one. Returns the toast: [`SENT`], or the last failure.
+async fn finish_send(
+    replied_to: Option<MsgRef>,
+    cross_account: bool,
+    archive: bool,
+    act: impl AsyncFn(&MsgRef, actions::Action) -> Result<()>,
+) -> String {
+    let mut toast = SENT;
+    let Some(r) = replied_to else {
+        return toast.into();
+    };
+
+    if cross_account && act(&r, actions::Action::MarkAnswered).await.is_err() {
+        toast = "Sent, but marking the original answered failed";
+    }
+
+    if archive && act(&r, actions::Action::Archive).await.is_err() {
+        toast = "Sent, but archiving failed";
+    }
+
+    toast.into()
 }
 
 /// Downloads an attachment of a message of `account_id` into the downloads folder.
@@ -2311,8 +2362,13 @@ mod tests {
 
     /// An email of account `default` in `mailboxes`.
     fn labelled(id: &str, mailboxes: &[&str]) -> EmailSummary {
+        labelled_in("default", id, mailboxes)
+    }
+
+    /// An email of `account` in `mailboxes`.
+    fn labelled_in(account: &str, id: &str, mailboxes: &[&str]) -> EmailSummary {
         EmailSummary {
-            account_id: "default".into(),
+            account_id: account.into(),
             id: id.into(),
             thread_id: format!("t-{id}"),
             received_at: "2026-10-12T10:00:00Z".into(),
@@ -2335,6 +2391,140 @@ mod tests {
         let mut fut = std::pin::pin!(fut);
 
         std::future::poll_fn(|cx| runtime.in_scope(ScopeId::ROOT, || fut.as_mut().poll(cx))).await
+    }
+
+    #[test]
+    fn replied_to_names_the_original_account() {
+        let mut draft = compose::Draft {
+            account_id: "work".into(),
+            reply_to_email_id: Some("e1".into()),
+            reply_to_account_id: Some("default".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(replied_to(&draft), Some(MsgRef::new("default", "e1")));
+
+        draft.reply_to_account_id = None;
+
+        assert_eq!(replied_to(&draft), Some(MsgRef::new("work", "e1")));
+
+        draft.reply_to_email_id = None;
+
+        assert_eq!(replied_to(&draft), None);
+    }
+
+    #[tokio::test]
+    async fn finish_send_archives_after_a_failed_mark_and_reports_it() {
+        let calls = RefCell::new(Vec::new());
+        let act = async |r: &MsgRef, action: actions::Action| {
+            calls.borrow_mut().push((r.clone(), action.clone()));
+
+            match action {
+                actions::Action::MarkAnswered => Err(Error::Other("x".into())),
+                _ => Ok(()),
+            }
+        };
+        let original = MsgRef::new("default", "e1");
+
+        let toast = finish_send(Some(original.clone()), true, true, act).await;
+
+        assert_eq!(toast, "Sent, but marking the original answered failed");
+        assert_eq!(
+            *calls.borrow(),
+            [
+                (original.clone(), actions::Action::MarkAnswered),
+                (original.clone(), actions::Action::Archive),
+            ]
+        );
+
+        calls.borrow_mut().clear();
+
+        let toast = finish_send(Some(original.clone()), false, false, act).await;
+
+        assert_eq!(toast, "Sent");
+        assert!(calls.borrow().is_empty());
+
+        let ok = async |r: &MsgRef, action: actions::Action| {
+            calls.borrow_mut().push((r.clone(), action));
+            Ok(())
+        };
+        let toast = finish_send(Some(original.clone()), true, false, ok).await;
+
+        assert_eq!(toast, "Sent");
+        assert_eq!(
+            *calls.borrow(),
+            [(original.clone(), actions::Action::MarkAnswered)]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_draft_acts_on_the_original_in_its_own_account() {
+        let mut cfg = Config::default();
+
+        cfg.add_account(Account::new("work", "w@x.io")).unwrap();
+
+        let mut ui = backend_with(cfg);
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let store = backend().peek().store.clone();
+        let mailbox = |account: &str, id: &str| Mailbox {
+            account_id: account.into(),
+            id: id.into(),
+            name: id.into(),
+            role: Some(id.into()),
+            parent_id: None,
+            sort_order: 0,
+            total: 0,
+            unread: 0,
+        };
+
+        for account in ["default", "work"] {
+            store
+                .upsert_mailboxes(&[mailbox(account, "inbox"), mailbox(account, "archive")])
+                .unwrap();
+
+            for id in ["e1", "e2"] {
+                store
+                    .upsert_emails(&[labelled_in(account, id, &["inbox"])])
+                    .unwrap();
+            }
+        }
+
+        let to = "a@b.io";
+        let reply_to = |id: &str| compose::Draft {
+            account_id: "work".into(),
+            reply_to_email_id: Some(id.into()),
+            reply_to_account_id: Some("default".into()),
+            to: vec![Address {
+                name: None,
+                email: to.into(),
+            }],
+            ..Default::default()
+        };
+        let email = |account: &str, id: &str| store.email(account, id).unwrap().unwrap();
+        let answered = |e: &EmailSummary| e.keywords.contains(&"$answered".to_string());
+
+        *COMPOSER.write() = Some(reply_to("e1"));
+        *COMPOSER_TO.write() = to.into();
+        in_root(&dom, send_draft(false)).await;
+
+        assert!(answered(&email("default", "e1")));
+        assert!(!answered(&email("work", "e1")));
+        assert!(COMPOSER.peek().is_none());
+        assert_eq!(email("default", "e1").mailbox_ids, ["inbox"]);
+
+        *COMPOSER.write() = Some(reply_to("e2"));
+        *COMPOSER_TO.write() = to.into();
+        in_root(&dom, send_draft(true)).await;
+
+        assert!(COMPOSER.peek().is_none());
+        assert!(answered(&email("default", "e2")));
+        assert_eq!(email("default", "e2").mailbox_ids, ["archive"]);
+        assert!(!answered(&email("work", "e2")));
+        assert_eq!(email("work", "e2").mailbox_ids, ["inbox"]);
     }
 
     #[test]

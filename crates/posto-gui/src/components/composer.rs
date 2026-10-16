@@ -1,7 +1,10 @@
 //! Compose and reply modal.
 
+use std::collections::BTreeMap;
+
 use dioxus::prelude::*;
 use posto_core::compose::{self, Draft};
+use posto_core::config::Config;
 use posto_core::provider::Identity;
 use posto_core::store::Address;
 
@@ -33,15 +36,12 @@ impl FromOption {
     }
 }
 
-/// The From choices: the identities of every enabled account, or only the
-/// draft's own account when it replies (a reply never changes account).
-fn from_options(draft: &Draft) -> Vec<FromOption> {
-    let cfg = backend().read().cfg.clone();
-    let identities = IDENTITIES();
+/// The From choices: the identities of every enabled account, replies included
+/// (a reply may go out from any account).
+fn from_options_for(cfg: &Config, identities: &BTreeMap<String, Vec<Identity>>) -> Vec<FromOption> {
     let several = cfg.accounts_enabled().count() > 1;
 
     cfg.accounts_enabled()
-        .filter(|a| draft.reply_to_email_id.is_none() || a.id == draft.account_id)
         .flat_map(|a| {
             identities
                 .get(&a.id)
@@ -71,7 +71,7 @@ pub fn Composer() -> Element {
         .account(&draft.account_id)
         .map(|a| a.email.clone())
         .unwrap_or_default();
-    let options = from_options(&draft);
+    let options = from_options_for(&backend().read().cfg, &IDENTITIES());
     // The same default `compose::send` applies when `from` is unset.
     let selected_email = draft
         .from
@@ -203,5 +203,50 @@ pub fn Composer() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use posto_core::config::Account;
+
+    use super::*;
+
+    fn identity(name: &str, email: &str) -> Identity {
+        Identity {
+            id: email.into(),
+            name: name.into(),
+            email: email.into(),
+        }
+    }
+
+    #[test]
+    fn reply_offers_every_account() {
+        let mut cfg = Config::default();
+
+        cfg.add_account(Account::new("work", "w@x.io")).unwrap();
+
+        let identities = BTreeMap::from([
+            ("default".to_string(), vec![identity("Home", "h@x.io")]),
+            ("work".to_string(), vec![identity("Work", "w@x.io")]),
+        ]);
+        let options = from_options_for(&cfg, &identities);
+        let accounts: Vec<_> = cfg.accounts_enabled().collect();
+
+        assert_eq!(options.len(), 2);
+
+        for (o, a) in options.iter().zip(&accounts) {
+            assert_eq!(o.account_id, a.id);
+            assert!(
+                o.label.ends_with(&format!(" — {}", a.display_name())),
+                "{}",
+                o.label
+            );
+        }
+
+        let single = from_options_for(&Config::default(), &identities);
+
+        assert_eq!(single.len(), 1);
+        assert!(!single[0].label.contains(" — "), "{}", single[0].label);
     }
 }

@@ -213,7 +213,8 @@ pub fn render(draft: &Draft) -> (String, String) {
 }
 
 /// Sends `draft` through `client` and files it under Sent. Marks the
-/// replied-to email `$answered`. Returns the new email id.
+/// replied-to email `$answered` when it lives in `account` (a reply sent from
+/// another account leaves the original to the caller). Returns the new email id.
 ///
 /// `client` must be the connection of `account`. The sent email is not
 /// inserted into the store; the next sync picks it up.
@@ -255,6 +256,10 @@ pub async fn send(
         .await?;
 
     if let Some(reply_to) = &draft.reply_to_email_id
+        && draft
+            .reply_to_account_id
+            .as_deref()
+            .is_none_or(|a| a == account)
         && let Err(e) = actions::apply(
             store,
             Some(client),
