@@ -26,6 +26,10 @@ pub struct Draft {
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     pub reply_to_email_id: Option<String>,
+    /// Local account slug the replied-to email belongs to; `None` means
+    /// `account_id`. Differs when a reply is sent from another account.
+    #[serde(default)]
+    pub reply_to_account_id: Option<String>,
     /// Sender; must be one of the account's identities. `None` means the
     /// configured account address.
     #[serde(default)]
@@ -150,6 +154,7 @@ pub fn reply(
         in_reply_to: body.message_id.first().cloned(),
         references,
         reply_to_email_id: Some(summary.id.clone()),
+        reply_to_account_id: Some(summary.account_id.clone()),
         from: pick_identity(identities, summary, me),
     }
 }
