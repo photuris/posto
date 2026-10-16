@@ -2237,7 +2237,7 @@ pub fn sync_soon() {
 #[cfg(test)]
 mod tests {
     use dioxus::core::RuntimeGuard;
-    use posto_core::store::{Address, Store};
+    use posto_core::store::{Address, Classified, Store};
 
     use super::*;
 
@@ -3359,6 +3359,168 @@ mod tests {
 
         assert_eq!(email("default", "e2").mailbox_ids, ["rc1"]);
         assert_eq!(*STATUS.peek(), "A message must keep at least one label.");
+    }
+
+    /// Queues the scopes that signal writes marked dirty, renders them and
+    /// returns the edits.
+    fn edits(dom: &mut VirtualDom) -> Vec<dioxus::core::Mutation> {
+        dom.process_events();
+        dom.render_immediate_to_vec().edits
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merged_view_hides_the_classification_chip_of_the_open_group() {
+        use dioxus::core::Mutation;
+
+        let (mut dom, store) = two_accounts();
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        // Tray `updates` is filed under a mailbox called Promos.
+        dom.in_scope(ScopeId::ROOT, || {
+            backend()
+                .write()
+                .cfg
+                .classify
+                .trays
+                .insert("updates".into(), "Promos".into());
+        });
+        store
+            .upsert_mailboxes(&[
+                named_box("default", "inbox", "Inbox", Some("inbox"), None),
+                named_box("default", "promos", "Promos", None, None),
+                named_box("work", "inbox", "Inbox", Some("inbox"), None),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[labelled_in("default", "p1", &["promos"])])
+            .unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Merged {
+            key: "name:promos".into(),
+        });
+        reload_list().await;
+        edits(&mut dom);
+
+        assert_eq!(list_order(), ["default/p1"]);
+
+        // Classified as `updates`, which this config files under Promos.
+        store
+            .put_classification(&Classified {
+                account_id: "default".into(),
+                email_id: "p1".into(),
+                tray: "updates".into(),
+                probs: Default::default(),
+                urgency: 1,
+                personal: 0.1,
+                unsure: false,
+                model: "test".into(),
+                input_tokens: 0,
+                classified_at: "2026-10-12T10:00:00Z".into(),
+                corrected_tray: None,
+                applied: true,
+                apply_error: None,
+            })
+            .unwrap();
+        reload_list().await;
+
+        assert!(CLASSIFIED.peek().contains_key("default/p1"));
+
+        let reappeared = edits(&mut dom)
+            .into_iter()
+            .any(|m| matches!(m, Mutation::CreateTextNode { value, .. } if value == "Promos"));
+
+        assert!(
+            !reappeared,
+            "the open group's name came back as a tray chip"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_label_row_reports_why_on_enter_and_click() {
+        use dioxus::core::Mutation;
+        use dioxus::html::{Code, Key, Location, Modifiers, PlatformEventData};
+        use dioxus::html::{SerializedKeyboardData, SerializedMouseData};
+
+        // The webview normally installs the converter that reads these events.
+        dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
+
+        let (mut dom, store) = two_accounts();
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        store
+            .upsert_mailboxes(&[named_box("default", "receipts", "Receipts", None, None)])
+            .unwrap();
+        // default/e1 has only the label, so removing it is refused; work has no such mailbox.
+        store
+            .upsert_emails(&[
+                labelled_in("default", "e1", &["receipts"]),
+                labelled_in("work", "e1", &["inbox"]),
+            ])
+            .unwrap();
+        select_merged("name:receipts", false).await;
+        *EMAILS.write() = vec![
+            store.email("default", "e1").unwrap().unwrap(),
+            store.email("work", "e1").unwrap().unwrap(),
+        ];
+        *SELECTION.write() = Selection {
+            anchor: Some("default/e1".into()),
+            focus: Some("default/e1".into()),
+            ids: vec!["default/e1".into(), "work/e1".into()],
+        };
+        edits(&mut dom);
+        *SHOW_LABEL_PICKER.write() = true;
+
+        let opened = edits(&mut dom);
+        let listener = |name: &str| {
+            opened
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Mutation::NewEventListener { name: n, id } if *n == name => Some(*id),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let enter = || {
+            Rc::new(PlatformEventData::new(Box::new(
+                SerializedKeyboardData::new(
+                    Key::Enter,
+                    Code::Enter,
+                    Location::Standard,
+                    false,
+                    Modifiers::empty(),
+                    false,
+                ),
+            ))) as Rc<dyn std::any::Any>
+        };
+        let click = || {
+            Rc::new(PlatformEventData::new(Box::new(
+                SerializedMouseData::default(),
+            ))) as Rc<dyn std::any::Any>
+        };
+        let toast = "A message must keep at least one label.";
+
+        // Receipts is the only label group, so it is the active row; the filter box
+        // is the only keydown listener the picker adds and the row the last click one.
+        for (event, name, id) in [
+            (enter(), "keydown", listener("keydown")),
+            (click(), "click", listener("click")),
+        ] {
+            STATUS.write().clear();
+            dom.runtime()
+                .handle_event(name, dioxus::core::Event::new(event, true), id);
+
+            // Tasks are polled once no scope is dirty.
+            edits(&mut dom);
+            dom.process_events();
+
+            assert_eq!(*STATUS.peek(), toast, "{name}");
+            assert_eq!(
+                store.email("default", "e1").unwrap().unwrap().mailbox_ids,
+                ["receipts"],
+                "{name}"
+            );
+        }
     }
 }
 

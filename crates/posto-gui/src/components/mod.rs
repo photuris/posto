@@ -131,10 +131,8 @@ pub fn LabelPicker() -> Element {
         .collect();
     let last = rows.len().saturating_sub(1);
     let active = index().min(last);
-    let enter_target = rows
-        .get(active)
-        .filter(|row| !row.4)
-        .map(|row| row.0.clone());
+    // A blocked row stays active: toggling it only reports why it cannot change.
+    let enter_target = rows.get(active).map(|row| row.0.clone());
 
     rsx! {
         div {
@@ -189,11 +187,7 @@ pub fn LabelPicker() -> Element {
                         title: if blocked { "A message must keep at least one label" } else { "" },
                         // Keep the filter focused across toggles.
                         onmousedown: |evt| evt.prevent_default(),
-                        onclick: move |_| {
-                            if !blocked {
-                                toggle_label(id.clone());
-                            }
-                        },
+                        onclick: move |_| toggle_label(id.clone()),
                         Icon {
                             name: match state {
                                 LabelState::All => "check-square",
