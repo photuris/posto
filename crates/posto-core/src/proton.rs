@@ -103,6 +103,56 @@ pub(crate) fn map_err(e: PmError) -> Error {
     }
 }
 
+/// The steps of a sign-in, named in its errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoginStep {
+    /// The SRP password exchange.
+    Password,
+    /// Submitting the TOTP code.
+    TwoFactor,
+    /// Fetching and unlocking the keys.
+    Keys,
+    /// Listing the addresses.
+    Addresses,
+}
+
+/// Maps a sign-in failure, naming the step. Only a password Proton refused is
+/// `Error::Auth`; every other refusal says where it happened, because
+/// "auth rejected" alone cannot tell a wrong password from a session Proton
+/// will not authorise.
+pub(crate) fn login_err(step: LoginStep, e: PmError) -> Error {
+    match (step, e) {
+        (LoginStep::Password, PmError::WrongPassword) => Error::Auth,
+        (LoginStep::Password, PmError::SessionExpired) => {
+            Error::Proton("Proton refused the sign-in request (HTTP 401)".into())
+        }
+        (LoginStep::TwoFactor, PmError::WrongPassword | PmError::SessionExpired) => {
+            Error::Proton("Proton rejected the two-factor code".into())
+        }
+        (step, PmError::WrongPassword | PmError::SessionExpired) => Error::Proton(format!(
+            "the password was accepted, but Proton refused the session while {}; \
+             the account may need a second factor Posto cannot provide (such as a security key)",
+            match step {
+                LoginStep::Keys => "reading the keys",
+                _ => "listing the addresses",
+            }
+        )),
+        (step, e) => match map_err(e) {
+            Error::Proton(text) => Error::Proton(format!("{} step: {text}", step_name(step))),
+            other => other,
+        },
+    }
+}
+
+fn step_name(step: LoginStep) -> &'static str {
+    match step {
+        LoginStep::Password => "password",
+        LoginStep::TwoFactor => "two-factor",
+        LoginStep::Keys => "key unlock",
+        LoginStep::Addresses => "address",
+    }
+}
+
 /// True for the HTTP statuses that mean "that item does not exist".
 fn is_gone(e: &PmError) -> bool {
     matches!(
@@ -416,13 +466,19 @@ pub async fn login_with(
     totp: Option<&str>,
     mailbox_password: Option<&str>,
 ) -> Result<Login> {
-    let outcome = client.login(username, password).await.map_err(map_err)?;
+    let outcome = client
+        .login(username, password)
+        .await
+        .map_err(|e| login_err(LoginStep::Password, e))?;
     let session = outcome.session;
 
     if outcome.needs_totp {
         let code = totp.ok_or_else(|| Error::Proton("two-factor code required".into()))?;
 
-        session.submit_totp(code).await.map_err(map_err)?;
+        session
+            .submit_totp(code)
+            .await
+            .map_err(|e| login_err(LoginStep::TwoFactor, e))?;
     }
 
     let unlock_with = match (outcome.password_mode, mailbox_password) {
@@ -433,9 +489,15 @@ pub async fn login_with(
         (PasswordMode::Single, _) => password,
     };
 
-    session.unlock_keys(unlock_with).await.map_err(map_err)?;
+    session
+        .unlock_keys(unlock_with)
+        .await
+        .map_err(|e| login_err(LoginStep::Keys, e))?;
 
-    let addresses = session.addresses().await.map_err(map_err)?;
+    let addresses = session
+        .addresses()
+        .await
+        .map_err(|e| login_err(LoginStep::Addresses, e))?;
     let email = addresses
         .iter()
         .find(|a| a.send.0 && a.status == 1)
@@ -1055,6 +1117,27 @@ mod tests {
                 .parent
                 .is_none()
         );
+    }
+
+    #[test]
+    fn login_err_names_the_step() {
+        assert!(matches!(
+            login_err(LoginStep::Password, PmError::WrongPassword),
+            Error::Auth
+        ));
+
+        let text = |step, e| match login_err(step, e) {
+            Error::Proton(t) => t,
+            other => panic!("expected Error::Proton, got {other}"),
+        };
+
+        assert!(text(LoginStep::Password, PmError::SessionExpired).contains("401"));
+        assert!(text(LoginStep::TwoFactor, PmError::WrongPassword).contains("two-factor"));
+        assert!(text(LoginStep::Keys, PmError::SessionExpired).contains("reading the keys"));
+        assert!(
+            text(LoginStep::Addresses, PmError::SessionExpired).contains("listing the addresses")
+        );
+        assert!(text(LoginStep::Keys, PmError::NoUsableKey).starts_with("key unlock step: "));
     }
 
     #[test]
