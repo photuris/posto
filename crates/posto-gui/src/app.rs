@@ -1603,13 +1603,10 @@ async fn send_draft(archive: bool) {
         refresh_row(r);
     }
 
-    if toast != SENT {
+    if toast != "Sent" {
         set_status(toast);
     }
 }
-
-/// The toast of a send whose follow-ups all worked.
-const SENT: &str = "Sent";
 
 /// The message `draft` replies to: its id in the account it was received by,
 /// which is not the sending account for a reply from another identity.
@@ -1626,14 +1623,14 @@ fn replied_to(draft: &compose::Draft) -> Option<MsgRef> {
 /// What follows a submitted mail, through `act`: a reply from another account
 /// marks the original answered (`compose::send` only does so in its own
 /// account), then `archive` archives it. A failed step does not stop the next
-/// one. Returns the toast: [`SENT`], or the last failure.
+/// one. Returns the toast: `Sent`, or the last failure.
 async fn finish_send(
     replied_to: Option<MsgRef>,
     cross_account: bool,
     archive: bool,
     act: impl AsyncFn(&MsgRef, actions::Action) -> Result<()>,
 ) -> String {
-    let mut toast = SENT;
+    let mut toast = "Sent";
     let Some(r) = replied_to else {
         return toast.into();
     };

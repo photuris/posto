@@ -61,6 +61,32 @@ fn from_options_for(cfg: &Config, identities: &BTreeMap<String, Vec<Identity>>) 
         .collect()
 }
 
+/// The option the From list shows selected: the identity of `draft.from`, in the
+/// draft's account when it has it there, else in another account; without a
+/// `from`, the same default `compose::send` applies (the account's own address,
+/// else its first identity). `account_email` is the draft account's address.
+fn selected_option<'a>(
+    options: &'a [FromOption],
+    draft: &Draft,
+    account_email: &str,
+) -> Option<&'a FromOption> {
+    let own = |o: &&FromOption| o.account_id == draft.account_id;
+    let email = |o: &&FromOption, email: &str| o.identity.email.eq_ignore_ascii_case(email);
+
+    match &draft.from {
+        Some(from) => options
+            .iter()
+            .filter(own)
+            .find(|o| email(o, &from.email))
+            .or_else(|| options.iter().find(|o| email(o, &from.email))),
+        None => options
+            .iter()
+            .filter(own)
+            .find(|o| email(o, account_email))
+            .or_else(|| options.iter().find(own)),
+    }
+}
+
 /// Modal over the reader: headers, body, Markdown toggle with preview, Close / Send.
 #[component]
 pub fn Composer() -> Element {
@@ -72,21 +98,25 @@ pub fn Composer() -> Element {
         .map(|a| a.email.clone())
         .unwrap_or_default();
     let options = from_options_for(&backend().read().cfg, &IDENTITIES());
-    // The same default `compose::send` applies when `from` is unset.
-    let selected_email = draft
-        .from
-        .as_ref()
-        .map(|a| a.email.clone())
-        .or_else(|| {
-            let own = || options.iter().filter(|o| o.account_id == draft.account_id);
-
-            own()
-                .find(|o| o.identity.email.eq_ignore_ascii_case(&account))
-                .or(own().next())
-                .map(|o| o.identity.email.clone())
-        })
+    let selected = selected_option(&options, &draft, &account)
+        .map(|o| o.value().to_lowercase())
         .unwrap_or_default();
-    let selected = format!("{}/{}", draft.account_id, selected_email.to_lowercase());
+    // A From of another account makes that account the sender.
+    use_effect(|| {
+        let draft = COMPOSER().unwrap_or_default();
+        let own = backend()
+            .read()
+            .cfg
+            .account(&draft.account_id)
+            .map(|a| a.email.clone())
+            .unwrap_or_default();
+        let options = from_options_for(&backend().read().cfg, &IDENTITIES());
+        let account = selected_option(&options, &draft, &own).map(|o| o.account_id.clone());
+
+        if let Some(account) = account.filter(|a| *a != draft.account_id) {
+            edit(|d| d.account_id = account);
+        }
+    });
     let from = if account.is_empty() {
         "Default Fastmail address".to_string()
     } else {
@@ -248,5 +278,71 @@ mod tests {
 
         assert_eq!(single.len(), 1);
         assert!(!single[0].label.contains(" — "), "{}", single[0].label);
+    }
+
+    #[test]
+    fn from_of_another_account_is_selected() {
+        let options = |accounts: &[(&str, &str)]| {
+            accounts
+                .iter()
+                .map(|(account, email)| FromOption {
+                    account_id: account.to_string(),
+                    identity: identity("N", email),
+                    label: String::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let from = |email: &str| {
+            Some(Address {
+                name: None,
+                email: email.into(),
+            })
+        };
+        let draft = |account: &str, email: &str| Draft {
+            account_id: account.into(),
+            from: from(email),
+            ..Draft::default()
+        };
+        let pick = |options: &[FromOption], draft: &Draft| {
+            selected_option(options, draft, "").map(FromOption::value)
+        };
+        let two = options(&[("default", "h@x.io"), ("work", "w@x.io")]);
+
+        // The addressed identity belongs to the other account.
+        assert_eq!(
+            pick(&two, &draft("default", "W@X.io")).as_deref(),
+            Some("work/w@x.io")
+        );
+        assert_eq!(
+            pick(&two, &draft("work", "h@x.io")).as_deref(),
+            Some("default/h@x.io")
+        );
+
+        // The draft's own account wins when both have the address.
+        let shared = options(&[("default", "s@x.io"), ("work", "s@x.io")]);
+
+        assert_eq!(
+            pick(&shared, &draft("work", "s@x.io")).as_deref(),
+            Some("work/s@x.io")
+        );
+
+        // Without a From: the account's own address, else its first identity.
+        let own = Draft {
+            account_id: "work".into(),
+            ..Draft::default()
+        };
+
+        assert_eq!(
+            selected_option(&two, &own, "w@x.io")
+                .map(FromOption::value)
+                .as_deref(),
+            Some("work/w@x.io")
+        );
+        assert_eq!(
+            selected_option(&two, &own, "other@x.io")
+                .map(FromOption::value)
+                .as_deref(),
+            Some("work/w@x.io")
+        );
     }
 }
