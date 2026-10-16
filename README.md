@@ -111,8 +111,21 @@ next write. The cache database is rebuilt when its schema version is
 older than the program's (the next sync refetches mail); config and
 secrets are never discarded.
 
-With several enabled accounts the GUI sidebar gets one group per account
-and an "All inboxes" entry that merges them; Settings, General manages
+With several enabled accounts the GUI sidebar shows one entry per
+*mailbox group*: Inbox, Drafts, Sent, Archive, Spam and Trash merge by
+role, every other folder or label merges by name (case-insensitive;
+nesting is ignored, so two Fastmail folders named "Receipts" under
+different parents share one entry). A group lists the mail of all its
+members as one list, newest first, each row tagged with its account; the
+disclosure arrow expands the group to its per-account members. Move and
+Labels… work on a mixed selection: each message goes to the mailbox of
+that name in its own account, and the status line names the accounts
+that have no such mailbox or refused the change (`Moved 1 of 2 messages;
+no "Receipts" in Proton`). Nothing is created in an account on your
+behalf. A reply offers the identities of every account in From, defaulting
+to the address the original was sent to; replying from another account
+sends through that account (the copy lands in its Sent) and still marks the
+original as answered in the account it arrived in. Settings, General manages
 the accounts. In the CLI, `--account <id>` picks an account. Reads
 (`email list`, `email search`, `mailbox list`) cover every account
 without it, and rows carry `account_id`. An email id given without

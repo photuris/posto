@@ -32,6 +32,17 @@ Read `README.md` first. This file holds what the code does not say.
   key a list, selection or cache on a bare email id. Sync cursors live under
   `<account>/<key>` in `sync_state` (`Store::account_state`); only
   `schema_version` is global.
+- Merged views: `store::mailbox_groups` groups mailboxes across accounts
+  (key `role:<role>` for the six roles, else `name:<lower-cased name>`;
+  nesting ignored) and `Store::list_emails_in` lists a set of
+  `(account, mailbox)` members as one page. The GUI's `Folder::Merged { key }`
+  resolves its members from `MAILBOXES` at query time. A group action targets
+  each account's *first* member, "has the label" means any member, removal
+  removes every member of that account; accounts without a member are
+  reported, never auto-created (`action_toast`). A reply records
+  `Draft.reply_to_account_id`; `compose::send` marks the original answered
+  only in that account, and the GUI's `finish_send` does it through the
+  original account's connection when the sender differs.
 
 ## Rules that bit us
 
