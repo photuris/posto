@@ -42,13 +42,23 @@ pub fn focus_out(_: FocusEvent) {
 }
 
 /// Wraps untrusted HTML for a sandboxed `srcdoc` iframe: links target a new
-/// window, colours follow the system scheme.
+/// window. The mail renders on the light canvas its sender designed for; a
+/// dark system scheme inverts it with hue kept, and inverts media back, so
+/// its own backgrounds darken with the text instead of staying light under
+/// light default text.
+// ponytail: a CSS filter, not per-colour rewriting: colour emoji and CSS
+// background images come out inverted. Rewrite inline colours in
+// `html::sanitize` if that shows up in real mail.
 pub fn frame_doc(inner: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><base target=\"_blank\">\
-         <style>:root{{color-scheme:light dark}}\
+         <style>:root{{color-scheme:light}}\
          body{{margin:16px;font-family:system-ui,sans-serif;overflow-wrap:anywhere}}\
-         img{{max-width:100%;height:auto}}</style></head><body>{inner}</body></html>"
+         img{{max-width:100%;height:auto}}\
+         @media (prefers-color-scheme:dark){{\
+         html{{background:#e6e6e6;filter:invert(1) hue-rotate(180deg)}}\
+         img,video,picture{{filter:invert(1) hue-rotate(180deg)}}}}\
+         </style></head><body>{inner}</body></html>"
     )
 }
 

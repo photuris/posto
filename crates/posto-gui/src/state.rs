@@ -353,12 +353,23 @@ async fn connect(backend: Signal<Backend>, account_id: &str) -> Result<Arc<Conne
 }
 
 /// Awaits `make` and caches its connection, unless the settings changed
-/// (`conn_rev`) in the meantime.
+/// (`conn_rev`) in the meantime. One connect at a time: a caller that waited
+/// gets the connection the first one cached, so an account never has two
+/// Proton sessions spending the same single-use refresh token.
 async fn connect_with(
     mut backend: Signal<Backend>,
     account_id: &str,
     make: impl Future<Output = Result<Connection>>,
 ) -> Result<Arc<Connection>> {
+    // ponytail: one lock for every account; a hung connect delays the others
+    // until it times out. Per-account locks if that ever matters.
+    static CONNECTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = CONNECTING.lock().await;
+
+    if let Some(client) = backend.peek().clients.get(account_id) {
+        return Ok(client.clone());
+    }
+
     let rev = backend.peek().conn_rev;
     let client = Arc::new(make.await?);
     let mut b = backend.write();
@@ -485,6 +496,47 @@ mod tests {
 
         assert!(connected.is_err(), "stale client was returned");
         assert!(backend.peek().clients.is_empty(), "stale client was cached");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_callers_share_one_connection() {
+        let (requested, release) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let session_url = session_server(requested, release);
+        let dom = VirtualDom::new(VNode::empty);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let backend = Signal::new_in_scope(
+            Backend {
+                store: Arc::new(Store::open_memory().unwrap()),
+                clients: HashMap::new(),
+                cfg: Config::default(),
+                ui_test: false,
+                conn_rev: 0,
+                config_error: None,
+            },
+            ScopeId::ROOT,
+        );
+        let made = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make = || {
+            let (made, url) = (made.clone(), session_url.clone());
+
+            async move {
+                made.fetch_add(1, Ordering::SeqCst);
+                Connection::connect_jmap(&url, "fake-token").await
+            }
+        };
+
+        // Two sessions holding one Proton refresh token: the second refresh
+        // reuses a spent token and the server signs the account out.
+        let (a, b) = tokio::join!(
+            connect_with(backend, "default", make()),
+            connect_with(backend, "default", make()),
+        );
+
+        assert_eq!(made.load(Ordering::SeqCst), 1, "connected twice");
+        assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()));
     }
 
     #[tokio::test]
