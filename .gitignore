@@ -6,3 +6,9 @@ graphify-out
 *.db
 *.db-wal
 *.db-shm
+
+# makepkg output
+packaging/arch/posto/
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.zst

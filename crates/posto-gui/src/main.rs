@@ -39,14 +39,26 @@ fn main() {
         .with_min_inner_size(LogicalSize::new(900.0, 600.0));
     let window = window.with_decorations(want_decorations(&backend.cfg.ui.decorations));
 
+    // `with_window` replaces the whole window builder, so the icon goes on after it.
+    let mut cfg = Config::new()
+        .with_window(window)
+        .with_menu(app_menu(&backend.cfg.shortcuts));
+
+    if let Some(icon) = window_icon() {
+        cfg = cfg.with_icon(icon);
+    }
+
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            Config::new()
-                .with_window(window)
-                .with_menu(app_menu(&backend.cfg.shortcuts)),
-        )
+        .with_cfg(cfg)
         .with_context(backend)
         .launch(app::App);
+}
+
+/// The window icon: the 256 px Posto icon, decoded at start.
+fn window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
+    dioxus::desktop::icon_from_memory(include_bytes!("../assets/icon-256.png"))
+        .inspect_err(|e| tracing::warn!("window icon: {e}"))
+        .ok()
 }
 
 /// The native menu bar on macOS and Windows; Linux (tiling sessions) gets none.
@@ -114,6 +126,11 @@ fn is_tiling_session(xdg_current_desktop: &str, tiler_socket: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_icon_decodes() {
+        assert!(window_icon().is_some());
+    }
 
     #[test]
     fn tiling_detection() {

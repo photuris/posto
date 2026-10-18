@@ -1,0 +1,17 @@
+<!-- Posto app icon: Linux master (freedesktop, flat). A postbox-red envelope, sealed. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- envelope body -->
+  <rect x="20" y="56" width="216" height="152" rx="22" fill="#C0392B"/>
+  <!-- flap shadow and flap -->
+  <path d="M20 86 L128 170 L236 86 V78 a22 22 0 0 0 -22 -22 H42 a22 22 0 0 0 -22 22 Z" fill="#8E2A1F"/>
+  <path d="M20 78 L128 160 L236 78 a22 22 0 0 0 -22 -22 H42 a22 22 0 0 0 -22 22 Z" fill="#E74C3C"/>
+  <!-- lower folds -->
+  <g fill="none" stroke="#8E2A1F" stroke-width="7" stroke-linecap="round">
+    <path d="M28 196 L104 140"/>
+    <path d="M228 196 L152 140"/>
+  </g>
+  <!-- wax seal -->
+  <circle cx="128" cy="160" r="30" fill="#F6E7C1"/>
+  <circle cx="128" cy="160" r="20" fill="none" stroke="#D4B06A" stroke-width="5"/>
+  <circle cx="128" cy="160" r="6" fill="#D4B06A"/>
+</svg>

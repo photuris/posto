@@ -1,0 +1,53 @@
+# Maintainer: Joshua Pruitt
+pkgname=posto-git
+pkgver=r1.0000000
+pkgrel=1
+pkgdesc="Email client for Fastmail (JMAP) and Proton Mail, with a GUI and a CLI"
+arch=(x86_64 aarch64)
+url=https://github.com/photuris/posto
+license=(MIT)
+depends=(webkit2gtk-4.1 gtk3 xdotool dbus openssl)
+makedepends=(cargo git)
+provides=(posto)
+conflicts=(posto)
+options=(!debug !lto) # bundled sqlite is C built with -flto, which lld cannot link
+source=("posto::git+https://github.com/photuris/posto.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/posto"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    cd posto
+    cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+    cd posto
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p posto-gui -p posto-cli
+}
+
+check() {
+    cd posto
+    export CARGO_TARGET_DIR=target
+    cargo test --frozen -p posto-core
+}
+
+package() {
+    cd posto
+
+    install -Dm755 target/release/posto-gui "$pkgdir/usr/bin/posto-gui"
+    install -Dm755 target/release/posto "$pkgdir/usr/bin/posto"
+    install -Dm644 packaging/linux/posto.desktop "$pkgdir/usr/share/applications/posto.desktop"
+
+    local icons=packaging/linux/icons/hicolor f
+    while IFS= read -r -d '' f; do
+        install -Dm644 "$f" "$pkgdir/usr/share/icons/hicolor/${f#"$icons"/}"
+    done < <(find "$icons" -type f -print0)
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

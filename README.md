@@ -11,6 +11,9 @@ scriptable CLI over the same Rust core.
 | `crates/posto-core` | All logic: config, secrets, SQLite store (WAL + FTS5), the provider seam (`provider::Connection`) with a JMAP client and a Proton back end (`proton-mail-api`), sync, actions, body fetch, compose/send, HTML sanitising, Markdown, Omarchy theme hints, keyboard shortcut map, UI fixtures. |
 | `crates/posto-cli` | `posto`, a noun-verb CLI. JSON on stdout, JSON errors on stderr, typed exit codes, no prompts. |
 | `crates/posto-gui` | `posto-gui`, a three-pane Dioxus 0.7 desktop app. |
+| `assets/icon` | The SVG icon masters. |
+| `packaging/` | Generated Linux icons, the launcher entry, and the Arch `PKGBUILD`. |
+| `scripts/render-icons.sh` | Renders the icons in `packaging/` from `assets/icon`. |
 
 ## Build and test
 
@@ -279,6 +282,18 @@ posto email reply <id> --body-file reply.md --markdown
 fixture mail and never touches the network or your config. Add
 `POSTO_EXIT_AFTER_MS=4000` to exit after first render (used by the smoke
 test).
+
+## Install
+
+**Arch / Omarchy.** Build and install the package:
+
+```sh
+cd packaging/arch && makepkg -si
+```
+
+This builds the latest commit on GitHub, not your local changes. It
+installs `posto-gui`, the `posto` CLI, the launcher entry, and the icons.
+Remove it with `sudo pacman -R posto-git`.
 
 ## Window decorations
 

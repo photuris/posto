@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Posto
+GenericName=Email Client
+Comment=Email for Fastmail and Proton Mail
+Exec=posto-gui
+Icon=posto
+Terminal=false
+Categories=Network;Email;Office;
+Keywords=mail;email;jmap;fastmail;proton;
+MimeType=x-scheme-handler/mailto;
+StartupWMClass=posto-gui

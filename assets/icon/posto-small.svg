@@ -1,0 +1,7 @@
+<!-- Posto app icon: small glyph for 16 to 32 px -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <rect x="2" y="7" width="28" height="19" rx="3" fill="#C0392B"/>
+  <path d="M2 11 L16 21 L30 11 V10 a3 3 0 0 0 -3 -3 H5 a3 3 0 0 0 -3 3 Z" fill="#8E2A1F"/>
+  <path d="M2 10 L16 20 L30 10 a3 3 0 0 0 -3 -3 H5 a3 3 0 0 0 -3 3 Z" fill="#E74C3C"/>
+  <circle cx="16" cy="20" r="4" fill="#F6E7C1"/>
+</svg>
