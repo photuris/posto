@@ -96,6 +96,10 @@ impl fmt::Debug for Session {
 pub(crate) fn map_err(e: PmError) -> Error {
     match e {
         PmError::SessionExpired | PmError::WrongPassword => Error::Auth,
+        // Insufficient scope: since the crate unlocks from the stored key
+        // password, this means that password no longer works (changed
+        // password); only a new sign-in fixes it.
+        PmError::Api { code: 9101, .. } => Error::Auth,
         PmError::SendOutcomeUnknown { draft_id } => Error::Other(format!(
             "sent? outcome unknown for draft {draft_id}; do not resend"
         )),
@@ -1150,6 +1154,14 @@ mod tests {
     fn map_err_classifies() {
         assert!(matches!(map_err(PmError::SessionExpired), Error::Auth));
         assert!(matches!(map_err(PmError::WrongPassword), Error::Auth));
+        assert!(matches!(
+            map_err(PmError::Api {
+                status: 403,
+                code: 9101,
+                message: "secret-text".into(),
+            }),
+            Error::Auth
+        ));
 
         let api = map_err(PmError::Api {
             status: 429,

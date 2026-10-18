@@ -80,11 +80,11 @@ Read `README.md` first. This file holds what the code does not say.
   and hands waiters the cached connection; keep it that way. A CLI command
   run while the GUI is open still holds its own copy, so keep such runs short.
 - Error 9101 ("Access token does not have sufficient scope") on a resumed
-  session comes from `GET /core/v4/keys/salts`, which Proton allows only
-  briefly after login; `user`, `addresses`, `labels` and events keep working.
-  The crate's `unlock_keys` fetches the salts on every connect, so every
-  reconnect hours after sign-in fails. The fix is in `proton-mail-api`: unlock
-  from the persisted `key_password` and skip the salts (pending).
+  session came from `GET /core/v4/keys/salts`, which Proton allows only
+  briefly after login. `proton-mail-api` v0.4.1 unlocks from the blob's
+  stored `key_password` and skips the salts; never pin a version below it.
+  `map_err` turns a remaining 9101 into `Error::Auth` (stored key password
+  stale, e.g. after a password change: sign in again).
 - `proton::map_err` uses the crate error's `Display` only. Never append
   `server_message()` (unrestricted server text) and never `{:?}`-format the
   crate error into anything a user, a log or a test failure can see.
