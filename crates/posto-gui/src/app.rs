@@ -1876,7 +1876,7 @@ pub fn classify_selected(tray: Tray) {
 
         let (mut filed, mut first_error) = (0, None);
         let settled = settle_selection(async {
-            (filed, first_error) = correct_refs(&b, &clients, &refs, tray).await;
+            (filed, first_error) = correct_refs(&b, &clients, &refs, tray.clone()).await;
 
             Ok(())
         })
@@ -1895,7 +1895,7 @@ pub fn classify_selected(tray: Tray) {
 
         set_status(format!(
             "Filed {filed} message{s} under {}{}",
-            tray_label(&b.cfg, tray),
+            tray_label(&b.cfg, &tray),
             if offline {
                 " (no connection: not yet sent to the server)"
             } else {
@@ -1920,7 +1920,7 @@ async fn correct_refs(
     for r in refs {
         let before = b.store.email(&r.account_id, &r.id).ok().flatten();
 
-        match classify::correct(&b.cfg, &b.store, clients, r, tray).await {
+        match classify::correct(&b.cfg, &b.store, clients, r, tray.clone()).await {
             Ok(()) => filed += 1,
             Err(e) => {
                 first_error.get_or_insert(e);
@@ -1961,16 +1961,16 @@ fn adopt_new_mailboxes(account: &str) {
 }
 
 /// The mailbox name of `tray` in `cfg`; spam always goes to Junk.
-pub fn tray_label(cfg: &Config, tray: Tray) -> String {
-    match tray {
-        Tray::Spam => "Junk".to_string(),
-        t => cfg
-            .classify
-            .trays
-            .get(t.as_str())
-            .cloned()
-            .unwrap_or_else(|| t.as_str().to_string()),
+pub fn tray_label(cfg: &Config, tray: &Tray) -> String {
+    if *tray == Tray::SPAM {
+        return "Junk".to_string();
     }
+
+    cfg.classify
+        .trays
+        .get(tray.as_str())
+        .cloned()
+        .unwrap_or_else(|| tray.as_str().to_string())
 }
 
 /// Marks every selected email read or unread, flagged or unflagged (`action`).
@@ -2373,16 +2373,10 @@ async fn classify_pass(clients: HashMap<String, Arc<Connection>>, manual: bool) 
         }
     } else {
         match Secrets::typesafe_key() {
-            Ok(Some(key)) => {
-                let jev = JevClient::new(
-                    JEV_BASE_URL,
-                    &key,
-                    &b.cfg.classify.model,
-                    b.cfg.classify.unsure_margin,
-                );
-
-                run_classifier(&b, clients, jev).await
-            }
+            Ok(Some(key)) => match JevClient::new(JEV_BASE_URL, &key, &b.cfg.classify) {
+                Ok(jev) => run_classifier(&b, clients, jev).await,
+                Err(e) => return fail("Classification", e),
+            },
             Ok(None) => {
                 if manual {
                     set_status("Classification is on but no TypeSafe key is set — open Settings");
@@ -2761,15 +2755,15 @@ mod tests {
             CLASSIFIED.peek().get("default/fx-05"),
             Some(&("needs_reply".to_string(), true))
         );
-        assert_eq!(tray_label(&b.cfg, Tray::Spam), "Junk");
-        assert_eq!(tray_label(&b.cfg, Tray::Updates), "Updates");
+        assert_eq!(tray_label(&b.cfg, &Tray::SPAM), "Junk");
+        assert_eq!(tray_label(&b.cfg, &Tray::new("receipts")), "Receipts");
 
         classify::correct(
             &b.cfg,
             &b.store,
             &HashMap::new(),
             &MsgRef::new("default", "fx-05"),
-            Tray::Updates,
+            Tray::new("receipts"),
         )
         .await
         .unwrap();
@@ -2800,9 +2794,9 @@ mod tests {
         run_sync(true).await;
 
         let row = b.store.classification("default", "fx-11").unwrap().unwrap();
-        let updates = b
+        let receipts = b
             .store
-            .top_level_mailbox_by_name("default", "Updates")
+            .top_level_mailbox_by_name("default", "Receipts")
             .unwrap()
             .unwrap();
 
@@ -2814,7 +2808,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .mailbox_ids
-                .contains(&updates.id)
+                .contains(&receipts.id)
         );
         assert!(STATUS.peek().contains("Classified 1"), "{}", STATUS.peek());
     }
@@ -2878,7 +2872,7 @@ mod tests {
         // The fixture has no such folder, so the correction has to create it.
         cfg.classify
             .trays
-            .insert("updates".into(), "Statements".into());
+            .insert("receipts".into(), "Statements".into());
 
         let dom = rendered(backend_with(cfg));
         let _guard = RuntimeGuard::new(dom.runtime());
@@ -2897,7 +2891,7 @@ mod tests {
             &b,
             &clients,
             &[MsgRef::new("default", "fx-01")],
-            Tray::Updates,
+            Tray::new("receipts"),
         )
         .await;
 
@@ -3693,7 +3687,7 @@ mod tests {
         let (mut dom, store) = two_accounts();
         let _guard = RuntimeGuard::new(dom.runtime());
 
-        // Tray `updates` is filed under a mailbox called Promos; the first
+        // Tray `receipts` is filed under a mailbox called Promos; the first
         // account spells it with spaces, which grouping ignores.
         dom.in_scope(ScopeId::ROOT, || {
             backend()
@@ -3701,7 +3695,7 @@ mod tests {
                 .cfg
                 .classify
                 .trays
-                .insert("updates".into(), "Promos".into());
+                .insert("receipts".into(), "Promos".into());
         });
         store
             .upsert_mailboxes(&[
@@ -3723,15 +3717,16 @@ mod tests {
 
         assert_eq!(list_order(), ["work/p1"]);
 
-        // Classified as `updates`, which this config files under Promos.
+        // Classified as `receipts`, which this config files under Promos.
         store
             .put_classification(&Classified {
                 account_id: "work".into(),
                 email_id: "p1".into(),
-                tray: "updates".into(),
+                tray: "receipts".into(),
                 probs: Default::default(),
                 urgency: 1,
                 personal: 0.1,
+                action: 0.0,
                 unsure: false,
                 model: "test".into(),
                 input_tokens: 0,

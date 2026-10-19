@@ -9,7 +9,7 @@ use posto_core::classify::{
     self, Candidate, ClassifyReport, JevClient, Tray, backfill_candidates, backfill_ids, correct,
     run_with_lock,
 };
-use posto_core::config::{Account, Config};
+use posto_core::config::{Account, ClassifyConfig, Config};
 use posto_core::jmap::Client;
 use posto_core::provider::Connection;
 use posto_core::store::{Address, Classified, EmailSummary, Mailbox, MsgRef, Store};
@@ -40,8 +40,13 @@ impl Respond for Script {
 }
 
 /// A 200 System One response choosing `tray`: sure (0.9 vs 0.05) or unsure
-/// (0.5 vs 0.4); `score` is the raw urgency score.
+/// (0.5 vs 0.4); `score` is the raw urgency score; no action required.
 fn answer(tray: &str, unsure: bool, score: f64) -> ResponseTemplate {
+    answer_acting(tray, unsure, score, 0.1)
+}
+
+/// [`answer`] with `action` as the `action_required` probability.
+fn answer_acting(tray: &str, unsure: bool, score: f64, action: f64) -> ResponseTemplate {
     let (top, second) = if unsure { (0.5, 0.4) } else { (0.9, 0.05) };
     let other = if tray == "updates" {
         "social"
@@ -58,6 +63,7 @@ fn answer(tray: &str, unsure: bool, score: f64) -> ResponseTemplate {
             },
             "urgency": { "score": score },
             "is_personal": { "noul": 0.9 },
+            "action_required": { "noul": action },
         },
         "usage": { "input_tokens": 123 },
     }))
@@ -91,7 +97,7 @@ impl FakeJev {
     }
 
     fn client(&self) -> JevClient {
-        JevClient::new(&self.server.uri(), KEY, "jev-latest", 0.15)
+        JevClient::new(&self.server.uri(), KEY, &legacy_trays()).unwrap()
     }
 
     /// The JSON bodies of the requests received so far.
@@ -306,6 +312,25 @@ fn email(account: &str, id: &str, mailboxes: &[&str]) -> EmailSummary {
     }
 }
 
+/// Classifier settings with the four trays configs written before the
+/// current defaults carry: these tests double as a check that such a config
+/// keeps working.
+fn legacy_trays() -> ClassifyConfig {
+    ClassifyConfig {
+        keep_in_inbox: vec!["needs_reply".into(), "updates".into()],
+        trays: [
+            ("needs_reply", "Needs reply"),
+            ("updates", "Updates"),
+            ("promotional", "Promos"),
+            ("social", "Social"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+        ..ClassifyConfig::default()
+    }
+}
+
 /// An environment with one JMAP and one Jev fake; every `(slug, classify)`
 /// becomes an account connected to the JMAP fake, with an inbox, a junk
 /// mailbox and a custom "Projects" mailbox.
@@ -322,6 +347,7 @@ async fn env_with(accounts: &[(&str, Option<bool>)], fallback: ResponseTemplate)
                 ..Account::new(id, "me@example.com")
             })
             .collect(),
+        classify: legacy_trays(),
         ..Config::default()
     };
     let mut clients = HashMap::new();
@@ -446,7 +472,7 @@ async fn request_matches_jevmail_shape() -> Result<()> {
         ["needs_reply", "promotional", "social", "spam", "updates"]
     );
 
-    assert_eq!(c.tray, Tray::Social);
+    assert_eq!(c.tray, Tray::new("social"));
     assert_eq!(c.urgency, 4);
     assert_eq!((c.model.as_str(), c.input_tokens), ("jev-test-1", 123));
     assert!(!c.unsure);
@@ -465,7 +491,7 @@ async fn retries_on_429_then_succeeds() -> Result<()> {
 
     let c = classify::Classifier::classify(&jev.client(), "s").await;
 
-    assert_eq!(c.map(|c| c.tray).ok(), Some(Tray::Promotional));
+    assert_eq!(c.map(|c| c.tray).ok(), Some(Tray::new("promotional")));
     assert_eq!(jev.bodies().await.len(), 2);
 
     Ok(())
@@ -524,6 +550,36 @@ async fn undecodable_and_incomplete_answers_are_errors() {
 }
 
 #[tokio::test]
+async fn a_configured_tray_is_offered_and_accepted() -> Result<()> {
+    let jev = FakeJev::start(answer("bills", false, 0.0)).await;
+    let mut settings = ClassifyConfig::default();
+
+    settings.trays.insert("bills".into(), "Bills".into());
+    settings
+        .criteria
+        .insert("bills".into(), "Bills the recipient has to pay.".into());
+
+    let client = JevClient::new(&jev.server.uri(), KEY, &settings)?;
+    let c = classify::Classifier::classify(&client, "s").await?;
+
+    assert_eq!(c.tray, Tray::new("bills"));
+    assert_eq!(
+        jev.bodies().await[0]["questions"]["category"]["criteria"]["bills"],
+        "Bills the recipient has to pay."
+    );
+
+    // Without a description the client refuses to start.
+    settings.criteria.clear();
+
+    assert!(matches!(
+        JevClient::new(&jev.server.uri(), KEY, &settings),
+        Err(Error::Config(_))
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn unknown_choice_error_does_not_echo_the_server() {
     let jev = FakeJev::start(ResponseTemplate::new(200).set_body_json(json!({
         "model": "m",
@@ -531,6 +587,7 @@ async fn unknown_choice_error_does_not_echo_the_server() {
             "category": { "choice": KEY },
             "urgency": { "score": 1.0 },
             "is_personal": { "noul": 0.1 },
+            "action_required": { "noul": 0.1 },
         },
     })))
     .await;
@@ -836,6 +893,96 @@ async fn run_keep_in_inbox_rule() -> Result<()> {
 }
 
 #[tokio::test]
+async fn run_files_a_remembered_sender_without_asking_jev() -> Result<()> {
+    let env = env().await;
+
+    // Every fixture email is from Ann. Correcting one email twice counts once.
+    env.queue("a", "e1", &["mb-inbox"]);
+    env.queue("a", "e2", &["mb-inbox"]);
+    env.store.set_correction("a", "e1", "promotional")?;
+    env.store.set_correction("a", "e1", "promotional")?;
+
+    assert_eq!(env.store.remembered_tray("ann@example.com")?, None);
+
+    env.store.set_correction("a", "e2", "promotional")?;
+
+    assert_eq!(
+        env.store.remembered_tray("ANN@example.com")?.as_deref(),
+        Some("promotional")
+    );
+
+    env.queue("a", "e3", &["mb-inbox"]);
+
+    let report = env.run(None).await;
+
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!((report.classified, report.remembered), (1, 1));
+    assert_eq!(report.input_tokens, 0);
+    assert!(env.jev.bodies().await.is_empty());
+    assert_eq!(
+        patches(&env.jmap, "e3").await,
+        [json!({ "mailboxIds/mb-promos": true, "mailboxIds/mb-inbox": null })]
+    );
+
+    // A correction to another tray starts the streak again.
+    env.store.set_correction("a", "e3", "social")?;
+
+    assert_eq!(env.store.remembered_tray("ann@example.com")?, None);
+
+    // Needs-reply streaks are kept but never answer for Jev.
+    env.store.set_correction("a", "e1", "needs_reply")?;
+    env.store.set_correction("a", "e2", "needs_reply")?;
+    env.queue("a", "e4", &["mb-inbox"]);
+    env.jev.push([answer("updates", false, 0.0)]);
+
+    let report = env.run(None).await;
+
+    assert_eq!((report.classified, report.remembered), (1, 0));
+    assert_eq!(env.jev.bodies().await.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_action_required_stays_in_inbox_and_flags_when_urgent() -> Result<()> {
+    let env = env().await;
+
+    env.queue("a", "e1", &["mb-inbox"]);
+    env.queue("a", "e2", &["mb-inbox"]);
+    env.queue("a", "e3", &["mb-inbox"]);
+    env.jev.push([
+        // A bill filed as promotional: kept in the inbox and flagged.
+        answer_acting("promotional", false, 3.0, 0.9),
+        // Action but not urgent: kept, not flagged.
+        answer_acting("promotional", false, 0.0, 0.9),
+        // Spam ignores the action answer.
+        answer_acting("spam", false, 3.0, 0.9),
+    ]);
+
+    let report = env.run(None).await;
+
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.flagged, 1);
+    assert_eq!(
+        patches(&env.jmap, "e1").await,
+        [
+            json!({ "mailboxIds/mb-promos": true }),
+            json!({ "keywords/$flagged": true })
+        ]
+    );
+    assert_eq!(
+        patches(&env.jmap, "e2").await,
+        [json!({ "mailboxIds/mb-promos": true })]
+    );
+    assert_eq!(
+        patches(&env.jmap, "e3").await,
+        [json!({ "mailboxIds/mb-junk": true, "mailboxIds/mb-inbox": null })]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_drains_queue_with_cap_and_retries() -> Result<()> {
     let mut env = env().await;
 
@@ -1128,6 +1275,7 @@ async fn correct_classified_and_unclassified() -> Result<()> {
         probs: Default::default(),
         urgency: 4,
         personal: 0.1,
+        action: 0.0,
         unsure: true,
         model: "jev-test-1".into(),
         input_tokens: 10,
@@ -1139,7 +1287,14 @@ async fn correct_classified_and_unclassified() -> Result<()> {
 
     let msg = MsgRef::new("a", "e1");
 
-    correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Updates).await?;
+    correct(
+        &env.cfg,
+        &env.store,
+        &env.clients,
+        &msg,
+        Tray::new("updates"),
+    )
+    .await?;
 
     let row = env.store.classification("a", "e1")?.unwrap();
 
@@ -1172,7 +1327,7 @@ async fn correct_classified_and_unclassified() -> Result<()> {
         &env.store,
         &env.clients,
         &MsgRef::new("a", "e2"),
-        Tray::NeedsReply,
+        Tray::NEEDS_REPLY,
     )
     .await?;
 
@@ -1208,7 +1363,7 @@ async fn correct_classified_and_unclassified() -> Result<()> {
     let m3 = MsgRef::new("a", "e3");
 
     assert!(
-        correct(&env.cfg, &env.store, &env.clients, &m3, Tray::Social)
+        correct(&env.cfg, &env.store, &env.clients, &m3, Tray::new("social"))
             .await
             .is_err()
     );
@@ -1245,7 +1400,7 @@ async fn correct_classified_and_unclassified() -> Result<()> {
     // Correcting twice to the same tray is idempotent.
     let before = env.mailboxes_of("a", "e3");
 
-    correct(&env.cfg, &env.store, &env.clients, &m3, Tray::Social).await?;
+    correct(&env.cfg, &env.store, &env.clients, &m3, Tray::new("social")).await?;
 
     assert_eq!(env.mailboxes_of("a", "e3"), before);
     assert!(env.store.classification("a", "e3")?.unwrap().applied);
@@ -1270,6 +1425,7 @@ async fn correct_classified_and_unclassified() -> Result<()> {
             probs: Default::default(),
             urgency: 5,
             personal: 0.9,
+            action: 0.0,
             unsure: false,
             model: "jev-test-1".into(),
             input_tokens: 10,
@@ -1282,14 +1438,14 @@ async fn correct_classified_and_unclassified() -> Result<()> {
 
     let m5 = MsgRef::new("a", "e5");
 
-    correct(&env.cfg, &env.store, &env.clients, &m5, Tray::NeedsReply).await?;
+    correct(&env.cfg, &env.store, &env.clients, &m5, Tray::NEEDS_REPLY).await?;
 
     env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
 
     let m4 = MsgRef::new("a", "e4");
 
     assert!(
-        correct(&env.cfg, &env.store, &env.clients, &m4, Tray::NeedsReply)
+        correct(&env.cfg, &env.store, &env.clients, &m4, Tray::NEEDS_REPLY)
             .await
             .is_err()
     );
@@ -1336,15 +1492,16 @@ impl classify::Classifier for CorrectsMidFlight<'_> {
             &self.env.store,
             &self.env.clients,
             &self.msg,
-            self.tray,
+            self.tray.clone(),
         )
         .await?;
 
         Ok(classify::Classification {
-            tray: self.answer,
+            tray: self.answer.clone(),
             probs: Default::default(),
             urgency: 5,
             personal: 0.9,
+            action: 0.0,
             unsure: false,
             model: "jev-test-1".into(),
             input_tokens: 7,
@@ -1361,8 +1518,8 @@ async fn correction_wins_over_inflight_answer() -> Result<()> {
     let mid = CorrectsMidFlight {
         env: &env,
         msg: MsgRef::new("a", "e1"),
-        tray: Tray::Social,
-        answer: Tray::NeedsReply,
+        tray: Tray::new("social"),
+        answer: Tray::NEEDS_REPLY,
     };
     let report = run_with_lock(&env.lock, &env.cfg, &env.store, &env.clients, &mid, None).await;
     let row = env.store.classification("a", "e1")?.unwrap();
@@ -1402,7 +1559,7 @@ async fn failed_correction_retries_after_exhausted_queue() -> Result<()> {
             &env.store,
             &env.clients,
             &MsgRef::new("a", "e1"),
-            Tray::Social,
+            Tray::new("social"),
         )
         .await
         .is_err()
@@ -1452,7 +1609,7 @@ async fn correction_preserves_unrelated_memberships() -> Result<()> {
     );
 
     // Updates -> needs_reply drops only the updates folder.
-    correct(&env.cfg, &env.store, &env.clients, &m1, Tray::NeedsReply).await?;
+    correct(&env.cfg, &env.store, &env.clients, &m1, Tray::NEEDS_REPLY).await?;
 
     assert_eq!(
         env.mailboxes_of("a", "e1"),
@@ -1470,9 +1627,15 @@ async fn correction_preserves_unrelated_memberships() -> Result<()> {
     env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
 
     assert!(
-        correct(&env.cfg, &env.store, &env.clients, &m1, Tray::Promotional)
-            .await
-            .is_err()
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &m1,
+            Tray::new("promotional")
+        )
+        .await
+        .is_err()
     );
 
     env.jmap_state.refuse_moves.store(false, Ordering::SeqCst);
@@ -1489,11 +1652,18 @@ async fn correction_preserves_unrelated_memberships() -> Result<()> {
 
     let m2 = MsgRef::new("a", "e2");
 
-    correct(&env.cfg, &env.store, &env.clients, &m2, Tray::Spam).await?;
+    correct(&env.cfg, &env.store, &env.clients, &m2, Tray::SPAM).await?;
 
     assert_eq!(env.mailboxes_of("a", "e2"), ["mb-junk"]);
 
-    correct(&env.cfg, &env.store, &env.clients, &m2, Tray::Updates).await?;
+    correct(
+        &env.cfg,
+        &env.store,
+        &env.clients,
+        &m2,
+        Tray::new("updates"),
+    )
+    .await?;
 
     assert_eq!(
         env.mailboxes_of("a", "e2"),
@@ -1520,7 +1690,7 @@ async fn pending_automatic_answer_respects_opt_out_but_corrections_do_not() -> R
             &env.store,
             &env.clients,
             &MsgRef::new("a", "e2"),
-            Tray::Social,
+            Tray::new("social"),
         )
         .await
         .is_err()
@@ -1562,7 +1732,7 @@ async fn correction_without_connection_mirrors_locally_and_stays_pending() -> Re
         &env.store,
         &env.clients,
         &MsgRef::new("a", "e1"),
-        Tray::Updates,
+        Tray::new("updates"),
     )
     .await?;
 
@@ -1677,7 +1847,7 @@ async fn review_correction_during_move_does_not_flag() -> Result<()> {
             &env.store,
             &env.clients,
             &MsgRef::new("a", "e1"),
-            Tray::Social,
+            Tray::new("social"),
         )
         .await
     });
@@ -1711,7 +1881,7 @@ impl classify::Classifier for CorrectAnotherQueued<'_> {
                 &self.env.store,
                 &self.env.clients,
                 &MsgRef::new("a", "e2"),
-                Tray::Social,
+                Tray::new("social"),
             )
             .await?;
         }
@@ -1760,14 +1930,34 @@ async fn review_concurrent_corrections_remove_all_owned_trays() -> Result<()> {
     delay_mailbox_patch(&env, "mailboxIds/mb-promos", 600).await;
     let msg = MsgRef::new("a", "e1");
     let (first, second, latest) = tokio::join!(
-        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social),
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &msg,
+            Tray::new("social")
+        ),
         async {
             wait_for_mailbox_patch(&env, "mailboxIds/mb-social").await;
-            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Promotional).await
+            correct(
+                &env.cfg,
+                &env.store,
+                &env.clients,
+                &msg,
+                Tray::new("promotional"),
+            )
+            .await
         },
         async {
             wait_for_mailbox_patch(&env, "mailboxIds/mb-promos").await;
-            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Updates).await
+            correct(
+                &env.cfg,
+                &env.store,
+                &env.clients,
+                &msg,
+                Tray::new("updates"),
+            )
+            .await
         },
     );
     first?;
@@ -1850,7 +2040,14 @@ async fn review_batch_rechecks_after_the_body_fetches() -> Result<()> {
         })
         .await
         .expect("header fetch never started");
-        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social).await
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &msg,
+            Tray::new("social"),
+        )
+        .await
     });
 
     correction?;
@@ -1927,12 +2124,25 @@ async fn correction_after_a_refused_one_removes_the_tray_it_may_have_added() -> 
 
     env.jmap_state.refuse_moves.store(true, Ordering::SeqCst);
     assert!(
-        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social)
-            .await
-            .is_err()
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &msg,
+            Tray::new("social")
+        )
+        .await
+        .is_err()
     );
     env.jmap_state.refuse_moves.store(false, Ordering::SeqCst);
-    correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Promotional).await?;
+    correct(
+        &env.cfg,
+        &env.store,
+        &env.clients,
+        &msg,
+        Tray::new("promotional"),
+    )
+    .await?;
 
     let last = patches(&env.jmap, "e1").await.pop().unwrap();
 
@@ -1958,9 +2168,15 @@ async fn correction_waits_for_the_move_in_flight_then_undoes_it() -> Result<()> 
 
         let since = std::time::Instant::now();
 
-        correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social)
-            .await
-            .map(|()| since.elapsed())
+        correct(
+            &env.cfg,
+            &env.store,
+            &env.clients,
+            &msg,
+            Tray::new("social"),
+        )
+        .await
+        .map(|()| since.elapsed())
     });
 
     assert!(
@@ -1996,7 +2212,13 @@ async fn review_distinct_store_handles_keep_all_owned_trays() -> Result<()> {
     let msg = MsgRef::new("a", "e1");
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         let (first, second, latest) = tokio::join!(
-            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social),
+            correct(
+                &env.cfg,
+                &env.store,
+                &env.clients,
+                &msg,
+                Tray::new("social")
+            ),
             async {
                 wait_for_mailbox_patch(&env, "mailboxIds/mb-social").await;
                 correct(
@@ -2004,13 +2226,20 @@ async fn review_distinct_store_handles_keep_all_owned_trays() -> Result<()> {
                     &second_store,
                     &env.clients,
                     &msg,
-                    Tray::Promotional,
+                    Tray::new("promotional"),
                 )
                 .await
             },
             async {
                 wait_for_mailbox_patch(&env, "mailboxIds/mb-promos").await;
-                correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Updates).await
+                correct(
+                    &env.cfg,
+                    &env.store,
+                    &env.clients,
+                    &msg,
+                    Tray::new("updates"),
+                )
+                .await
             },
         );
         first?;
@@ -2076,7 +2305,14 @@ async fn review_stale_confirmation_does_not_resurrect_removed_tray() -> Result<(
             .contains(&"mb-social".to_string())
     );
     // Another handle completes a newer correction, including Social's removal.
-    correct(&env.cfg, &second_store, &env.clients, &msg, Tray::Updates).await?;
+    correct(
+        &env.cfg,
+        &second_store,
+        &env.clients,
+        &msg,
+        Tray::new("updates"),
+    )
+    .await?;
     assert_eq!(
         env.mailboxes_of("a", "e1"),
         sorted(&["mb-inbox", "mb-updates"])
@@ -2116,6 +2352,7 @@ async fn superseded_confirmation_returns_false_and_changes_nothing() -> Result<(
         probs: Default::default(),
         urgency: 0,
         personal: 0.0,
+        action: 0.0,
         unsure: false,
         model: "jev-test-1".into(),
         input_tokens: 1,
@@ -2179,7 +2416,13 @@ async fn review_latest_intent_stays_applied_after_superseded_move_finishes_last(
     let msg = MsgRef::new("a", "e1");
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         let (first, second, latest) = tokio::join!(
-            correct(&env.cfg, &env.store, &env.clients, &msg, Tray::Social),
+            correct(
+                &env.cfg,
+                &env.store,
+                &env.clients,
+                &msg,
+                Tray::new("social")
+            ),
             async {
                 wait_for_mailbox_patch(&env, "mailboxIds/mb-social").await;
                 correct(
@@ -2187,13 +2430,20 @@ async fn review_latest_intent_stays_applied_after_superseded_move_finishes_last(
                     &second_store,
                     &env.clients,
                     &msg,
-                    Tray::Promotional,
+                    Tray::new("promotional"),
                 )
                 .await
             },
             async {
                 wait_for_mailbox_patch(&env, "mailboxIds/mb-promos").await;
-                correct(&env.cfg, &second_store, &env.clients, &msg, Tray::Updates).await
+                correct(
+                    &env.cfg,
+                    &second_store,
+                    &env.clients,
+                    &msg,
+                    Tray::new("updates"),
+                )
+                .await
             },
         );
         first?;

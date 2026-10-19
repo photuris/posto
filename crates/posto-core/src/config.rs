@@ -277,7 +277,8 @@ pub struct ClassifyConfig {
     pub model: String,
     /// Top-two probability gap below which an answer is unsure.
     pub unsure_margin: f64,
-    /// A needs-reply message with at least this urgency (1 to 5) gets `$flagged`.
+    /// A needs-reply or action-required message with at least this urgency
+    /// (1 to 5) gets `$flagged`.
     pub flag_urgency_at: u8,
     /// Most messages sent to Jev by one run.
     pub max_per_run: u32,
@@ -288,7 +289,11 @@ pub struct ClassifyConfig {
     /// Mailbox that collects unsure messages.
     pub unsure_mailbox: String,
     /// Tray key to top-level mailbox name; spam always goes to the junk role.
+    /// Each key is a tray Jev may choose, spam besides.
     pub trays: BTreeMap<String, String>,
+    /// Tray key to the description Jev decides by; needed for a tray Posto
+    /// has no built-in description of (`classify::jev::BUILTIN_CRITERIA`).
+    pub criteria: BTreeMap<String, String>,
 }
 
 impl Default for ClassifyConfig {
@@ -300,17 +305,23 @@ impl Default for ClassifyConfig {
             flag_urgency_at: 4,
             max_per_run: 50,
             body_chars: 2000,
-            keep_in_inbox: vec!["needs_reply".to_string(), "updates".to_string()],
+            keep_in_inbox: ["needs_reply", "personal", "alerts"]
+                .map(String::from)
+                .to_vec(),
             unsure_mailbox: "Unsure".to_string(),
             trays: [
                 ("needs_reply", "Needs reply"),
-                ("updates", "Updates"),
+                ("personal", "Personal"),
+                ("alerts", "Alerts"),
+                ("receipts", "Receipts"),
+                ("newsletters", "Newsletters"),
                 ("promotional", "Promos"),
                 ("social", "Social"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+            criteria: BTreeMap::new(),
         }
     }
 }

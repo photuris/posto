@@ -13,9 +13,10 @@ const ME: &str = "me@example.com";
 /// Address of the fixture account's second identity.
 const SHOP: &str = "shop@example.com";
 
-/// Mailboxes: id, name, role, sort order. The last four are the classifier's
-/// tray mailboxes, present so a correction works offline.
-const MAILBOXES: [(&str, &str, Option<&str>, i64); 13] = [
+/// Mailboxes: id, name, role, sort order. The last three, Newsletters and
+/// Receipts are the classifier's tray mailboxes, present so a correction
+/// works offline.
+const MAILBOXES: [(&str, &str, Option<&str>, i64); 12] = [
     ("mb-inbox", "Inbox", Some("inbox"), 1),
     ("mb-drafts", "Drafts", Some("drafts"), 2),
     ("mb-sent", "Sent", Some("sent"), 3),
@@ -26,7 +27,6 @@ const MAILBOXES: [(&str, &str, Option<&str>, i64); 13] = [
     ("mb-receipts", "Receipts", None, 11),
     ("mb-bilag", "Bilag", None, 12),
     ("mb-needs-reply", "Needs reply", None, 13),
-    ("mb-updates", "Updates", None, 14),
     ("mb-promos", "Promos", None, 15),
     ("mb-social", "Social", None, 16),
 ];
@@ -363,6 +363,7 @@ fn seed_classifier(store: &Store) -> Result<()> {
         probs: probs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         urgency,
         personal: 0.5,
+        action: 0.0,
         unsure,
         model: "jev-fixture".into(),
         input_tokens: 120,
@@ -375,7 +376,7 @@ fn seed_classifier(store: &Store) -> Result<()> {
     store.put_classification(&row(
         "fx-01",
         "promotional",
-        [("promotional", 0.88), ("updates", 0.07)],
+        [("promotional", 0.88), ("receipts", 0.07)],
         1,
         false,
     ))?;
@@ -401,7 +402,7 @@ mod tests {
 
         seed(&store).unwrap();
 
-        assert_eq!(store.mailboxes(ACCOUNT).unwrap().len(), 13);
+        assert_eq!(store.mailboxes(ACCOUNT).unwrap().len(), 12);
         assert_eq!(store.identities(ACCOUNT).unwrap().len(), 2);
         assert_eq!(
             store

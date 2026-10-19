@@ -898,12 +898,7 @@ pub async fn classify_run(
             (Some(reports), clients, 0, HashMap::new())
         }
     };
-    let jev = JevClient::new(
-        JEV_BASE_URL,
-        &key,
-        &cfg.classify.model,
-        cfg.classify.unsure_margin,
-    );
+    let jev = JevClient::new(JEV_BASE_URL, &key, &cfg.classify)?;
     let mut report = classify::run(&cfg, &store, &clients, &jev, limit).await;
 
     report
@@ -959,8 +954,8 @@ pub fn classify_show(account: Option<&str>, id: &str) -> Result<Value> {
 }
 
 pub async fn classify_correct(account: Option<&str>, id: &str, tray: &str) -> Result<Value> {
-    let tray: Tray = tray.parse()?;
     let cfg = Config::load()?;
+    let tray = Tray::parse_in(&cfg.classify, tray)?;
     let store = open_store()?;
     let email = find_email(&store, &cfg, account, id)?;
 
@@ -979,7 +974,7 @@ pub async fn classify_correct(account: Option<&str>, id: &str, tray: &str) -> Re
         .into_iter()
         .collect();
 
-    classify::correct(&cfg, &store, &clients, &email.msg_ref(), tray).await?;
+    classify::correct(&cfg, &store, &clients, &email.msg_ref(), tray.clone()).await?;
 
     Ok(json!({
         "account_id": email.account_id,

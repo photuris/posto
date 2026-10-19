@@ -33,7 +33,7 @@ pub enum Folder {
 }
 
 /// Stands in for Jev in UI test mode, so no key and no network are needed: a
-/// subject with a question mark needs a reply, anything else is an update.
+/// subject with a question mark needs a reply, anything else is a receipt.
 /// Never unsure.
 pub struct FakeJev;
 
@@ -44,19 +44,17 @@ impl Classifier for FakeJev {
             .find_map(|l| l.strip_prefix("Subject:"))
             .is_some_and(|subject| subject.contains('?'));
         let tray = if asks {
-            Tray::NeedsReply
+            Tray::NEEDS_REPLY
         } else {
-            Tray::Updates
+            Tray::new("receipts")
         };
 
         Ok(Classification {
+            probs: [(tray.as_str().to_string(), 0.9)].into(),
             tray,
-            probs: Tray::ALL
-                .iter()
-                .map(|t| (t.as_str().to_string(), if *t == tray { 0.9 } else { 0.025 }))
-                .collect(),
             urgency: if asks { 3 } else { 1 },
             personal: if asks { 0.8 } else { 0.1 },
+            action: if asks { 0.8 } else { 0.0 },
             unsure: false,
             model: "fake-jev".into(),
             input_tokens: 0,
@@ -103,6 +101,7 @@ pub async fn fake_classify_pass(cfg: &Config, store: &Store) -> Result<ClassifyR
             probs: c.probs,
             urgency: c.urgency,
             personal: c.personal,
+            action: c.action,
             unsure: c.unsure,
             model: c.model,
             input_tokens: c.input_tokens,
@@ -545,11 +544,14 @@ mod tests {
 
         fixtures::seed(&store).unwrap();
 
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+
+        cfg.classify.keep_in_inbox.push("receipts".into());
+
         let report = fake_classify_pass(&cfg, &store).await.unwrap();
         let row = store.classification("default", "fx-11").unwrap().unwrap();
-        let updates = store
-            .top_level_mailbox_by_name("default", "Updates")
+        let receipts = store
+            .top_level_mailbox_by_name("default", "Receipts")
             .unwrap()
             .unwrap();
         let email = store.email("default", "fx-11").unwrap().unwrap();
@@ -561,9 +563,9 @@ mod tests {
 
         assert_eq!((report.classified, report.moved), (1, 1), "{report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
-        assert_eq!((row.tray.as_str(), row.applied), ("updates", true));
+        assert_eq!((row.tray.as_str(), row.applied), ("receipts", true));
         assert_eq!(store.classify_queue_len("default").unwrap(), 0);
-        assert!(email.mailbox_ids.contains(&updates.id), "{email:?}");
+        assert!(email.mailbox_ids.contains(&receipts.id), "{email:?}");
         assert!(email.mailbox_ids.contains(&inbox), "{email:?}");
 
         // A tray that does not stay in the inbox leaves it.
@@ -597,8 +599,8 @@ mod tests {
         let lunch = FakeJev.classify(&ask("Lunch Thursday?")).await.unwrap();
         let invoice = FakeJev.classify(&ask("Your invoice")).await.unwrap();
 
-        assert_eq!(lunch.tray, Tray::NeedsReply);
-        assert_eq!(invoice.tray, Tray::Updates);
+        assert_eq!(lunch.tray, Tray::NEEDS_REPLY);
+        assert_eq!(invoice.tray, Tray::new("receipts"));
         assert!(!lunch.unsure && !invoice.unsure);
         assert_eq!(
             lunch,

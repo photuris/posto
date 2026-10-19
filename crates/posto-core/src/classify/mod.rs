@@ -33,10 +33,10 @@
 pub mod jev;
 pub mod state;
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -45,67 +45,68 @@ pub use jev::{Classification, Classifier, JEV_BASE_URL, JevClient};
 
 use crate::actions::{Action, apply};
 use crate::body::fetch_body;
-use crate::config::{Config, data_dir};
+use crate::config::{ClassifyConfig, Config, data_dir};
 use crate::error::{Error, Result};
 use crate::provider::Connection;
-use crate::store::{CLASSIFY_MAX_ATTEMPTS, Classified, MsgRef, QueueRow, Store};
+use crate::store::{CLASSIFY_MAX_ATTEMPTS, Classified, EmailSummary, MsgRef, QueueRow, Store};
 
-/// A mailbox category Jev sorts mail into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Tray {
-    /// A real person expects a reply.
-    NeedsReply,
-    /// Transactional and informational mail.
-    Updates,
-    /// Marketing.
-    Promotional,
-    /// Social network and community notifications.
-    Social,
-    /// Scams and junk; goes to the junk mailbox.
-    Spam,
-}
+/// A mailbox category Jev sorts mail into: `spam` (always the junk
+/// mailbox) or a key of `[classify.trays]`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Tray(Cow<'static, str>);
 
 impl Tray {
-    /// Every tray, in jevmail's order.
-    pub const ALL: [Tray; 5] = [
-        Tray::NeedsReply,
-        Tray::Updates,
-        Tray::Promotional,
-        Tray::Social,
-        Tray::Spam,
-    ];
+    /// Scams and junk; goes to the junk mailbox.
+    pub const SPAM: Tray = Tray(Cow::Borrowed("spam"));
+    /// A real person expects a reply; the tray urgent answers are flagged in.
+    pub const NEEDS_REPLY: Tray = Tray(Cow::Borrowed("needs_reply"));
+    /// A real person wrote, no reply expected.
+    pub const PERSONAL: Tray = Tray(Cow::Borrowed("personal"));
 
-    /// The key jevmail and Jev use for this tray.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Tray::NeedsReply => "needs_reply",
-            Tray::Updates => "updates",
-            Tray::Promotional => "promotional",
-            Tray::Social => "social",
-            Tray::Spam => "spam",
-        }
+    /// The tray with this key, whether or not a config defines it.
+    pub fn new(key: impl Into<String>) -> Tray {
+        Tray(Cow::Owned(key.into()))
+    }
+
+    /// The key Jev and the config use for this tray.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Every tray `settings` defines: the keys of `trays`, then spam.
+    pub fn all(settings: &ClassifyConfig) -> Vec<Tray> {
+        settings
+            .trays
+            .keys()
+            .filter(|k| *k != Tray::SPAM.as_str())
+            .map(Tray::new)
+            .chain([Tray::SPAM])
+            .collect()
+    }
+
+    /// The tray `key`, when `settings` define it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming the trays there are.
+    pub fn parse_in(settings: &ClassifyConfig, key: &str) -> Result<Tray> {
+        let all = Tray::all(settings);
+
+        all.iter()
+            .find(|t| t.as_str() == key)
+            .cloned()
+            .ok_or_else(|| {
+                let keys: Vec<&str> = all.iter().map(Tray::as_str).collect();
+
+                Error::Config(format!("unknown tray {key:?}; use {}", keys.join(", ")))
+            })
     }
 }
 
 impl fmt::Display for Tray {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Tray {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Tray> {
-        Tray::ALL
-            .into_iter()
-            .find(|t| t.as_str() == s)
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "unknown tray {s:?}; use needs_reply, updates, promotional, social or spam"
-                ))
-            })
     }
 }
 
@@ -118,11 +119,24 @@ pub struct Candidate {
     pub email_id: String,
 }
 
+/// `action_required` probability from which an uncorrected answer stays in the
+/// inbox, and is flagged when urgent, whatever its tray (spam excepted).
+pub const ACTION_AT: f64 = 0.5;
+
+/// The `model` of an answer taken from sender memory.
+pub const SENDER_MODEL: &str = "sender";
+
+/// Trays never taken from sender memory: whether a person's mail needs a reply
+/// depends on the message, not on who sent it.
+const UNREMEMBERED: [Tray; 2] = [Tray::NEEDS_REPLY, Tray::PERSONAL];
+
 /// What one [`run`] did.
 #[derive(Debug, Default, PartialEq, Serialize)]
 pub struct ClassifyReport {
-    /// Answers obtained from Jev.
+    /// Answers obtained, from Jev or from sender memory.
     pub classified: usize,
+    /// Of those, answers taken from sender memory without asking Jev.
+    pub remembered: usize,
     /// Emails whose mailbox changes the server accepted, including retried ones.
     pub moved: usize,
     /// Emails flagged.
@@ -247,6 +261,7 @@ async fn drain<C: Classifier>(
             };
 
             report.classified += 1;
+            report.remembered += usize::from(answer.model == SENDER_MODEL);
             report.input_tokens += answer.input_tokens;
 
             // A correction made while Jev was answering wins.
@@ -387,6 +402,26 @@ async fn ask<C: Classifier>(
     let email = store
         .email(account, id)?
         .ok_or_else(|| Error::NotFound(format!("email {account}/{id}")))?;
+
+    if let Some(tray) = remembered(cfg, store, &email)? {
+        return Ok(Some(Classified {
+            account_id: account.to_string(),
+            email_id: id.to_string(),
+            tray: tray.as_str().to_string(),
+            probs: BTreeMap::new(),
+            urgency: 1,
+            personal: 0.0,
+            action: 0.0,
+            unsure: false,
+            model: SENDER_MODEL.to_string(),
+            input_tokens: 0,
+            classified_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            corrected_tray: None,
+            applied: false,
+            apply_error: None,
+        }));
+    }
+
     let body = fetch_body(store, Some(client), account, id).await?;
     let has_unsubscribe = client.has_unsubscribe(id).await;
     let replied = store.thread_has_reply_from(
@@ -417,6 +452,7 @@ async fn ask<C: Classifier>(
         probs: c.probs,
         urgency: c.urgency,
         personal: c.personal,
+        action: c.action,
         unsure: c.unsure,
         model: c.model,
         input_tokens: c.input_tokens,
@@ -425,6 +461,19 @@ async fn ask<C: Classifier>(
         applied: false,
         apply_error: None,
     }))
+}
+
+/// The tray the user keeps filing `email`'s sender under, when it is one sender
+/// memory may answer for.
+fn remembered(cfg: &Config, store: &Store, email: &EmailSummary) -> Result<Option<Tray>> {
+    let Some(sender) = email.from.first() else {
+        return Ok(None);
+    };
+
+    Ok(store
+        .remembered_tray(&sender.email)?
+        .and_then(|t| Tray::parse_in(&cfg.classify, &t).ok())
+        .filter(|t| !UNREMEMBERED.contains(t)))
 }
 
 /// The addresses the user writes from in `account`: its identities and its
@@ -522,12 +571,13 @@ pub struct Applied {
 }
 
 /// Files the email per its effective tray and flags it when it is an urgent
-/// uncorrected needs-reply; returns whether it was flagged and which trays
+/// uncorrected needs-reply or action; returns whether it was flagged and which trays
 /// it left (what the caller must drop from the row's ownership). Mailbox changes
 /// are patches, so memberships the classifier does not own are untouched:
 ///
 /// - add the tray's mailbox, and the unsure mailbox when unsure;
-/// - leave the inbox only when sure and the tray is not in `keep_in_inbox`;
+/// - leave the inbox only when sure, the tray is not in `keep_in_inbox` and
+///   Jev does not think the recipient has to act ([`ACTION_AT`]);
 /// - spam: sure goes to the junk mailbox and leaves the inbox; unsure stays
 ///   in the inbox and goes to the unsure mailbox only.
 ///
@@ -552,11 +602,13 @@ pub async fn apply_tray(
     c: &Classified,
     revision: i64,
 ) -> Result<Applied> {
-    let tray: Tray = c.effective_tray().parse()?;
+    let tray = Tray::parse_in(&cfg.classify, c.effective_tray())?;
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
     let settings = &cfg.classify;
     let corrected = c.corrected_tray.is_some();
-    let keeps = settings.keep_in_inbox.iter().any(|k| k == tray.as_str());
+    // Jev's view on actions gives way to the user's choice of tray.
+    let acts = !corrected && tray != Tray::SPAM && c.action >= ACTION_AT;
+    let keeps = acts || settings.keep_in_inbox.iter().any(|k| k == tray.as_str());
     let inbox = || {
         store
             .mailbox_by_role(account, "inbox")?
@@ -566,7 +618,7 @@ pub async fn apply_tray(
     let (mut add, mut remove) = (Vec::new(), Vec::new());
     let mut removed_trays = Vec::new();
 
-    if tray == Tray::Spam {
+    if tray == Tray::SPAM {
         if !c.unsure {
             add.push(
                 store
@@ -594,7 +646,7 @@ pub async fn apply_tray(
     }
 
     if corrected {
-        for (previous, mailbox) in previous_mailboxes(cfg, store, c, tray)? {
+        for (previous, mailbox) in previous_mailboxes(cfg, store, c, &tray)? {
             removed_trays.push(previous.as_str().to_string());
             remove.push(mailbox);
         }
@@ -605,7 +657,7 @@ pub async fn apply_tray(
             remove.push(m.id);
         }
 
-        if tray != Tray::Spam && keeps {
+        if tray != Tray::SPAM && keeps {
             add.push(inbox()?);
         }
     }
@@ -656,7 +708,7 @@ pub async fn apply_tray(
     // A flag cannot be taken back, so look at the row again: a correction
     // made while the patch was in flight forbids it.
     let flag = !corrected
-        && tray == Tray::NeedsReply
+        && (tray == Tray::NEEDS_REPLY || acts)
         && c.urgency >= settings.flag_urgency_at
         && !store
             .classification(account, id)?
@@ -682,23 +734,23 @@ fn previous_mailboxes(
     cfg: &Config,
     store: &Store,
     c: &Classified,
-    new: Tray,
+    new: &Tray,
 ) -> Result<Vec<(Tray, String)>> {
     let (account, id) = (c.account_id.as_str(), c.email_id.as_str());
     let mut before: Vec<Tray> = store
         .owned_trays(account, id)?
         .iter()
-        .filter_map(|t| t.parse().ok())
+        .map(Tray::new)
         .collect();
 
     if c.model != "manual" {
-        before.extend(c.tray.parse::<Tray>());
+        before.push(Tray::new(c.tray.clone()));
     }
 
     let mut found = Vec::new();
 
-    for tray in before.into_iter().filter(|t| *t != new) {
-        let mailbox = if tray == Tray::Spam {
+    for tray in before.into_iter().filter(|t| t != new) {
+        let mailbox = if tray == Tray::SPAM {
             store.mailbox_by_role(account, "junk")?
         } else {
             match cfg.classify.trays.get(tray.as_str()) {
@@ -733,6 +785,8 @@ pub async fn correct(
 ) -> Result<()> {
     let (account, id) = (msg.account_id.as_str(), msg.id.as_str());
 
+    // A tray the config lacks would leave a correction pending for good.
+    Tray::parse_in(&cfg.classify, tray.as_str())?;
     store.set_correction(account, id, tray.as_str())?;
     store.remove_from_classify_queue(account, id)?;
 
@@ -919,6 +973,7 @@ mod tests {
             probs: Default::default(),
             urgency: 1,
             personal: 0.0,
+            action: 0.0,
             unsure: false,
             model: "m".into(),
             input_tokens: 0,

@@ -125,7 +125,7 @@ fn mailbox_list_after_seed() {
     let v = Sandbox::seeded().json(&["mailbox", "list"]);
     let list = v.as_array().unwrap();
 
-    assert_eq!(list.len(), 13);
+    assert_eq!(list.len(), 12);
     assert_eq!(list[0]["role"], "inbox");
     assert_eq!(list[0]["account_id"], "default");
 }
@@ -767,21 +767,21 @@ fn classify_status_and_correct_offline() {
     assert_eq!(account["pending_apply"], 0);
     assert_eq!(account["by_tray"]["promotional"], 1);
 
-    let done = sb.json(&["classify", "correct", "fx-01", "updates"]);
+    let done = sb.json(&["classify", "correct", "fx-01", "receipts"]);
 
     assert_eq!(done["offline"], true);
     assert_eq!(
         sb.json(&["classify", "show", "fx-01"])["corrected_tray"],
-        "updates"
+        "receipts"
     );
 
-    let updates = sb
+    let receipts = sb
         .json(&["mailbox", "list"])
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["name"] == "Updates")
-        .expect("seed has an Updates mailbox")["id"]
+        .find(|m| m["name"] == "Receipts")
+        .expect("seed has an Receipts mailbox")["id"]
         .clone();
     let shown = sb.json(&["email", "show", "fx-01"]);
 
@@ -789,7 +789,7 @@ fn classify_status_and_correct_offline() {
         shown["summary"]["mailbox_ids"]
             .as_array()
             .unwrap()
-            .contains(&updates),
+            .contains(&receipts),
         "{shown}"
     );
     // Offline, the move waits for the next run.
@@ -800,7 +800,12 @@ fn classify_status_and_correct_offline() {
 
     let bad = sb.run_with(&["classify", "correct", "fx-01", "nonsense"], None);
 
-    assert_eq!(bad.status.code(), Some(2));
+    // The trays come from the config, so an unknown one is a config error.
+    assert_eq!(bad.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("unknown tray"),
+        "{bad:?}"
+    );
 }
 
 #[test]
@@ -842,7 +847,7 @@ fn classify_dry_run_writes_nothing() {
 
     enable_classifier(&sb, "http://127.0.0.1:9/session");
     // A pending correction, so the dry run has an entry of each kind.
-    sb.json(&["classify", "correct", "fx-01", "updates"]);
+    sb.json(&["classify", "correct", "fx-01", "receipts"]);
 
     let before = sb.json(&["classify", "status"]);
     let db = sb.0.join("posto.db");
@@ -936,13 +941,13 @@ fn classify_correct_keeps_intent_when_the_server_is_unreachable() {
     enable_classifier(&sb, "http://127.0.0.1:9/session");
     sb.run_with(&["account", "set-token", "--token-stdin"], Some("dummy"));
 
-    let done = sb.json(&["classify", "correct", "fx-01", "updates"]);
+    let done = sb.json(&["classify", "correct", "fx-01", "receipts"]);
 
     assert_eq!(done["applied"], false, "{done}");
     assert_eq!(done["pending"], true, "{done}");
     assert_eq!(
         sb.json(&["classify", "show", "fx-01"])["corrected_tray"],
-        "updates"
+        "receipts"
     );
 }
 

@@ -356,8 +356,6 @@ pub enum EmailCmd {
 }
 
 /// The tray names `classify correct` accepts.
-const TRAYS: [&str; 5] = ["needs_reply", "updates", "promotional", "social", "spam"];
-
 #[derive(Subcommand)]
 pub enum ClassifyCmd {
     /// Classify queued mail. Without `--backfill` it first syncs, then drains the queue of new inbox arrivals; accounts count only where classification is enabled (`[classify] enabled`, or the account's own `classify`).
@@ -396,8 +394,7 @@ pub enum ClassifyCmd {
     Correct {
         /// Email id; an id found in several accounts needs `--account`.
         id: String,
-        /// Tray to file it under.
-        #[arg(value_parser = clap::builder::PossibleValuesParser::new(TRAYS))]
+        /// Tray to file it under: `spam` or a key of `[classify.trays]`.
         tray: String,
     },
     /// Read the TypeSafe API key from stdin and store it (mode 0600).

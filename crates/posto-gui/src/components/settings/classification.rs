@@ -3,18 +3,19 @@
 
 use dioxus::prelude::*;
 use posto_core::classify::Tray;
+use posto_core::classify::jev::tray_criteria;
 use posto_core::config::{ClassifyConfig, Config, Secrets};
 
 use crate::app::{backend, set_status};
 use crate::components::{focus_in, focus_out};
 
 /// The trays with a mailbox of their own; spam always goes to Junk.
-const FILED: [Tray; 4] = [
-    Tray::NeedsReply,
-    Tray::Updates,
-    Tray::Promotional,
-    Tray::Social,
-];
+fn filed(c: &ClassifyConfig) -> Vec<Tray> {
+    Tray::all(c)
+        .into_iter()
+        .filter(|t| *t != Tray::SPAM)
+        .collect()
+}
 
 /// What is wrong with the classifier settings, if anything.
 pub fn problems(c: &ClassifyConfig) -> Option<String> {
@@ -30,7 +31,16 @@ pub fn problems(c: &ClassifyConfig) -> Option<String> {
         return Some("The flag threshold must be between 1 and 5.".into());
     }
 
-    let names: Vec<String> = FILED
+    if c.trays.contains_key(Tray::SPAM.as_str()) {
+        return Some("Spam always goes to Junk; it cannot have a tray mailbox.".into());
+    }
+
+    if let Err(e) = tray_criteria(c) {
+        return Some(e.to_string());
+    }
+
+    let filed = filed(c);
+    let names: Vec<String> = filed
         .iter()
         .map(|t| {
             c.trays
@@ -49,14 +59,14 @@ pub fn problems(c: &ClassifyConfig) -> Option<String> {
         if *name == "inbox" || *name == unsure {
             return Some(format!(
                 "{:?} cannot be a tray mailbox.",
-                c.trays[FILED[i].as_str()].trim()
+                c.trays[filed[i].as_str()].trim()
             ));
         }
 
         if names[..i].contains(name) {
             return Some(format!(
                 "Two trays use the mailbox {:?}.",
-                c.trays[FILED[i].as_str()].trim()
+                c.trays[filed[i].as_str()].trim()
             ));
         }
     }
@@ -236,27 +246,32 @@ pub fn ClassificationPage(
         }
 
         h3 { "Trays" }
-        for tray in FILED {
+        for tray in filed(c) {
             div { key: "{tray}", class: "setting-row tray",
-                label { {tray_title(tray)} }
+                label { {tray_title(&tray)} }
                 input {
                     r#type: "text",
                     value: "{c.trays.get(tray.as_str()).cloned().unwrap_or_default()}",
                     onfocusin: focus_in,
                     onfocusout: focus_out,
-                    oninput: move |evt| {
+                    oninput: {
+                        let tray = tray.clone();
+                        move |evt: FormEvent| {
                         draft
                             .write()
                             .classify
                             .trays
                             .insert(tray.as_str().to_string(), evt.value());
+                        }
                     },
                 }
                 label { class: "check",
                     input {
                         r#type: "checkbox",
                         checked: c.keep_in_inbox.iter().any(|k| k == tray.as_str()),
-                        onchange: move |evt| {
+                        onchange: {
+                            let tray = tray.clone();
+                            move |evt: FormEvent| {
                             let mut d = draft.write();
                             let keep = &mut d.classify.keep_in_inbox;
 
@@ -264,6 +279,7 @@ pub fn ClassificationPage(
 
                             if evt.checked() {
                                 keep.push(tray.as_str().to_string());
+                            }
                             }
                         },
                     }
@@ -276,7 +292,7 @@ pub fn ClassificationPage(
             span { class: "muted", "Junk (fixed)" }
         }
         div { class: "hint",
-            "Each tray is a top-level mailbox, created when first needed. Unsure messages always stay in the inbox."
+            "Each tray is a top-level mailbox, created when first needed. Unsure messages always stay in the inbox. To add a tray, give it a mailbox under [classify.trays] and a description under [classify.criteria] in config.toml."
         }
 
         h3 { "Accounts" }
@@ -315,15 +331,16 @@ pub fn ClassificationPage(
     }
 }
 
-/// The page's label for a tray.
-fn tray_title(tray: Tray) -> &'static str {
-    match tray {
-        Tray::NeedsReply => "Needs reply",
-        Tray::Updates => "Updates",
-        Tray::Promotional => "Promotional",
-        Tray::Social => "Social",
-        Tray::Spam => "Spam",
-    }
+/// The page's label for a tray: its key with spaces, capitalised
+/// (`needs_reply` is "Needs reply").
+fn tray_title(tray: &Tray) -> String {
+    let words = tray.as_str().replace('_', " ");
+    let mut chars = words.chars();
+
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -343,13 +360,27 @@ mod tests {
 
         let mut twice = ok.clone();
 
-        twice.trays.insert("social".into(), "UPDATES".into());
+        twice.trays.insert("social".into(), "RECEIPTS".into());
         assert!(problems(&twice).unwrap().contains("Two trays"));
 
         let mut clash = ok.clone();
 
         clash.trays.insert("social".into(), "unsure".into());
         assert!(problems(&clash).unwrap().contains("cannot be"));
+
+        let mut spam = ok.clone();
+
+        spam.trays.insert("spam".into(), "Spam".into());
+        assert!(problems(&spam).unwrap().contains("Junk"));
+
+        let mut undescribed = ok.clone();
+
+        undescribed.trays.insert("bills".into(), "Bills".into());
+        assert!(
+            problems(&undescribed)
+                .unwrap()
+                .contains("[classify.criteria]")
+        );
 
         let mut margin = ok.clone();
 

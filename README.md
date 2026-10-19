@@ -171,14 +171,32 @@ denominator, with these mappings and limits on Proton:
 ## Classification
 
 Posto can sort new inbox mail with Jev (TypeSafe
-System One). For each new message Jev picks a tray: needs reply, updates,
-promotional, social or spam. Posto then adds the message to the tray's
-mailbox (created at the top level when missing), takes it out of the inbox
-unless the tray is kept there, and flags urgent replies. Spam goes to the
+System One). For each new message Jev picks a tray (by default: needs reply,
+personal, alerts, receipts, newsletters, promotional, social or spam) and
+says whether you have to act on it (reply, pay, sign, confirm...). Posto then
+adds the message to the tray's mailbox (created at the top level when
+missing) and takes it out of the inbox unless the tray is kept there or you
+have to act. Urgent replies and urgent actions are flagged. Spam goes to the
 junk mailbox. When Jev's two best trays are too close to call, the message
 stays in the inbox and also goes into the `Unsure` mailbox. Mail is queued
 at sync time and classified afterwards; the first sync of an account
 queues nothing.
+
+**Sender memory.** When you file two messages in a row from one sender
+under the same tray, later mail from that sender goes there without asking
+Jev (no cost, no flag). A correction to another tray starts the count again.
+Needs reply and personal are never remembered: whether a person's message
+needs an answer depends on the message. The memory is kept across cache
+rebuilds.
+
+**Trays.** A tray is a key of `[classify.trays]` (its mailbox) plus a
+description Jev decides by. The defaults have built-in descriptions, as does
+the older `updates` tray; any other tray needs one under `[classify.criteria]`,
+which can also replace a built-in one. Spam is always there and always goes
+to the junk mailbox. More trays split Jev's probabilities thinner, so expect
+more Unsure answers at the same `unsure_margin`. A `config.toml` saved before these defaults keeps
+the trays written in it; remove its `keep_in_inbox` and `[classify.trays]`
+to take the new ones.
 
 ```toml
 # config.toml
@@ -186,17 +204,24 @@ queues nothing.
 enabled = false            # global switch; an account's `classify` overrides it
 model = "jev-latest"
 unsure_margin = 0.15       # top-two gap below which an answer is unsure
-flag_urgency_at = 4        # needs_reply with urgency >= this gets $flagged
+flag_urgency_at = 4        # needs_reply or action with urgency >= this gets $flagged
 max_per_run = 50
 body_chars = 2000          # body text sent to Jev
-keep_in_inbox = ["needs_reply", "updates"]
+keep_in_inbox = ["needs_reply", "personal", "alerts"]
 unsure_mailbox = "Unsure"
 
 [classify.trays]           # tray -> mailbox name; spam always goes to junk
 needs_reply = "Needs reply"
-updates = "Updates"
+personal = "Personal"
+alerts = "Alerts"
+receipts = "Receipts"
+newsletters = "Newsletters"
 promotional = "Promos"
 social = "Social"
+# bills = "Bills"          # a tray of your own needs a description:
+
+[classify.criteria]        # tray -> description; replaces a built-in one
+# bills = "Bills and payment reminders the recipient has to pay."
 
 [[accounts]]
 id = "fastmail"
@@ -228,7 +253,7 @@ posto classify run --limit 20 --retry-failed
 posto classify run --dry-run --backfill 5   # show the state blocks; changes and sends nothing
 posto classify status                  # per account: classified, unsure, queued, failed, per tray
 posto classify show <id>
-posto classify correct <id> updates    # needs_reply updates promotional social spam
+posto classify correct <id> receipts   # any configured tray, or spam
 ```
 
 `classify run` needs the key (exit 3 without it) and a switched-on

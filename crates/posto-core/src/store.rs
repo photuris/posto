@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::provider::Identity;
 
 /// Version of the table layout below; stored in `sync_state` as `schema_version`.
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 /// Database schema; every statement is idempotent.
 const SCHEMA: &str = "
@@ -29,12 +29,19 @@ CREATE TABLE IF NOT EXISTS email_mailboxes(account_id TEXT NOT NULL, email_id TE
 CREATE INDEX IF NOT EXISTS email_mailboxes_box ON email_mailboxes(account_id, mailbox_id);
 CREATE TABLE IF NOT EXISTS bodies(account_id TEXT NOT NULL, email_id TEXT NOT NULL, html TEXT, text TEXT, attachments_json TEXT NOT NULL, in_reply_to_json TEXT NOT NULL, references_json TEXT NOT NULL, message_id_json TEXT NOT NULL, PRIMARY KEY(account_id, email_id));
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(account_id UNINDEXED, email_id UNINDEXED, subject, from_text, preview, body_text);
-CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, owned_trays TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(account_id, email_id));
+CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, owned_trays TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, action REAL NOT NULL DEFAULT 0, PRIMARY KEY(account_id, email_id));
 CREATE TABLE IF NOT EXISTS classify_queue(account_id TEXT NOT NULL, email_id TEXT NOT NULL, added_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(account_id, email_id));
+CREATE TABLE IF NOT EXISTS sender_trays(sender TEXT PRIMARY KEY, tray TEXT NOT NULL, streak INTEGER NOT NULL);
 ";
+
+/// Corrections in a row to one tray after which a sender's mail is filed
+/// there without asking Jev.
+pub const SENDER_STREAK: u32 = 2;
 
 /// Tables that hold cached data, dropped when the schema version changes.
 /// `classified` belongs to the classifier and may not exist yet.
+/// `sender_trays` is learned from the user's corrections, not cached: it
+/// survives a rebuild, so its layout must never change.
 const CACHE_TABLES: [&str; 7] = [
     "mailboxes",
     "emails",
@@ -233,6 +240,8 @@ pub struct Classified {
     pub urgency: u8,
     /// Probability the email was written by a person to the recipient.
     pub personal: f64,
+    /// Probability the recipient has to reply or act; 0 for a manual row.
+    pub action: f64,
     /// True while the top two trays were too close to call and nobody corrected it.
     pub unsure: bool,
     /// Model name from the Jev response, or `manual`.
@@ -609,7 +618,7 @@ fn upsert_email(conn: &Connection, m: &EmailSummary) -> Result<()> {
 
 /// Column list matching [`classified_from_row`].
 const CLASSIFIED_COLS: &str = "account_id, email_id, tray, probs_json, urgency, personal, \
-     unsure, model, input_tokens, classified_at, corrected_tray, applied, apply_error";
+     unsure, model, input_tokens, classified_at, corrected_tray, applied, apply_error, action";
 
 /// Maps a row selected with [`CLASSIFIED_COLS`] to a [`Classified`].
 fn classified_from_row(row: &Row) -> rusqlite::Result<Classified> {
@@ -627,6 +636,7 @@ fn classified_from_row(row: &Row) -> rusqlite::Result<Classified> {
         corrected_tray: row.get(10)?,
         applied: row.get(11)?,
         apply_error: row.get(12)?,
+        action: row.get(13)?,
     })
 }
 
@@ -1260,7 +1270,7 @@ impl Store {
         Ok(self.conn().execute(
             &format!(
                 "{verb} INTO classified({CLASSIFIED_COLS}, owned_trays, revision) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                  COALESCE((SELECT revision FROM classified \
                            WHERE account_id = ?1 AND email_id = ?2), 0) + 1)"
             ),
@@ -1278,6 +1288,7 @@ impl Store {
                 c.corrected_tray,
                 c.applied,
                 c.apply_error,
+                c.action,
                 if c.applied { c.effective_tray() } else { "" },
             ],
         )?)
@@ -1399,7 +1410,7 @@ impl Store {
                      WHERE account_id = ?1 AND email_id = ?2"
                 ),
                 [account, id],
-                |row| Ok((classified_from_row(row)?, row.get(13)?)),
+                |row| Ok((classified_from_row(row)?, row.get(14)?)),
             )
             .optional()?)
     }
@@ -1620,8 +1631,41 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error on database failure.
+    /// Also counts the correction towards the sender's streak (see
+    /// [`Store::remembered_tray`]), unless the email was already corrected to
+    /// `tray`.
     pub fn set_correction(&self, account: &str, id: &str, tray: &str) -> Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let before: Option<String> = tx
+            .query_row(
+                "SELECT corrected_tray FROM classified WHERE account_id = ?1 AND email_id = ?2",
+                [account, id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let sender: Option<Vec<Address>> = tx
+            .query_row(
+                "SELECT from_json FROM emails WHERE account_id = ?1 AND id = ?2",
+                [account, id],
+                |r| json_col(r, 0),
+            )
+            .optional()?;
+
+        if before.as_deref() != Some(tray)
+            && let Some(sender) = sender.as_ref().and_then(|f| f.first())
+        {
+            tx.execute(
+                "INSERT INTO sender_trays(sender, tray, streak) VALUES (?1, ?2, 1) \
+                 ON CONFLICT(sender) DO UPDATE SET \
+                 streak = CASE WHEN tray = excluded.tray THEN streak + 1 ELSE 1 END, \
+                 tray = excluded.tray",
+                [sender.email.to_lowercase(), tray.to_string()],
+            )?;
+        }
+
+        tx.execute(
             "INSERT INTO classified(account_id, email_id, tray, probs_json, urgency, \
              personal, unsure, model, input_tokens, classified_at, corrected_tray, applied) \
              VALUES (?1, ?2, ?3, '{}', 0, 0, 0, 'manual', 0, \
@@ -1630,8 +1674,26 @@ impl Store {
              unsure = 0, applied = 0, apply_error = NULL, revision = revision + 1",
             params![account, id, tray],
         )?;
+        tx.commit()?;
 
         Ok(())
+    }
+
+    /// The tray the user filed the last [`SENDER_STREAK`] or more corrections
+    /// of `sender`'s mail under (compared ignoring case), in any account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn remembered_tray(&self, sender: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT tray FROM sender_trays WHERE sender = ?1 AND streak >= ?2",
+                params![sender.to_lowercase(), SENDER_STREAK],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Queue rows, oldest first; `account` `None` spans every account.
@@ -2440,7 +2502,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("5"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("6"));
         assert_eq!(store.account_state("a", "email_state").unwrap(), None);
         assert_eq!(store.state("email_state").unwrap(), None);
         assert_eq!(store.state("identities").unwrap(), None);
@@ -2472,7 +2534,7 @@ mod tests {
 
             conn.execute_batch(
                 "CREATE TABLE sync_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO sync_state VALUES ('schema_version', '6');",
+                 INSERT INTO sync_state VALUES ('schema_version', '7');",
             )
             .unwrap();
         }
@@ -2945,7 +3007,7 @@ mod tests {
             store.account_state("b", "email_state").unwrap().as_deref(),
             Some("s1")
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("5"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("6"));
         assert_eq!(store.search(None, "subject", 0).unwrap().len(), 1);
     }
 
@@ -3129,6 +3191,7 @@ mod tests {
             probs: BTreeMap::from([("updates".to_string(), 0.8)]),
             urgency: 2,
             personal: 0.25,
+            action: 0.0,
             unsure,
             model: "jev-test".into(),
             input_tokens: 77,

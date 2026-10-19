@@ -129,7 +129,7 @@ pub fn MessageList() -> Element {
                         // The tray's mailbox name, unless a mailbox chip or the open folder says it.
                         let (tray_chip, unsure_chip) = match classified.get(&key) {
                             Some((tray, unsure)) => {
-                                let name = tray.parse::<Tray>().ok().map(|t| tray_label(&cfg, t));
+                                let name = Tray::parse_in(&cfg.classify, tray).ok().map(|t| tray_label(&cfg, &t));
                                 let shown = name.filter(|n| {
                                     !chips.iter().any(|(c, _)| c.eq_ignore_ascii_case(n))
                                         && mailbox.as_ref().is_none_or(|m| !m.name.eq_ignore_ascii_case(n))

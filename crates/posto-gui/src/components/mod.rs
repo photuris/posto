@@ -230,14 +230,14 @@ pub fn LabelPicker() -> Element {
     }
 }
 
-/// The five classifier trays, labelled by mailbox name, to file the selected
-/// emails under.
+/// The configured classifier trays, labelled by mailbox name, to file the
+/// selected emails under.
 #[component]
 pub fn ClassifyPicker() -> Element {
     let cfg = backend().read().cfg.clone();
-    let items: Vec<(String, String)> = Tray::ALL
+    let items: Vec<(String, String)> = Tray::all(&cfg.classify)
         .into_iter()
-        .map(|t| (t.as_str().to_string(), tray_label(&cfg, t)))
+        .map(|t| (t.as_str().to_string(), tray_label(&cfg, &t)))
         .collect();
 
     rsx! {
@@ -245,11 +245,7 @@ pub fn ClassifyPicker() -> Element {
             title: "Classify as…",
             placeholder: "Filter trays",
             items,
-            on_pick: |key: String| {
-                if let Ok(tray) = key.parse::<Tray>() {
-                    classify_selected(tray);
-                }
-            },
+            on_pick: |key: String| classify_selected(Tray::new(key)),
             on_close: |_| *SHOW_CLASSIFY_PICKER.write() = false,
         }
     }

@@ -55,13 +55,26 @@ Read `README.md` first. This file holds what the code does not say.
   folds below sidebar + list + 360px. GUI state is still `GlobalSignal`
   statics, which the skill lists as the rejected option.
 
+- Classifier trays are config, not code: `classify::Tray` is a key of
+  `[classify.trays]` or `spam`, validated with `Tray::parse_in`; Jev's
+  `questions` are built per client from `jev::tray_criteria` (config
+  `[classify.criteria]`, else `jev::BUILTIN_CRITERIA`). Beyond jevmail's
+  questions Posto asks `action_required`: at `ACTION_AT` an uncorrected
+  answer stays in the inbox and is flagged when urgent, whatever its tray.
+  `set_correction` feeds sender memory (`Store::remembered_tray`, two
+  corrections in a row); a remembered answer has model `sender` and costs no
+  request. The integration tests pin the pre-2026-10 trays
+  (`legacy_trays`) on purpose: old configs must keep working.
+
 ## Rules that bit us
 
 - The database is a cache with a schema version (`schema_version` in
-  `sync_state`, now 2). `Store::open` drops and recreates every cache table,
+  `sync_state`, now 6). `Store::open` drops and recreates every cache table,
   cursor and identity when the version is missing or older, and refuses a newer
   one. A table or column change means bumping `SCHEMA_VERSION`; never write a
-  data migration for the cache. Config and secrets are the only files that
+  data migration for the cache. The one exception is `sender_trays` (sender
+  memory, learned from corrections): it is not in `CACHE_TABLES`, survives a
+  rebuild, and so its layout must never change. Config and secrets are the only files that
   migrate (`Config::load` converts the legacy `[account]`; the first `Secrets`
   write converts the legacy `token`).
 - `Secrets` setters read-modify-write the whole file (tokens and the TypeSafe
