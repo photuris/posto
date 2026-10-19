@@ -136,6 +136,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: non
   display: flex; flex-direction: column;
 }
 .list-head { gap: 10px; padding: 0 12px; }
+/* The list head pads 12px for its title; pull the panel toggle back to the
+   8px every other head uses, so it does not move when the sidebar folds. */
+.list-head > button.tool:first-child { margin-left: -4px; }
 .list-title { font-weight: 600; }
 .list-counts { font-size: 12px; color: var(--posto-muted); }
 .sel-count { color: var(--posto-accent); font-weight: 600; }
