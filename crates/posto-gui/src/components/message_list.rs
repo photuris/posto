@@ -8,7 +8,7 @@ use crate::app::{
     CLASSIFIED, EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION,
     SIDEBAR_OPEN, backend, click_email, dispatch, enabled_ids, load_more, tray_label,
 };
-use crate::components::Icon;
+use crate::components::{Icon, SidebarOpen};
 use crate::format;
 use crate::selection::Click;
 use crate::state::{Folder, rows_for_display};
@@ -73,25 +73,11 @@ pub fn MessageList() -> Element {
     };
     let more = HAS_MORE();
 
-    let toggle_icon = if SIDEBAR_OPEN() {
-        "panel-close"
-    } else {
-        "panel-open"
-    };
-
     rsx! {
         section { class: "list",
             header { class: "list-head",
-                button {
-                    class: "tool",
-                    title: "Toggle sidebar",
-                    onmousedown: |evt| evt.prevent_default(),
-                    onclick: |_| {
-                        let open = *SIDEBAR_OPEN.peek();
-
-                        *SIDEBAR_OPEN.write() = !open;
-                    },
-                    Icon { name: toggle_icon }
+                if !SIDEBAR_OPEN() {
+                    SidebarOpen {}
                 }
                 div {
                     div { class: "list-title", "{title}" }

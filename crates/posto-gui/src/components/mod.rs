@@ -31,6 +31,20 @@ use crate::format;
 use posto_core::classify::Tray;
 use posto_core::store::mailbox_groups;
 
+/// The button that brings a hidden sidebar back, at the top left of the main pane.
+#[component]
+pub fn SidebarOpen() -> Element {
+    rsx! {
+        button {
+            class: "tool",
+            title: "Show sidebar (Ctrl+B)",
+            onmousedown: |evt| evt.prevent_default(),
+            onclick: |_| crate::app::toggle_sidebar(),
+            Icon { name: "panel-open" }
+        }
+    }
+}
+
 /// `onfocusin` for inputs: shortcuts are suspended while typing.
 pub fn focus_in(_: FocusEvent) {
     *TYPING.write() = true;

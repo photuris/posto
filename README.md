@@ -119,8 +119,10 @@ With several enabled accounts the GUI sidebar shows one entry per
 role, every other folder or label merges by name (case-insensitive;
 nesting is ignored, so two Fastmail folders named "Receipts" under
 different parents share one entry). A group lists the mail of all its
-members as one list, newest first, each row tagged with its account; the
-disclosure arrow expands the group to its per-account members. Move and
+members as one list, newest first, each row tagged with its account;
+double-clicking a group shows its per-account members under it (and
+hides them again). Nothing marks a group as expandable: the merged view
+is the default. Move and
 Labels… work on a mixed selection: each message goes to the mailbox of
 that name in its own account, and the status line names the accounts
 that have no such mailbox or refused the change (`Moved 1 of 2 messages;
@@ -241,7 +243,9 @@ next `classify run` or classifying sync.
 `j`/`k` next/previous, `Enter` open, `Esc` close, `Backspace` back,
 `e` archive, `#` delete, `!` junk, `r` reply, `a` reply all, `c` compose,
 `u` toggle read, `s` toggle flag, `m` move, `l` labels, `t` classify as, `/` search, `g` sync,
-`Ctrl+Enter` send. Delete moves a message to Trash; deleting a message that is
+`Ctrl+Enter` send, `Ctrl+B` hide or show the sidebar (it also folds away by
+itself when the window gets too narrow for the reader, and comes back when it
+widens). Delete moves a message to Trash; deleting a message that is
 already in Trash deletes it permanently, after a confirmation. Right-click Trash or
 Spam in the sidebar for "Empty …", which permanently deletes everything the app
 has synced there, in every account, after a confirmation. Labels are mailboxes;

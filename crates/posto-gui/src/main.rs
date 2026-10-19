@@ -36,7 +36,7 @@ fn main() {
     let window = WindowBuilder::new()
         .with_title("Posto")
         .with_inner_size(LogicalSize::new(1400.0, 900.0))
-        .with_min_inner_size(LogicalSize::new(900.0, 600.0));
+        .with_min_inner_size(LogicalSize::new(360.0, 320.0));
     let window = window.with_decorations(want_decorations(&backend.cfg.ui.decorations));
 
     // `with_window` replaces the whole window builder, so the icon goes on after it.

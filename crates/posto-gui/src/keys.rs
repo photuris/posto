@@ -3,7 +3,7 @@
 use posto_core::shortcuts::{Action, Chord, Keymap};
 
 /// Every action, in the order Settings lists them.
-pub const ALL_ACTIONS: [Action; 23] = [
+pub const ALL_ACTIONS: [Action; 24] = [
     Action::Next,
     Action::Prev,
     Action::Open,
@@ -27,6 +27,7 @@ pub const ALL_ACTIONS: [Action; 23] = [
     Action::Classify,
     Action::Label,
     Action::DeleteConfirmed,
+    Action::ToggleSidebar,
 ];
 
 /// Normalises a Dioxus `Key` display string and modifier state.

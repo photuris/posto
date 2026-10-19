@@ -17,7 +17,11 @@
   --sel: var(--posto-selection-background, var(--posto-selection));
   --border: color-mix(in srgb, var(--fg) 14%, var(--bg));
   --hover: color-mix(in srgb, var(--fg) 7%, var(--bg));
-  --on-accent: #ffffff;
+  --on-accent: var(--posto-on-accent, #ffffff);
+  --ok: light-dark(#1a7f37, #3fb950);
+  --warn: light-dark(#9a6700, #e6a700);
+  --err: light-dark(#c62828, #f06060);
+  --info: light-dark(#0b57d0, #6ea8fe);
 }
 
 * { box-sizing: border-box; }
@@ -41,7 +45,7 @@ button {
 button:hover:not(:disabled) { background: var(--hover); }
 button:disabled { opacity: 0.45; cursor: default; }
 button.primary { background: var(--posto-accent); border-color: var(--posto-accent); color: var(--on-accent); }
-button.danger { color: #d33; }
+button.danger { color: var(--err); }
 
 input[type="text"], input[type="password"], input[type="number"], input:not([type]), textarea {
   background: var(--bg);
@@ -54,7 +58,9 @@ select {
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
 }
 input:focus, textarea:focus { border-color: var(--posto-accent); }
-input.invalid { border-color: #d33; }
+input.invalid { border-color: var(--err); }
+:focus-visible { outline: 2px solid var(--posto-accent); outline-offset: 2px; }
+input:focus-visible, textarea:focus-visible, select:focus-visible { outline: none; }
 
 .app {
   display: flex;
@@ -79,17 +85,32 @@ input.invalid { border-color: #d33; }
 .banner {
   display: flex; align-items: center; gap: 12px;
   padding: 6px 12px;
-  background: color-mix(in srgb, #e6a700 25%, var(--bg));
+  background: color-mix(in srgb, var(--warn) 25%, var(--bg));
+  border-bottom: 1px solid var(--border);
+}
+
+/* The sidebar's top row, the list's head and the toolbar share one height,
+   so the panel toggle stays put and the top edge reads as one line. */
+.side-head, .main-bar, .list-head, .toolbar {
+  flex: none; display: flex; align-items: center; height: 44px; padding: 0 8px;
   border-bottom: 1px solid var(--border);
 }
 
 /* Sidebar */
 .sidebar {
-  min-width: 0; overflow: auto;
-  padding: 8px;
+  min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
   background: var(--posto-dark-background);
 }
-.sidebar-title { padding: 8px 8px 6px; font-size: 12px; color: var(--posto-muted); }
+.side-head { gap: 4px; }
+.side-head input { flex: 1; min-width: 0; }
+.mailboxes { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 8px 8px; }
+.group-head {
+  padding: 12px 8px 4px; font-size: 11px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--posto-muted);
+}
+.side-foot { flex: none; padding: 8px; border-top: 1px solid var(--border); }
+.side-foot .nav-item { width: 100%; }
 .mailbox {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 8px; border-radius: 6px; cursor: pointer; user-select: none;
@@ -102,20 +123,19 @@ input.invalid { border-color: #d33; }
 .flag, .flag .icon { color: var(--posto-accent); }
 .flag, .clip { display: inline-flex; }
 .mailbox.member { padding-left: 32px; }
-.disclosure {
-  flex: none; width: 16px; padding: 0; border: 0; background: none;
-  font-size: 11px; line-height: 1; color: var(--posto-muted); cursor: pointer;
+.mailbox .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge {
+  flex: none; min-width: 18px; padding: 0 6px; border-radius: 9px; text-align: center;
+  font-size: 11px; line-height: 18px; font-weight: 600;
+  background: var(--posto-accent); color: var(--on-accent);
 }
-.disclosure:hover { color: var(--fg); }
-.mailbox .name { flex: 1; }
-.badge { font-size: 12px; color: var(--posto-muted); }
 
 /* Message list */
 .list {
   min-width: 0; min-height: 0;
   display: flex; flex-direction: column;
 }
-.list-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.list-head { gap: 10px; padding: 0 12px; }
 .list-title { font-weight: 600; }
 .list-counts { font-size: 12px; color: var(--posto-muted); }
 .sel-count { color: var(--posto-accent); font-weight: 600; }
@@ -172,11 +192,7 @@ input.invalid { border-color: #d33; }
 
 /* Right pane */
 .right { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.toolbar {
-  display: flex; align-items: center; justify-content: flex-end; gap: 6px;
-  padding: 8px 12px; border-bottom: 1px solid var(--border);
-}
-.toolbar .search { width: 220px; margin-right: auto; }
+.toolbar { justify-content: flex-end; gap: 6px; padding: 0 12px; }
 button.tool { display: inline-flex; align-items: center; padding: 5px 9px; background: transparent; border-color: transparent; }
 button.tool:hover { background: var(--hover); }
 
@@ -216,7 +232,7 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
   display: flex; align-items: center; justify-content: center;
   background: rgb(0 0 0 / 0.35);
 }
-.composer, .settings, .picker {
+.composer, .picker, .dialog {
   background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
   box-shadow: 0 12px 40px rgb(0 0 0 / 0.35);
   display: flex; flex-direction: column; overflow: hidden;
@@ -239,13 +255,10 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 .composer-status { flex: 1; text-align: right; color: var(--posto-muted); font-size: 12px; }
 .switch { display: flex; align-items: center; gap: 6px; }
 
-.settings {
-  width: min(780px, 92vw); height: min(580px, 88vh);
-  display: grid; grid-template-columns: 180px 1fr; grid-template-rows: minmax(0, 1fr);
-}
-.settings-wide { grid-column: 1 / -1; }
+.settings { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.settings-body { flex: 1; min-height: 0; display: flex; }
 .settings-nav {
-  display: flex; flex-direction: column; gap: 2px; padding: 12px 8px;
+  flex: none; width: 180px; display: flex; flex-direction: column; gap: 2px; padding: 12px 8px;
   background: var(--posto-lighter-background); border-right: 1px solid var(--border);
 }
 .nav-item {
@@ -257,7 +270,7 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
   box-shadow: inset 3px 0 0 var(--posto-accent);
 }
 .nav-item.active .icon { color: var(--posto-accent); }
-.settings-page { overflow: auto; padding: 20px; min-height: 0; }
+.settings-page { flex: 1; min-width: 0; max-width: 760px; overflow: auto; padding: 20px; min-height: 0; }
 .settings-page h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
 .settings h3 { margin: 18px 0 6px; font-size: 14px; }
 .setting-row {
@@ -282,29 +295,33 @@ iframe.mail { flex: 1; width: 100%; border: 0; min-height: 0; }
 .setting-row.blocked span { flex: 1; }
 input.number { width: 80px; }
 .hint { font-size: 12px; color: var(--posto-muted); padding: 0 10px 4px; }
-.error { color: #d33; font-size: 12px; }
+.error { color: var(--err); font-size: 12px; }
 .error.pad { padding: 6px 18px; }
 .settings-foot { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
 .settings-foot .spacer { flex: 1; }
-.ui-test { color: #d6593a; font-size: 12px; }
+.ui-test { color: var(--warn); font-size: 12px; }
 
 .picker { width: 320px; max-height: 60vh; padding: 12px; gap: 8px; overflow: auto; }
 .picker-title { font-weight: 600; }
-.picker.confirm { width: 340px; outline: none; }
-.confirm-body { color: var(--posto-muted); }
-.confirm-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.dialog { width: min(460px, 92vw); max-height: 88vh; padding: 14px; gap: 10px; outline: none; }
+.dialog-title { font-weight: 600; font-size: 16px; }
+.dialog-body { color: var(--posto-muted); overflow-wrap: anywhere; }
+.dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; }
 .picker-row { padding: 6px 10px; border-radius: 6px; cursor: pointer; }
 .picker-row:hover, .picker-row.active { background: var(--sel); }
 .picker-row.disabled { opacity: 0.5; cursor: not-allowed; }
 .label-row { display: flex; align-items: center; gap: 8px; }
 .label-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: hsl(var(--hue) 60% 55%); }
 
-.menu-overlay { background: none; }
+.menu-backdrop { position: fixed; inset: 0; z-index: 30; }
 .menu {
-  position: fixed; min-width: 160px; padding: 4px;
+  position: fixed; z-index: 31; min-width: 150px; padding: 4px; outline: none;
+  display: flex; flex-direction: column;
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 0.3);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
 }
+.menu button { text-align: left; background: none; border: none; }
+.menu button:hover { background: var(--hover); }
 
 .toast {
   position: fixed; right: 16px; bottom: 16px; z-index: 20;

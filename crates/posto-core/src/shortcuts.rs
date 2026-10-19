@@ -37,6 +37,8 @@ pub enum Action {
     Label,
     /// Deletes the selection without asking; what the Delete confirmation runs.
     DeleteConfirmed,
+    /// Shows or hides the sidebar.
+    ToggleSidebar,
 }
 
 /// A key plus modifiers.
@@ -107,6 +109,7 @@ const DEFAULTS: &[(Action, &str)] = &[
     (Action::Classify, "t"),
     (Action::Label, "l"),
     (Action::DeleteConfirmed, "ctrl+shift+delete"),
+    (Action::ToggleSidebar, "ctrl+b"),
 ];
 
 impl Keymap {
@@ -241,6 +244,7 @@ mod tests {
             Action::Classify,
             Action::Label,
             Action::DeleteConfirmed,
+            Action::ToggleSidebar,
         ];
         for action in all {
             match action {
@@ -266,7 +270,8 @@ mod tests {
                 | Action::SelectAll
                 | Action::Classify
                 | Action::Label
-                | Action::DeleteConfirmed => {}
+                | Action::DeleteConfirmed
+                | Action::ToggleSidebar => {}
             }
             assert!(map.chord_for(action).is_some(), "{action:?} unbound");
         }

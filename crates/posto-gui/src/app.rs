@@ -248,6 +248,12 @@ pub static THEME_CSS: GlobalSignal<String> = Signal::global(|| {
         .unwrap_or_default()
 });
 pub static SIDEBAR_OPEN: GlobalSignal<bool> = Signal::global(|| true);
+/// The window folded the sidebar away (too narrow); widening brings it back.
+static SIDEBAR_FOLDED: GlobalSignal<bool> = Signal::global(|| false);
+/// Whether the window was narrower than the panes need at the last resize.
+static NARROW: GlobalSignal<bool> = Signal::global(|| false);
+/// The search box takes focus when it next mounts (the sidebar was hidden).
+pub static FOCUS_SEARCH: GlobalSignal<bool> = Signal::global(|| false);
 /// True while an `<input>` or `<textarea>` has focus.
 pub static TYPING: GlobalSignal<bool> = Signal::global(|| false);
 pub static SIDEBAR_WIDTH: GlobalSignal<u32> = Signal::global(|| UiConfig::default().sidebar_width);
@@ -312,9 +318,58 @@ struct Drag {
     start_width: u32,
 }
 
+/// Narrowest reader, in pixels, before the sidebar folds away.
+const READER_MIN: u32 = 360;
+
+/// Shows or hides the sidebar by hand.
+pub fn toggle_sidebar() {
+    let open = *SIDEBAR_OPEN.peek();
+
+    *SIDEBAR_OPEN.write() = !open;
+    *SIDEBAR_FOLDED.write() = false;
+}
+
+/// Shows the sidebar if needed and focuses its search box.
+fn open_search() {
+    if *SIDEBAR_OPEN.peek() {
+        focus("search");
+    } else {
+        *FOCUS_SEARCH.write() = true;
+        *SIDEBAR_OPEN.write() = true;
+        *SIDEBAR_FOLDED.write() = false;
+    }
+}
+
+/// Opens Settings in the main pane.
+pub fn open_settings() {
+    *SHOW_SETTINGS.write() = true;
+}
+
+/// Takes the window width in pixels. Becoming narrower than sidebar, list and
+/// [`READER_MIN`] hides the sidebar; widening past that again shows it, unless
+/// it was shown or hidden by hand in between.
+pub fn set_window_width(width: f64) {
+    let need = *SIDEBAR_WIDTH.peek() + *LIST_WIDTH.peek() + 12 + READER_MIN;
+    let narrow = width < f64::from(need);
+
+    if narrow == *NARROW.peek() {
+        return;
+    }
+
+    *NARROW.write() = narrow;
+
+    if narrow && *SIDEBAR_OPEN.peek() {
+        *SIDEBAR_OPEN.write() = false;
+        *SIDEBAR_FOLDED.write() = true;
+    } else if !narrow && *SIDEBAR_FOLDED.peek() {
+        *SIDEBAR_OPEN.write() = true;
+        *SIDEBAR_FOLDED.write() = false;
+    }
+}
+
 /// Mailbox column width limits, in pixels.
 pub fn clamp_sidebar(width: u32) -> u32 {
-    width.clamp(140, 480)
+    width.clamp(180, 480)
 }
 
 /// Message-list column width limits, in pixels.
@@ -496,11 +551,33 @@ pub fn App() -> Element {
         }
     });
 
-    // A collapsed sidebar takes no column and no divider.
-    let columns = if SIDEBAR_OPEN() {
-        format!("{}px 6px {}px 6px 1fr", SIDEBAR_WIDTH(), LIST_WIDTH())
+    // The webview reports its width on every resize. Headless tests have no
+    // webview; the eval fails there and the loop ends.
+    use_future(|| async {
+        let mut width = document::eval(
+            "const send = () => dioxus.send(window.innerWidth);
+             window.addEventListener('resize', send);
+             send();
+             await new Promise(() => {});",
+        );
+
+        while let Ok(w) = width.recv::<f64>().await {
+            set_window_width(w);
+        }
+    });
+
+    // A collapsed sidebar takes no column and no divider; Settings takes the
+    // list's and the reader's place.
+    let settings = SHOW_SETTINGS();
+    let main = if settings {
+        "1fr".to_string()
     } else {
         format!("{}px 6px 1fr", LIST_WIDTH())
+    };
+    let columns = if SIDEBAR_OPEN() {
+        format!("{}px 6px {main}", SIDEBAR_WIDTH())
+    } else {
+        main
     };
 
     rsx! {
@@ -542,7 +619,7 @@ pub fn App() -> Element {
             if NEEDS_TOKEN() {
                 div { class: "banner",
                     "Not signed in — open Settings"
-                    button { onclick: |_| *SHOW_SETTINGS.write() = true, "Settings" }
+                    button { onclick: |_| open_settings(), "Settings" }
                 }
             }
             div {
@@ -561,24 +638,25 @@ pub fn App() -> Element {
                         },
                     }
                 }
-                MessageList {}
-                div {
-                    class: "resizer",
-                    onmousedown: |evt| {
-                        evt.prevent_default();
-                        begin_drag(Divider::List, evt.client_coordinates().x);
-                    },
-                }
-                div { class: "right",
-                    Toolbar {}
-                    Reader {}
+                if settings {
+                    Settings {}
+                } else {
+                    MessageList {}
+                    div {
+                        class: "resizer",
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            begin_drag(Divider::List, evt.client_coordinates().x);
+                        },
+                    }
+                    div { class: "right",
+                        Toolbar {}
+                        Reader {}
+                    }
                 }
             }
             if COMPOSER.read().is_some() {
                 Composer {}
-            }
-            if SHOW_SETTINGS() {
-                Settings {}
             }
             if SHOW_MOVE_PICKER() {
                 MovePicker {}
@@ -628,6 +706,7 @@ pub fn dispatch(action: Action) {
         }
         Action::Back | Action::Escape => close_top(),
         Action::Send if COMPOSER.peek().is_some() => send(false),
+        Action::ToggleSidebar => toggle_sidebar(),
         _ if modal => {}
         Action::Next => move_focus(1, false),
         Action::Prev => move_focus(-1, false),
@@ -662,7 +741,7 @@ pub fn dispatch(action: Action) {
                 *SHOW_CLASSIFY_PICKER.write() = true;
             }
         }
-        Action::Search => focus("search"),
+        Action::Search => open_search(),
         Action::Sync => run(run_sync(true)),
         Action::Send => {}
     }
@@ -2439,12 +2518,37 @@ mod tests {
 
     #[test]
     fn clamp_widths() {
-        assert_eq!(clamp_sidebar(139), 140);
+        assert_eq!(clamp_sidebar(179), 180);
         assert_eq!(clamp_sidebar(481), 480);
         assert_eq!(clamp_sidebar(300), 300);
         assert_eq!(clamp_list(239), 240);
         assert_eq!(clamp_list(801), 800);
         assert_eq!(clamp_list(300), 300);
+    }
+
+    #[test]
+    fn sidebar_folds_in_a_narrow_window_unless_toggled_by_hand() {
+        let dom = rendered(backend_with(Config::default()));
+
+        dom.in_scope(ScopeId::ROOT, || {
+            // Default widths: 220 + 360 + 12 + 360 = 952.
+            set_window_width(1400.0);
+            assert!(*SIDEBAR_OPEN.peek());
+
+            set_window_width(900.0);
+            assert!(!*SIDEBAR_OPEN.peek(), "too narrow folds it");
+
+            set_window_width(1400.0);
+            assert!(
+                *SIDEBAR_OPEN.peek(),
+                "widening brings a folded sidebar back"
+            );
+
+            toggle_sidebar();
+            set_window_width(900.0);
+            set_window_width(1400.0);
+            assert!(!*SIDEBAR_OPEN.peek(), "hidden by hand stays hidden");
+        });
     }
 
     #[test]

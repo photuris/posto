@@ -1,10 +1,10 @@
-//! Top-right toolbar: actions and search.
+//! Top-right toolbar: message actions.
 
 use dioxus::prelude::*;
 use posto_core::shortcuts::Action;
 
-use crate::app::{KEYMAP, SEARCH_QUERY, SELECTION, SHOW_SETTINGS, dispatch, search_input};
-use crate::components::{Icon, focus_in, focus_out};
+use crate::app::{KEYMAP, SELECTION, dispatch};
+use crate::components::Icon;
 use crate::keys;
 
 /// Tooltip such as `Archive (e)`.
@@ -37,17 +37,6 @@ pub fn Toolbar() -> Element {
 
     rsx! {
         div { class: "toolbar",
-            input {
-                id: "search",
-                class: "search",
-                r#type: "text",
-                placeholder: "Search",
-                title: title("Search", Action::Search),
-                value: "{SEARCH_QUERY}",
-                onfocusin: focus_in,
-                onfocusout: focus_out,
-                oninput: |evt| search_input(evt.value()),
-            }
             for (icon, label, action) in buttons {
                 button {
                     key: "{label}",
@@ -57,13 +46,6 @@ pub fn Toolbar() -> Element {
                     onclick: move |_| dispatch(action),
                     Icon { name: icon }
                 }
-            }
-            button {
-                class: "tool",
-                title: "Settings",
-                onmousedown: |evt| evt.prevent_default(),
-                onclick: |_| *SHOW_SETTINGS.write() = true,
-                Icon { name: "settings" }
             }
         }
     }

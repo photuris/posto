@@ -43,10 +43,17 @@ Read `README.md` first. This file holds what the code does not say.
   `Draft.reply_to_account_id`; `compose::send` marks the original answered
   only in that account, and the GUI's `finish_send` does it through the
   original account's connection when the sender differs. The Unsure row is one
-  view over every account. Right-clicking a Trash or Spam row (group or single)
-  offers "Empty …", which runs `actions::empty_mailbox` per account (destroys
-  what the store lists there; `Confirm.on_accept` is an `Accept`, not only a
-  key action).
+  view over every account. A group row has no disclosure control on purpose:
+  a double click toggles its members (`EXPANDED`), a click selects the merged
+  view. Right-clicking a Trash or Spam row (group or single) offers
+  "Empty …", which runs `actions::empty_mailbox` per account (destroys what
+  the store lists there; `Confirm.on_accept` is an `Accept`, not only a key
+  action).
+- GUI shell follows the `dioxus-desktop-apps` skill: search and the panel
+  toggle in the sidebar's 44px head, Settings in its footer and shown in the
+  main pane (not a modal), `Ctrl+B` (`Action::ToggleSidebar`), the sidebar
+  folds below sidebar + list + 360px. GUI state is still `GlobalSignal`
+  statics, which the skill lists as the rejected option.
 
 ## Rules that bit us
 

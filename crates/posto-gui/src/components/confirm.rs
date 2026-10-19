@@ -26,7 +26,7 @@ pub fn ConfirmDialog() -> Element {
     rsx! {
         div { class: "overlay", onclick: |_| finish(false),
             div {
-                class: "picker confirm",
+                class: "dialog",
                 tabindex: "0",
                 onclick: |evt| evt.stop_propagation(),
                 onmounted: |evt| async move {
@@ -48,9 +48,9 @@ pub fn ConfirmDialog() -> Element {
                         _ => {}
                     }
                 },
-                div { class: "picker-title", "{confirm.title}" }
-                div { class: "confirm-body", "{confirm.body}" }
-                div { class: "confirm-buttons",
+                div { class: "dialog-title", "{confirm.title}" }
+                div { class: "dialog-body", "{confirm.body}" }
+                div { class: "dialog-buttons",
                     button { onclick: |_| finish(false), "Cancel" }
                     button { class: "primary", onclick: |_| finish(true), "{confirm.accept_label}" }
                 }

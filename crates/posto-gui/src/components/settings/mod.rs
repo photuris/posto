@@ -1,4 +1,4 @@
-//! Settings modal: side tabs on the left, one page at a time on the right.
+//! Settings view in the main pane: side tabs on the left, one page at a time on the right.
 //!
 //! The draft config lives here, so edits survive switching pages and one
 //! Save writes everything.
@@ -14,10 +14,10 @@ use posto_core::config::{Account, Config, Provider, Secrets};
 use posto_core::shortcuts::Keymap;
 
 use crate::app::{
-    KEYMAP, SHOW_SETTINGS, backend, focus_root, reload_identities, reload_list, reload_mailboxes,
-    run, sync_soon,
+    KEYMAP, SHOW_SETTINGS, SIDEBAR_OPEN, backend, focus_root, reload_identities, reload_list,
+    reload_mailboxes, run, sync_soon,
 };
-use crate::components::Icon;
+use crate::components::{Icon, SidebarOpen};
 use crate::keys;
 use appearance::AppearancePage;
 use classification::ClassificationPage;
@@ -199,23 +199,27 @@ pub fn Settings() -> Element {
 
     if let Some(e) = backend().read().config_error.clone() {
         return rsx! {
-            div { class: "overlay", onclick: |_| close(),
-                div { class: "settings", onclick: |evt| evt.stop_propagation(),
-                    div { class: "error pad settings-wide",
-                        "Settings are disabled: config.toml could not be loaded ({e}). Fix the file and restart."
-                    }
-                    div { class: "settings-foot settings-wide",
-                        span { class: "spacer" }
-                        button { onclick: |_| close(), "Close" }
-                    }
+            section { class: "settings",
+                if !SIDEBAR_OPEN() {
+                    div { class: "main-bar", SidebarOpen {} }
+                }
+                div { class: "error pad",
+                    "Settings are disabled: config.toml could not be loaded ({e}). Fix the file and restart."
+                }
+                div { class: "settings-foot",
+                    span { class: "spacer" }
+                    button { onclick: |_| close(), "Close" }
                 }
             }
         };
     }
 
     rsx! {
-        div { class: "overlay", onclick: |_| close(),
-            div { class: "settings", onclick: |evt| evt.stop_propagation(),
+        section { class: "settings",
+            if !SIDEBAR_OPEN() {
+                div { class: "main-bar", SidebarOpen {} }
+            }
+            div { class: "settings-body",
                 nav { class: "settings-nav",
                     for p in Page::ALL {
                         button {
@@ -237,38 +241,38 @@ pub fn Settings() -> Element {
                         Page::Appearance => rsx! { AppearancePage { draft } },
                     }
                 }
-                if let Some(e) = save_error() {
-                    div { class: "error pad settings-wide", "{e}" }
+            }
+            if let Some(e) = save_error() {
+                div { class: "error pad", "{e}" }
+            }
+            div { class: "settings-foot",
+                if ui_test {
+                    span { class: "ui-test", "UI test mode" }
                 }
-                div { class: "settings-foot settings-wide",
-                    if ui_test {
-                        span { class: "ui-test", "UI test mode" }
-                    }
-                    span { class: "spacer" }
-                    if confirm_reset() {
-                        button {
-                            class: "danger",
-                            onclick: move |_| {
-                                {
-                                    let mut d = draft.write();
+                span { class: "spacer" }
+                if confirm_reset() {
+                    button {
+                        class: "danger",
+                        onclick: move |_| {
+                            {
+                                let mut d = draft.write();
 
-                                    d.blocked_senders.clear();
-                                    d.trusted_senders.clear();
-                                    d.remote_content = "ask".to_string();
-                                    d.ui.decorations = "auto".to_string();
-                                }
-                                rows.set(chord_rows(&Default::default()));
-                                confirm_reset.set(false);
-                            },
-                            "Clear shortcuts, senders and decorations"
-                        }
-                        button { onclick: move |_| confirm_reset.set(false), "Cancel" }
-                    } else {
-                        button { onclick: move |_| confirm_reset.set(true), "Reset to Defaults…" }
+                                d.blocked_senders.clear();
+                                d.trusted_senders.clear();
+                                d.remote_content = "ask".to_string();
+                                d.ui.decorations = "auto".to_string();
+                            }
+                            rows.set(chord_rows(&Default::default()));
+                            confirm_reset.set(false);
+                        },
+                        "Clear shortcuts, senders and decorations"
                     }
-                    button { onclick: |_| close(), "Close" }
-                    button { class: "primary", disabled: !valid, onclick: save, "Save" }
+                    button { onclick: move |_| confirm_reset.set(false), "Cancel" }
+                } else {
+                    button { onclick: move |_| confirm_reset.set(true), "Reset to defaults…" }
                 }
+                button { onclick: |_| close(), "Close" }
+                button { class: "primary", disabled: !valid, onclick: save, "Save" }
             }
         }
     }
