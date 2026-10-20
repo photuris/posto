@@ -542,7 +542,12 @@ pub async fn email_show(account: Option<&str>, id: &str, text: bool) -> Result<V
 
     Ok(json!({
         "summary": summary,
-        "body": { "text": body.text, "html": body.html, "attachments": body.attachments },
+        "body": {
+            "text": body.text,
+            "html": body.html,
+            "attachments": body.attachments,
+            "reply_to": body.reply_to,
+        },
     }))
 }
 
@@ -781,6 +786,7 @@ fn dry_state(cfg: &Config, store: &Store, account: &str, id: &str) -> Result<Str
         in_reply_to: Vec::new(),
         references: Vec::new(),
         message_id: Vec::new(),
+        reply_to: Vec::new(),
     });
     let mut own: Vec<String> = store
         .identities(account)?

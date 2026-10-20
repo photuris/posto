@@ -357,6 +357,7 @@ pub(crate) fn body_from(
         in_reply_to: header_ids(&message.header, "In-Reply-To"),
         references: header_ids(&message.header, "References"),
         message_id: header_ids(&message.header, "Message-ID"),
+        reply_to: message.meta.reply_tos.iter().map(address_from).collect(),
     }
 }
 
@@ -1043,6 +1044,41 @@ mod tests {
         assert_eq!(header_ids(header, "Message-Id"), ["m@x"]);
         assert!(header_ids(header, "In-Reply-To").is_empty());
         assert_eq!(header_values(header, "Subject"), ["x"]);
+    }
+
+    #[test]
+    fn body_from_keeps_reply_tos() {
+        let message = |reply_tos: Option<serde_json::Value>| -> Message {
+            let mut v = serde_json::json!({"ID": "m1"});
+
+            if let Some(r) = reply_tos {
+                v["ReplyTos"] = r;
+            }
+
+            serde_json::from_value(v).unwrap()
+        };
+        let reply_to = |m: &Message| body_from("m1", m, None, None).reply_to;
+        let some = message(Some(serde_json::json!([
+            {"Name": "R", "Address": "ra@passmail.com"},
+            {"Address": "r2@x.io"},
+        ])));
+
+        assert_eq!(
+            reply_to(&some),
+            [
+                Address {
+                    name: Some("R".into()),
+                    email: "ra@passmail.com".into()
+                },
+                Address {
+                    name: None,
+                    email: "r2@x.io".into()
+                },
+            ]
+        );
+        assert!(reply_to(&message(Some(serde_json::Value::Null))).is_empty());
+        assert!(reply_to(&message(Some(serde_json::json!([])))).is_empty());
+        assert!(reply_to(&message(None)).is_empty());
     }
 
     #[test]

@@ -132,6 +132,11 @@ pub fn pick_identity(
 /// Builds a reply to `summary`, sent from the account the original arrived in.
 /// `me` is the sender's own address; `identities` and `masked` are that
 /// account's sending identities and masked email addresses.
+///
+/// The recipients are the original recipients when every author is me;
+/// otherwise the message's `Reply-To` addresses (deduplicated, mine left out
+/// unless they are all mine) when it has any; otherwise the original authors.
+/// A reply-all through `Reply-To` never copies the original authors.
 pub fn reply(
     summary: &EmailSummary,
     body: &EmailBody,
@@ -151,8 +156,20 @@ pub fn reply(
     };
 
     // Own sent mail only when every author is me; a co-author stays a recipient.
+    let mut via_reply_to = false;
     let to: Vec<Address> = if !summary.from.is_empty() && summary.from.iter().all(is_mine) {
         summary.to.clone()
+    } else if !body.reply_to.is_empty() {
+        let mut rt: Vec<Address> = Vec::new();
+        for a in &body.reply_to {
+            if !rt.iter().any(|x| x.email.eq_ignore_ascii_case(&a.email)) {
+                rt.push(a.clone());
+            }
+        }
+        let ext: Vec<Address> = rt.iter().filter(|a| !is_mine(a)).cloned().collect();
+
+        via_reply_to = true;
+        if ext.is_empty() { rt } else { ext }
     } else {
         summary.from.clone()
     };
@@ -161,7 +178,11 @@ pub fn reply(
     if reply_all {
         for a in summary.to.iter().chain(&summary.cc) {
             let known = |x: &Address| x.email.eq_ignore_ascii_case(&a.email);
-            if !is_mine(a) && !to.iter().any(known) && !cc.iter().any(known) {
+            if !is_mine(a)
+                && !to.iter().any(known)
+                && !cc.iter().any(known)
+                && !(via_reply_to && summary.from.iter().any(known))
+            {
                 cc.push(a.clone());
             }
         }
@@ -382,6 +403,7 @@ mod tests {
             in_reply_to: vec![],
             references: vec!["r0@x".into()],
             message_id: vec!["m1@x".into()],
+            reply_to: vec![],
         }
     }
 
@@ -561,6 +583,117 @@ mod tests {
         let d = reply(&s, &body("x"), "me@x.io", true, &[], &[]);
         assert_eq!(d.to, vec![addr(None, "bob@y.io")]);
         assert_eq!(d.cc, vec![carol, dave]);
+    }
+
+    #[test]
+    fn reply_goes_to_reply_to() {
+        let ids = ["me@x.io", "shop@x.io"].map(|email| Identity {
+            id: email.into(),
+            name: String::new(),
+            email: email.into(),
+        });
+        let masked = [mask("m1@x.io")];
+        let go = |from: &[&str], to: &str, reply_to: Vec<Address>| {
+            let mut s = summary(addr(None, "x@y.io"), vec![addr(None, to)], vec![]);
+            let mut b = body("x");
+
+            s.from = from.iter().map(|e| addr(None, e)).collect();
+            b.reply_to = reply_to;
+
+            reply(&s, &b, "me@x.io", false, &ids, &masked)
+        };
+        let bob = addr(None, "bob@y.io");
+        let ra = addr(None, "ra@passmail.com");
+
+        let d = go(&["bob@y.io"], "me@x.io", vec![ra.clone()]);
+        assert_eq!(d.to, vec![ra.clone()]);
+        assert!(d.cc.is_empty());
+
+        assert_eq!(go(&["bob@y.io"], "me@x.io", vec![]).to, vec![bob.clone()]);
+
+        let two = vec![addr(Some("R1"), "r1@lists.io"), addr(None, "r2@lists.io")];
+        assert_eq!(go(&["bob@y.io"], "me@x.io", two.clone()).to, two);
+
+        let messy = vec![
+            addr(None, "ME@X.IO"),
+            addr(None, "Ra@Passmail.com"),
+            ra.clone(),
+        ];
+        assert_eq!(
+            go(&["bob@y.io"], "me@x.io", messy).to,
+            vec![addr(None, "Ra@Passmail.com")]
+        );
+
+        for mine in [
+            vec![addr(None, "me@x.io")],
+            vec![addr(None, "shop@x.io")],
+            vec![addr(None, "m1@x.io")],
+            vec![addr(None, "shop@x.io"), addr(None, "m1@x.io")],
+        ] {
+            assert_eq!(go(&["bob@y.io"], "me@x.io", mine.clone()).to, mine);
+        }
+
+        assert_eq!(
+            go(&["bob@y.io"], "me@x.io", vec![bob.clone()]).to,
+            vec![bob]
+        );
+
+        let carol = addr(None, "carol@z.io");
+        for from in [
+            vec!["me@x.io"],
+            vec!["shop@x.io"],
+            vec!["m1@x.io"],
+            vec!["me@x.io", "shop@x.io"],
+        ] {
+            assert_eq!(
+                go(&from, "carol@z.io", vec![ra.clone()]).to,
+                vec![carol.clone()]
+            );
+        }
+
+        assert_eq!(
+            go(&["me@x.io", "bob@y.io"], "me@x.io", vec![ra.clone()]).to,
+            vec![ra.clone()]
+        );
+        assert_eq!(go(&[], "carol@z.io", vec![ra.clone()]).to, vec![ra]);
+    }
+
+    #[test]
+    fn reply_all_with_reply_to_leaves_out_the_original_sender() {
+        let s = summary(
+            addr(None, "bob@y.io"),
+            vec![
+                addr(None, "me@x.io"),
+                addr(None, "carol@z.io"),
+                addr(None, "BOB@y.io"),
+            ],
+            vec![
+                addr(None, "dave@z.io"),
+                addr(None, "Bob@Y.io"),
+                addr(None, "RA@passmail.com"),
+            ],
+        );
+        let mut b = body("x");
+
+        b.reply_to = vec![addr(None, "ra@passmail.com")];
+
+        let d = reply(&s, &b, "me@x.io", true, &[], &[]);
+        assert_eq!(d.to, vec![addr(None, "ra@passmail.com")]);
+        assert_eq!(
+            d.cc,
+            vec![addr(None, "carol@z.io"), addr(None, "dave@z.io")]
+        );
+
+        let d = reply(&s, &body("x"), "me@x.io", true, &[], &[]);
+        assert_eq!(d.to, vec![addr(None, "bob@y.io")]);
+        assert_eq!(
+            d.cc,
+            vec![
+                addr(None, "carol@z.io"),
+                addr(None, "dave@z.io"),
+                addr(None, "RA@passmail.com")
+            ]
+        );
     }
 
     #[test]

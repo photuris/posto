@@ -359,6 +359,14 @@ pub fn seed(store: &Store) -> Result<()> {
                 in_reply_to: vec![],
                 references: vec![],
                 message_id: vec![message_id],
+                reply_to: if fx.id == "fx-02" {
+                    vec![Address {
+                        name: None,
+                        email: "replies@example.net".into(),
+                    }]
+                } else {
+                    vec![]
+                },
             },
         )?;
     }

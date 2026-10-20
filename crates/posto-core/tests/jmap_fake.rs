@@ -590,6 +590,7 @@ async fn delta_sync_recovers_from_cannot_calculate() -> Result<()> {
             in_reply_to: vec![],
             references: vec![],
             message_id: vec![],
+            reply_to: vec![],
         },
     )?;
 
@@ -1229,6 +1230,74 @@ async fn fetch_body_caches() -> Result<()> {
 }
 
 #[tokio::test]
+async fn body_reads_reply_to() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+
+    for (id, extra) in [
+        (
+            "e1",
+            json!({ "replyTo": [
+                { "name": "R", "email": "ra@passmail.com" },
+                { "name": null, "email": "r2@x.io" },
+            ] }),
+        ),
+        ("e2", json!({ "replyTo": null })),
+        ("e3", json!({})),
+    ] {
+        let mut email = json!({ "id": id, "textBody": [], "htmlBody": [], "bodyValues": {} });
+
+        email
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        reply(
+            &server,
+            "Email/get",
+            json!({ "ids": [id] }),
+            json!({ "state": "s", "list": [email] }),
+            1,
+        )
+        .await;
+    }
+
+    let reply_to = |id: &'static str| {
+        let c = &c;
+
+        async move { c.body(id).await.map(|b| b.unwrap().reply_to) }
+    };
+    let got = reply_to("e1").await?;
+
+    assert_eq!(
+        got.iter()
+            .map(|a| (a.name.as_deref(), a.email.as_str()))
+            .collect::<Vec<_>>(),
+        [(Some("R"), "ra@passmail.com"), (None, "r2@x.io")]
+    );
+    assert!(reply_to("e2").await?.is_empty());
+    assert!(reply_to("e3").await?.is_empty());
+
+    let requests = server.received_requests().await.unwrap();
+    let gets: Vec<Value> = requests
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .filter(|b| b["methodCalls"][0][0] == "Email/get")
+        .collect();
+
+    assert_eq!(gets.len(), 3);
+    for g in gets {
+        assert!(
+            g["methodCalls"][0][1]["properties"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("replyTo"))
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn save_attachment_downloads_and_dedupes() -> Result<()> {
     let server = server().await;
     let c = client(&server).await;
@@ -1626,6 +1695,7 @@ async fn destroy_removes_locally_and_skips_not_destroyed() -> Result<()> {
             in_reply_to: vec![],
             references: vec![],
             message_id: vec![],
+            reply_to: vec![],
         },
     )?;
 

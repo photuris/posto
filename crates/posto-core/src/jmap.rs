@@ -844,7 +844,7 @@ impl Client {
                     "ids": [email_id],
                     "properties": [
                         "textBody", "htmlBody", "bodyValues", "attachments",
-                        "inReplyTo", "references", "messageId",
+                        "inReplyTo", "references", "messageId", "replyTo",
                     ],
                     "fetchHTMLBodyValues": true,
                     "fetchTextBodyValues": true,
@@ -867,6 +867,7 @@ impl Client {
             in_reply_to: strings(&email["inReplyTo"]),
             references: strings(&email["references"]),
             message_id: strings(&email["messageId"]),
+            reply_to: addresses(&email["replyTo"]),
         }))
     }
 

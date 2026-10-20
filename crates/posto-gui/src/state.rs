@@ -84,6 +84,7 @@ pub async fn fake_classify_pass(cfg: &Config, store: &Store) -> Result<ClassifyR
             in_reply_to: Vec::new(),
             references: Vec::new(),
             message_id: Vec::new(),
+            reply_to: Vec::new(),
         });
         let state = state_for(
             &email,

@@ -431,6 +431,7 @@ mod tests {
             in_reply_to: vec![],
             references: vec![],
             message_id: vec![],
+            reply_to: vec![],
         }
     }
 

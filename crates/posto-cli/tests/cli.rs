@@ -409,6 +409,7 @@ fn email_ids_resolve_across_accounts() {
                     in_reply_to: vec![],
                     references: vec![],
                     message_id: vec![],
+                    reply_to: vec![],
                 },
             )
             .unwrap();
@@ -533,6 +534,18 @@ fn email_show_text_mode() {
     assert_eq!(v["summary"]["id"], "fx-01");
     assert!(v["body"]["html"].is_null());
     assert!(!v["body"]["text"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn email_show_prints_reply_to() {
+    let sb = Sandbox::seeded();
+    let v = sb.json(&["email", "show", "fx-02", "--account", "default"]);
+
+    assert_eq!(v["body"]["reply_to"][0]["email"], "replies@example.net");
+
+    let v = sb.json(&["email", "show", "fx-01", "--account", "default"]);
+
+    assert_eq!(v["body"]["reply_to"], json!([]));
 }
 
 #[test]

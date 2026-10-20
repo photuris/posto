@@ -226,7 +226,7 @@ pub enum EmailCmd {
     },
     /// Show one email with its body (fetched and cached if needed); an id found in several accounts needs `--account`.
     ///
-    /// Output: {"summary": email summary (see `email list`), "body": {"text": string|null, "html": string|null, "attachments": [{"blob_id": string, "name": string, "mime": string, "size": number}]}}
+    /// Output: {"summary": email summary (see `email list`), "body": {"text": string|null, "html": string|null, "attachments": [{"blob_id": string, "name": string, "mime": string, "size": number}], "reply_to": [address]}}
     Show {
         /// Email id.
         id: String,
