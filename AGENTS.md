@@ -75,11 +75,20 @@ Read `README.md` first. This file holds what the code does not say.
   the first) with an empty display name. An address that is also an identity
   of the account is the identity, so the GUI leaves it out of the masked
   group. From resolution searches the draft's account first.
+- Reply-To lives on `EmailBody.reply_to`, not on the summary. Proton list
+  and event metadata never carry `ReplyTos` (only the full message does), so
+  `compose::reply` reads it from the fetched body. Rule: own mail goes to the
+  original To; otherwise a non-empty Reply-To wins (mine removed, but never
+  replaced by From, even when every address in it is mine), else From. When
+  Reply-To applied, reply-all also drops every From address from Cc, so a
+  Proton Pass alias reply cannot copy the real sender. Proton Pass itself
+  (alias lists, sending new mail from an alias) is out of reach: the session
+  has no `pass` scope, and the Pass API answers 403 with code 9108.
 
 ## Rules that bit us
 
 - The database is a cache with a schema version (`schema_version` in
-  `sync_state`, now 6). `Store::open` drops and recreates every cache table,
+  `sync_state`, now 7). `Store::open` drops and recreates every cache table,
   cursor and identity when the version is missing or older, and refuses a newer
   one. A table or column change means bumping `SCHEMA_VERSION`; never write a
   data migration for the cache. The one exception is `sender_trays` (sender

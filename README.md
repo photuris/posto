@@ -130,7 +130,12 @@ no "Receipts" in Proton`). Nothing is created in an account on your
 behalf. A reply offers the identities of every account in From, defaulting
 to the address the original was sent to; replying from another account
 sends through that account (the copy lands in its Sent) and still marks the
-original as answered in the account it arrived in. Fastmail masked email
+original as answered in the account it arrived in. A reply goes to the
+original's Reply-To when it has one, and otherwise to its From. With
+Reply-To, Reply all also leaves the original sender out of Cc. This is how
+replies to Proton Pass alias mail work: Pass sets Reply-To to a reverse
+alias, and replying to that address sends the reply out as the alias.
+Fastmail masked email
 addresses work as senders too: when the API token has the Masked Email
 scope, each sync caches the account's enabled and disabled masked
 addresses. A reply to mail that was sent to one of them defaults its From to
