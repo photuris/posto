@@ -2107,7 +2107,12 @@ pub fn open_composer(mut draft: compose::Draft) {
 
     *COMPOSER_TO.write() = format::addresses_text(&draft.to);
     *COMPOSER_CC.write() = format::addresses_text(&draft.cc);
-    *FROM_MENU.write() = false;
+    // A replaced draft takes its focused filter along without a focusout.
+    if *FROM_MENU.peek() {
+        *FROM_MENU.write() = false;
+        focus_root();
+    }
+
     *COMPOSER.write() = Some(draft);
 }
 

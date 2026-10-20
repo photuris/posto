@@ -1191,9 +1191,14 @@ mod tests {
         assert!(COMPOSER.peek().is_none());
 
         *FROM_MENU.write() = true;
+        *TYPING.write() = true;
         dom.in_scope(ScopeId::ROOT, || open_composer(Draft::default()));
 
         assert!(!*FROM_MENU.peek());
+        assert!(
+            !*TYPING.peek(),
+            "the replaced filter's typing state is cleared"
+        );
 
         *FROM_MENU.write() = true;
         *COMPOSER_TO.write() = String::new();
