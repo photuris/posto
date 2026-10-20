@@ -675,6 +675,17 @@ fn sync_without_enabled_account_says_so() {
 }
 
 #[test]
+fn account_masked_emails_lists_the_cache() {
+    let sb = Sandbox::seeded();
+    let masked = sb.json(&["account", "masked-emails"]);
+    let masked = masked.as_array().unwrap();
+
+    assert_eq!(masked.len(), 2);
+    assert_eq!(masked[0]["email"], "clear.hall9729@example.com");
+    assert_eq!(masked[1]["state"], "disabled");
+}
+
+#[test]
 fn account_identities_and_send_from_flag() {
     let sb = Sandbox::seeded();
     let ids = sb.json(&["account", "identities"]);

@@ -207,6 +207,12 @@ pub fn account_identities(account: Option<&str>) -> Result<Value> {
     to_json(&open_store()?.identities(&pick_account(&cfg, account)?.id)?)
 }
 
+pub fn account_masked_emails(account: Option<&str>) -> Result<Value> {
+    let cfg = Config::load()?;
+
+    to_json(&open_store()?.masked_emails(&pick_account(&cfg, account)?.id)?)
+}
+
 pub fn account_set_token(account: Option<&str>) -> Result<Value> {
     let cfg = Config::load()?;
     let picked = pick_account(&cfg, account)?;
@@ -658,7 +664,8 @@ pub async fn email_reply(
     let client = client_for(&cfg, owner).await?;
     let body = fetch_body(&store, Some(&client), &owner.id, id).await?;
     let identities = store.identities(&owner.id)?;
-    let mut draft = compose::reply(&summary, &body, &owner.email, all, &identities);
+    let masked = store.masked_emails(&owner.id)?;
+    let mut draft = compose::reply(&summary, &body, &owner.email, all, &identities, &masked);
 
     draft.body = text + &draft.body;
     draft.markdown = markdown;

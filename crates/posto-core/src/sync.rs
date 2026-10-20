@@ -28,6 +28,8 @@ pub struct SyncReport {
     pub initial: bool,
     /// Sending identities cached afterwards.
     pub identities: usize,
+    /// Masked email addresses cached afterwards.
+    pub masked_emails: usize,
     /// Ids newly added to the inbox-role mailbox by this run's delta; empty
     /// on an initial sync. They are also queued for classification.
     pub inbox_added: Vec<String>,
@@ -178,6 +180,14 @@ async fn sync_one(
             report.identities = identities.len();
         }
         Err(e) => tracing::warn!("identity sync failed: {e}"),
+    }
+
+    match conn.masked_emails().await {
+        Ok(masked) => {
+            store.set_masked_emails(account, &masked)?;
+            report.masked_emails = masked.len();
+        }
+        Err(e) => tracing::warn!("masked email sync failed: {e}"),
     }
 
     Ok(report)

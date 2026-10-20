@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::provider::Identity;
+use crate::provider::{Identity, MaskedEmail};
 
 /// Version of the table layout below; stored in `sync_state` as `schema_version`.
 const SCHEMA_VERSION: u32 = 6;
@@ -899,6 +899,31 @@ impl Store {
         match self.account_state(account, "identities")? {
             Some(json) => serde_json::from_str(&json)
                 .map_err(|_| Error::Other("corrupt identity cache".into())),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Replaces the cached masked email addresses of `account`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn set_masked_emails(&self, account: &str, masked: &[MaskedEmail]) -> Result<()> {
+        let json = serde_json::to_string(masked).map_err(|e| Error::Other(e.to_string()))?;
+
+        self.set_account_state(account, "masked_emails", &json)
+    }
+
+    /// The cached masked email addresses of `account`; empty before its first
+    /// sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure or when the cache is corrupt.
+    pub fn masked_emails(&self, account: &str) -> Result<Vec<MaskedEmail>> {
+        match self.account_state(account, "masked_emails")? {
+            Some(json) => serde_json::from_str(&json)
+                .map_err(|_| Error::Other("corrupt masked email cache".into())),
             None => Ok(Vec::new()),
         }
     }
@@ -2165,6 +2190,36 @@ mod tests {
             mailbox_ids: mailboxes.iter().map(|s| s.to_string()).collect(),
             keywords: vec![],
         }
+    }
+
+    /// Builds a masked email for tests.
+    fn masked(id: &str, email: &str, state: &str, at: Option<&str>) -> MaskedEmail {
+        MaskedEmail {
+            id: id.into(),
+            email: email.into(),
+            description: format!("for {id}"),
+            for_domain: "https://shop.example".into(),
+            state: state.into(),
+            last_message_at: at.map(String::from),
+        }
+    }
+
+    #[test]
+    fn masked_emails_round_trip() {
+        let store = Store::open_memory().unwrap();
+        let a = [
+            masked("m1", "one@x.io", "enabled", Some("2026-10-01T09:00:00Z")),
+            masked("m2", "two@x.io", "disabled", None),
+        ];
+        let b = [masked("m3", "three@x.io", "enabled", None)];
+
+        assert!(store.masked_emails("a").unwrap().is_empty());
+
+        store.set_masked_emails("a", &a).unwrap();
+        store.set_masked_emails("b", &b).unwrap();
+
+        assert_eq!(store.masked_emails("a").unwrap(), a);
+        assert_eq!(store.masked_emails("b").unwrap(), b);
     }
 
     /// Builds a minimal email of account `a` for tests.

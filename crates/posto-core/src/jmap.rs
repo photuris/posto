@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::compose::Draft;
 use crate::error::{Error, Result};
-use crate::provider::{Change, Delta, DeltaPage, Identity, Updated};
+use crate::provider::{Change, Delta, DeltaPage, Identity, MaskedEmail, Updated};
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 use crate::sync::get_state;
 
@@ -17,6 +17,10 @@ const USING: [&str; 3] = [
     "urn:ietf:params:jmap:mail",
     "urn:ietf:params:jmap:submission",
 ];
+
+/// Capability of Fastmail's masked email methods; sent in `using` only for
+/// the one call that needs it, and only when the session advertises it.
+const MASKED: &str = "https://www.fastmail.com/dev/maskedemail";
 
 /// Capability key whose primary account is the mail account.
 const MAIL: &str = "urn:ietf:params:jmap:mail";
@@ -69,6 +73,9 @@ pub struct Session {
     /// Login name.
     #[serde(default)]
     pub username: String,
+    /// The session's top-level `capabilities`, keyed by capability URN.
+    #[serde(default)]
+    pub capabilities: Map<String, Value>,
 }
 
 /// An authenticated JMAP connection.
@@ -174,7 +181,16 @@ impl Client {
         &self,
         calls: Vec<(String, Value, String)>,
     ) -> Result<Vec<(String, Value, String)>> {
-        let body = json!({ "using": USING, "methodCalls": calls });
+        self.call_using(&USING, calls).await
+    }
+
+    /// [`Client::call`] with an explicit `using` list.
+    async fn call_using(
+        &self,
+        using: &[&str],
+        calls: Vec<(String, Value, String)>,
+    ) -> Result<Vec<(String, Value, String)>> {
+        let body = json!({ "using": using, "methodCalls": calls });
         let resp = self
             .http
             .post(&self.session.api_url)
@@ -197,7 +213,14 @@ impl Client {
     /// Returns [`Error::Jmap`] with `type: description` when the server
     /// answers with an `error` response, plus everything [`Client::call`] does.
     pub async fn call_one(&self, name: &str, args: Value) -> Result<Value> {
-        let responses = self.call(vec![(name.into(), args, "0".into())]).await?;
+        self.call_one_using(&USING, name, args).await
+    }
+
+    /// [`Client::call_one`] with an explicit `using` list.
+    async fn call_one_using(&self, using: &[&str], name: &str, args: Value) -> Result<Value> {
+        let responses = self
+            .call_using(using, vec![(name.into(), args, "0".into())])
+            .await?;
         let (rname, rargs, _) = responses
             .into_iter()
             .next()
@@ -294,6 +317,33 @@ impl Client {
             .map_err(|_| Error::Jmap("malformed identities".into()))
     }
 
+    /// Lists the account's masked email addresses, newest activity first.
+    ///
+    /// Returns an empty list without a request when the session does not
+    /// advertise the masked email capability: an unknown capability in `using`
+    /// would fail the whole request on such a server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Jmap`] when the server answers with an `error` or the
+    /// list is malformed, plus everything [`Client::call`] does.
+    pub async fn masked_emails(&self) -> Result<Vec<MaskedEmail>> {
+        if !self.session.capabilities.contains_key(MASKED) {
+            return Ok(Vec::new());
+        }
+
+        let using = [USING.as_slice(), &[MASKED]].concat();
+        let r = self
+            .call_one_using(
+                &using,
+                "MaskedEmail/get",
+                json!({ "accountId": self.session.account_id, "ids": null }),
+            )
+            .await?;
+
+        masked_from(&r["list"])
+    }
+
     /// Creates a top-level mailbox called `name`.
     ///
     /// The returned [`Mailbox`] is rebuilt from the request and the server's
@@ -339,6 +389,45 @@ impl Client {
             unread: created["unreadEmails"].as_i64().unwrap_or(0),
         })
     }
+}
+
+/// Maps the `list` of a `MaskedEmail/get` response to the masked emails worth
+/// keeping: `enabled` and `disabled` ones, newest `lastMessageAt` first (none
+/// last), then by lower-cased address.
+fn masked_from(list: &Value) -> Result<Vec<MaskedEmail>> {
+    // Static message: the server's values never go into the error.
+    let malformed = || Error::Jmap("malformed masked emails".into());
+    let mut kept = Vec::new();
+
+    for v in list.as_array().ok_or_else(malformed)? {
+        let text = |key: &str| v[key].as_str().map(String::from);
+        let (Some(id), Some(email), Some(state)) = (text("id"), text("email"), text("state"))
+        else {
+            return Err(malformed());
+        };
+
+        if state != "enabled" && state != "disabled" {
+            continue;
+        }
+
+        kept.push(MaskedEmail {
+            id,
+            email,
+            description: text("description").unwrap_or_default(),
+            for_domain: text("forDomain").unwrap_or_default(),
+            state,
+            last_message_at: text("lastMessageAt"),
+        });
+    }
+
+    // `None` sorts before `Some`, so the descending order puts it last.
+    kept.sort_by(|a, b| {
+        b.last_message_at
+            .cmp(&a.last_message_at)
+            .then_with(|| a.email.to_lowercase().cmp(&b.email.to_lowercase()))
+    });
+
+    Ok(kept)
 }
 
 /// Ids from a JSON string array; anything else yields an empty list.
@@ -957,5 +1046,43 @@ mod tests {
             email_from("a", &v).unwrap().preview,
             "🚨 Joshua, polls close"
         );
+    }
+
+    #[test]
+    fn masked_emails_keep_enabled_and_disabled_newest_first() {
+        let day = |d: u8| format!("2026-10-0{d}T00:00:00Z");
+        let list = json!([
+            { "id": "1", "email": "p@x.io", "state": "pending", "lastMessageAt": day(9) },
+            { "id": "2", "email": "x@x.io", "state": "deleted", "lastMessageAt": day(9) },
+            { "id": "3", "email": "B@x.io", "state": "enabled", "lastMessageAt": day(2) },
+            { "id": "4", "email": "a@x.io", "state": "enabled", "lastMessageAt": day(2) },
+            { "id": "5", "email": "D@x.io", "state": "enabled",
+              "description": null, "forDomain": null },
+            { "id": "6", "email": "c@x.io", "state": "enabled", "lastMessageAt": null },
+            { "id": "7", "email": "e@x.io", "state": "disabled", "lastMessageAt": day(3) },
+        ]);
+
+        let got = masked_from(&list).unwrap();
+        let emails: Vec<&str> = got.iter().map(|m| m.email.as_str()).collect();
+
+        assert_eq!(emails, ["e@x.io", "a@x.io", "B@x.io", "c@x.io", "D@x.io"]);
+
+        let d = &got[4];
+
+        assert_eq!(d.description, "");
+        assert_eq!(d.for_domain, "");
+        assert_eq!(d.last_message_at, None);
+
+        let bad = json!([
+            { "id": "1", "state": "enabled", "description": "SENTINEL-7f3a" },
+        ]);
+        let err = masked_from(&bad).unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Jmap(m) if m == "malformed masked emails"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("SENTINEL-7f3a"), "{err}");
+        assert!(!format!("{err:?}").contains("SENTINEL-7f3a"), "{err:?}");
     }
 }

@@ -17,6 +17,16 @@ use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 const SESSION: &str = include_str!("fixtures/session.json");
 
+/// The masked email capability, as the session advertises it.
+const MASKED: &str = "https://www.fastmail.com/dev/maskedemail";
+
+/// The `using` of every request that does not need the masked capability.
+const USING: [&str; 3] = [
+    "urn:ietf:params:jmap:core",
+    "urn:ietf:params:jmap:mail",
+    "urn:ietf:params:jmap:submission",
+];
+
 /// Matches `POST /api` requests whose first call has this name and whose
 /// arguments contain every key/value of `args`.
 struct Call {
@@ -42,13 +52,29 @@ impl Match for Call {
 }
 
 async fn server() -> MockServer {
+    server_with(SESSION.to_string()).await
+}
+
+/// A server whose session also advertises the masked email capability.
+async fn masked_server() -> MockServer {
+    let session = SESSION.replace(
+        r#""urn:ietf:params:jmap:submission": {}"#,
+        &format!(r#""urn:ietf:params:jmap:submission": {{}}, "{MASKED}": {{}}"#),
+    );
+
+    assert_ne!(session, SESSION, "the fixture changed shape");
+
+    server_with(session).await
+}
+
+async fn server_with(session: String) -> MockServer {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
         .and(path("/session"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_string(SESSION.replace("{{base}}", &server.uri()))
+                .set_body_string(session.replace("{{base}}", &server.uri()))
                 .insert_header("content-type", "application/json"),
         )
         .mount(&server)
@@ -347,6 +373,127 @@ async fn initial_sync_stores_identities() -> Result<()> {
     assert!(store.identities("a")?.is_empty());
 
     Ok(())
+}
+
+#[tokio::test]
+async fn masked_emails_need_the_capability() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+
+    reply(
+        &server,
+        "MaskedEmail/get",
+        json!({}),
+        json!({ "list": [] }),
+        0,
+    )
+    .await;
+
+    assert!(c.masked_emails().await?.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_stores_masked_emails_with_the_capability() -> Result<()> {
+    let server = masked_server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+    let dir = tempfile::tempdir()?;
+
+    mount_empty_account(&server).await;
+    reply(
+        &server,
+        "Identity/get",
+        json!({ "ids": null }),
+        json!({ "list": [
+            { "id": "id-1", "name": "Me", "email": "me@example.com" },
+            { "id": "id-2", "name": "Shop", "email": "shop@example.com" },
+        ] }),
+        1,
+    )
+    .await;
+    reply(
+        &server,
+        "MaskedEmail/get",
+        json!({ "accountId": "acc1", "ids": null }),
+        json!({ "list": [
+            { "id": "m1", "email": "old.owl@example.com", "state": "enabled",
+              "description": "Forum", "forDomain": "https://forum.example",
+              "lastMessageAt": "2026-09-01T00:00:00Z" },
+            { "id": "m2", "email": "gone@example.com", "state": "deleted" },
+            { "id": "m3", "email": "new.fox@example.com", "state": "disabled",
+              "lastMessageAt": "2026-10-01T00:00:00Z" },
+        ] }),
+        1,
+    )
+    .await;
+
+    let report = sync_account(&dir.path().join("sync.lock"), &cfg_a(), "a", &store, &c).await?;
+    let masked = store.masked_emails("a")?;
+    let emails: Vec<&str> = masked.iter().map(|m| m.email.as_str()).collect();
+
+    assert_eq!(report.identities, 2);
+    assert_eq!(store.identities("a")?.len(), 2);
+    assert_eq!(emails, ["new.fox@example.com", "old.owl@example.com"]);
+    assert_eq!(report.masked_emails, 2);
+    assert_eq!(masked[1].description, "Forum");
+    assert_eq!(masked[1].for_domain, "https://forum.example");
+
+    let bodies: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| serde_json::from_slice(&r.body).ok())
+        .collect();
+    let with_call = |name: &str| {
+        bodies
+            .iter()
+            .find(|b| b["methodCalls"][0][0] == name)
+            .unwrap_or_else(|| panic!("no {name} request recorded"))
+    };
+    let mut masked_using = USING.to_vec();
+    masked_using.push(MASKED);
+
+    assert_eq!(with_call("Identity/get")["using"], json!(USING));
+    assert_eq!(with_call("MaskedEmail/get")["using"], json!(masked_using));
+    assert_eq!(
+        with_call("MaskedEmail/get")["methodCalls"][0][1],
+        json!({ "accountId": "acc1", "ids": null })
+    );
+
+    let carrying = bodies
+        .iter()
+        .filter(|b| {
+            b["using"]
+                .as_array()
+                .is_some_and(|u| u.iter().any(|c| c == MASKED))
+        })
+        .count();
+
+    assert_eq!(carrying, 1, "only MaskedEmail/get may name the capability");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn masked_email_method_errors_are_redacted() {
+    let server = masked_server().await;
+    let c = client(&server).await;
+
+    reply_raw(
+        &server,
+        json!([["error", { "type": "forbidden", "description": "token tok leaked" }, "0"]]),
+    )
+    .await;
+
+    let err = c.masked_emails().await.unwrap_err();
+
+    assert!(
+        matches!(&err, Error::Jmap(m) if m.contains("<redacted>") && !m.contains("tok")),
+        "{err}"
+    );
 }
 
 #[tokio::test]

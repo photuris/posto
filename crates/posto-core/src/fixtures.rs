@@ -1,7 +1,7 @@
 //! Deterministic sample data for tests and the GUI's UI test mode.
 
 use crate::error::Result;
-use crate::provider::Identity;
+use crate::provider::{Identity, MaskedEmail};
 use crate::store::{Address, Attachment, Classified, EmailBody, EmailSummary, Mailbox, Store};
 
 /// Account the fixtures belong to: the id of a fresh config's only account.
@@ -280,6 +280,27 @@ pub fn seed(store: &Store) -> Result<()> {
                 id: "id-2".into(),
                 name: "Mikkel (shop)".into(),
                 email: SHOP.into(),
+            },
+        ],
+    )?;
+    store.set_masked_emails(
+        ACCOUNT,
+        &[
+            MaskedEmail {
+                id: "me-1".into(),
+                email: "clear.hall9729@example.com".into(),
+                description: "Hardware store".into(),
+                for_domain: "https://shop.example".into(),
+                state: "enabled".into(),
+                last_message_at: Some("2026-10-01T09:00:00Z".into()),
+            },
+            MaskedEmail {
+                id: "me-2".into(),
+                email: "quiet.owl1234@example.com".into(),
+                description: "Old forum".into(),
+                for_domain: String::new(),
+                state: "disabled".into(),
+                last_message_at: None,
             },
         ],
     )?;

@@ -6,7 +6,7 @@ use crate::actions::{self, Action};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::html;
-use crate::provider::{Connection, Identity};
+use crate::provider::{Connection, Identity, MaskedEmail};
 use crate::store::{Address, EmailBody, EmailSummary, Store};
 
 /// A message being composed.
@@ -30,8 +30,8 @@ pub struct Draft {
     /// `account_id`. Differs when a reply is sent from another account.
     #[serde(default)]
     pub reply_to_account_id: Option<String>,
-    /// Sender; must be one of the account's identities. `None` means the
-    /// configured account address.
+    /// Sender; must be one of the account's identities or masked emails.
+    /// `None` means the configured account address.
     #[serde(default)]
     pub from: Option<Address>,
 }
@@ -81,39 +81,77 @@ fn parse_address(part: &str) -> Option<Address> {
     })
 }
 
-/// The identity a reply to `summary` should come from: the first one the
-/// original was addressed to, then one it was copied to, then the one
-/// matching `me`.
-pub fn pick_identity(identities: &[Identity], summary: &EmailSummary, me: &str) -> Option<Address> {
-    let addressed = |list: &[Address]| {
+/// The sender address of `identity`: its display name, if it has one.
+fn identity_address(identity: &Identity) -> Address {
+    Address {
+        name: (!identity.name.is_empty()).then(|| identity.name.clone()),
+        email: identity.email.clone(),
+    }
+}
+
+/// The sender a reply to `summary` should come from: an identity the original
+/// was addressed to, then a masked address it was addressed to, then the same
+/// two among its Cc recipients, then the identity matching `me`. A masked
+/// address carries no display name. Addresses compare ASCII-case-insensitively.
+pub fn pick_identity(
+    identities: &[Identity],
+    masked: &[MaskedEmail],
+    summary: &EmailSummary,
+    me: &str,
+) -> Option<Address> {
+    let listed =
+        |list: &[Address], email: &str| list.iter().any(|a| a.email.eq_ignore_ascii_case(email));
+    let identity_in = |list: &[Address]| {
         identities
             .iter()
-            .find(|i| list.iter().any(|a| a.email.eq_ignore_ascii_case(&i.email)))
+            .find(|i| listed(list, &i.email))
+            .map(identity_address)
+    };
+    let masked_in = |list: &[Address]| {
+        masked
+            .iter()
+            .find(|m| listed(list, &m.email))
+            .map(|m| Address {
+                name: None,
+                email: m.email.clone(),
+            })
     };
 
-    addressed(&summary.to)
-        .or_else(|| addressed(&summary.cc))
-        .or_else(|| identities.iter().find(|i| i.email.eq_ignore_ascii_case(me)))
-        .map(|i| Address {
-            name: (!i.name.is_empty()).then(|| i.name.clone()),
-            email: i.email.clone(),
+    identity_in(&summary.to)
+        .or_else(|| masked_in(&summary.to))
+        .or_else(|| identity_in(&summary.cc))
+        .or_else(|| masked_in(&summary.cc))
+        .or_else(|| {
+            identities
+                .iter()
+                .find(|i| i.email.eq_ignore_ascii_case(me))
+                .map(identity_address)
         })
 }
 
 /// Builds a reply to `summary`, sent from the account the original arrived in.
-/// `me` is the sender's own address; `identities` are that account's sending
-/// identities.
+/// `me` is the sender's own address; `identities` and `masked` are that
+/// account's sending identities and masked email addresses.
 pub fn reply(
     summary: &EmailSummary,
     body: &EmailBody,
     me: &str,
     reply_all: bool,
     identities: &[Identity],
+    masked: &[MaskedEmail],
 ) -> Draft {
-    let is_me = |a: &Address| a.email.eq_ignore_ascii_case(me);
+    let is_mine = |a: &Address| {
+        a.email.eq_ignore_ascii_case(me)
+            || identities
+                .iter()
+                .any(|i| i.email.eq_ignore_ascii_case(&a.email))
+            || masked
+                .iter()
+                .any(|m| m.email.eq_ignore_ascii_case(&a.email))
+    };
 
     // Own sent mail only when every author is me; a co-author stays a recipient.
-    let to: Vec<Address> = if !summary.from.is_empty() && summary.from.iter().all(is_me) {
+    let to: Vec<Address> = if !summary.from.is_empty() && summary.from.iter().all(is_mine) {
         summary.to.clone()
     } else {
         summary.from.clone()
@@ -123,7 +161,7 @@ pub fn reply(
     if reply_all {
         for a in summary.to.iter().chain(&summary.cc) {
             let known = |x: &Address| x.email.eq_ignore_ascii_case(&a.email);
-            if !is_me(a) && !to.iter().any(known) && !cc.iter().any(known) {
+            if !is_mine(a) && !to.iter().any(known) && !cc.iter().any(known) {
                 cc.push(a.clone());
             }
         }
@@ -155,7 +193,7 @@ pub fn reply(
         references,
         reply_to_email_id: Some(summary.id.clone()),
         reply_to_account_id: Some(summary.account_id.clone()),
-        from: pick_identity(identities, summary, me),
+        from: pick_identity(identities, masked, summary, me),
     }
 }
 
@@ -212,6 +250,47 @@ pub fn render(draft: &Draft) -> (String, String) {
     (draft.body.clone(), html)
 }
 
+/// The identity to send as: the one matching `from`, else (for a masked
+/// address of the account) the account's own identity with `from`'s address
+/// and no display name. Without `from`, the identity matching `me`, else the
+/// first one. Masked emails are fetched only when `from` is no identity.
+async fn sender(
+    client: &Connection,
+    identities: &[Identity],
+    from: Option<&Address>,
+    me: &str,
+) -> Result<Identity> {
+    let base = || {
+        identities
+            .iter()
+            .find(|i| i.email.eq_ignore_ascii_case(me))
+            .or(identities.first())
+            .ok_or_else(|| Error::NotConfigured("no sending identity".into()))
+    };
+    let Some(from) = from else {
+        return base().cloned();
+    };
+
+    if let Some(identity) = identities
+        .iter()
+        .find(|i| i.email.eq_ignore_ascii_case(&from.email))
+    {
+        return Ok(identity.clone());
+    }
+
+    let masked = client.masked_emails().await?;
+    let masked = masked
+        .iter()
+        .find(|m| m.email.eq_ignore_ascii_case(&from.email))
+        .ok_or_else(|| Error::NotConfigured(format!("no identity for {}", from.email)))?;
+
+    Ok(Identity {
+        id: base()?.id.clone(),
+        name: String::new(),
+        email: masked.email.clone(),
+    })
+}
+
 /// Sends `draft` through `client` and files it under Sent. Marks the
 /// replied-to email `$answered` when it lives in `account` (a reply sent from
 /// another account leaves the original to the caller). Returns the new email id.
@@ -239,20 +318,10 @@ pub async fn send(
         .email
         .as_str();
     let identities = client.identities().await?;
-    let identity = match &draft.from {
-        Some(from) => identities
-            .iter()
-            .find(|i| i.email.eq_ignore_ascii_case(&from.email))
-            .ok_or_else(|| Error::NotConfigured(format!("no identity for {}", from.email)))?,
-        None => identities
-            .iter()
-            .find(|i| i.email.eq_ignore_ascii_case(me))
-            .or(identities.first())
-            .ok_or_else(|| Error::NotConfigured("no sending identity".into()))?,
-    };
+    let identity = sender(client, &identities, draft.from.as_ref(), me).await?;
     let (text, html) = render(draft);
     let id = client
-        .send(store, account, identity, draft, &text, &html)
+        .send(store, account, &identity, draft, &text, &html)
         .await?;
 
     if let Some(reply_to) = &draft.reply_to_email_id
@@ -323,8 +392,9 @@ mod tests {
             name: String::new(),
             email: email.into(),
         });
-        let pick =
-            |s: &EmailSummary, ids: &[Identity]| pick_identity(ids, s, "me@x.io").map(|a| a.email);
+        let pick = |s: &EmailSummary, ids: &[Identity]| {
+            pick_identity(ids, &[], s, "me@x.io").map(|a| a.email)
+        };
         let from = addr(None, "bob@y.io");
         let other = addr(None, "other@y.io");
         let shop = addr(None, "SHOP@x.io");
@@ -338,6 +408,67 @@ mod tests {
         let s = summary(from, vec![other], vec![]);
         assert_eq!(pick(&s, &ids).as_deref(), Some("me@x.io"));
         assert_eq!(pick(&s, &[]), None);
+    }
+
+    fn mask(email: &str) -> MaskedEmail {
+        MaskedEmail {
+            id: email.into(),
+            email: email.into(),
+            description: String::new(),
+            for_domain: String::new(),
+            state: "enabled".into(),
+            last_message_at: None,
+        }
+    }
+
+    #[test]
+    fn pick_identity_prefers_a_masked_address_the_mail_was_sent_to() {
+        let ids = [Identity {
+            id: "i1".into(),
+            name: String::new(),
+            email: "me@x.io".into(),
+        }];
+        let masked = [mask("m1@x.io"), mask("m2@x.io")];
+        let pick = |to: &str, cc: &str| {
+            let list = |e: &str| {
+                if e.is_empty() {
+                    vec![]
+                } else {
+                    vec![addr(None, e)]
+                }
+            };
+            let s = summary(addr(None, "bob@y.io"), list(to), list(cc));
+
+            pick_identity(&ids, &masked, &s, "me@x.io")
+        };
+
+        assert_eq!(pick("M1@X.IO", ""), Some(addr(None, "m1@x.io")));
+        assert_eq!(pick("me@x.io", "m2@x.io"), Some(addr(None, "me@x.io")));
+        assert_eq!(pick("m2@x.io", "me@x.io"), Some(addr(None, "m2@x.io")));
+        assert_eq!(pick("", "M2@x.io"), Some(addr(None, "m2@x.io")));
+        assert_eq!(pick("stranger@y.io", ""), Some(addr(None, "me@x.io")));
+    }
+
+    #[test]
+    fn reply_all_leaves_out_my_masked_address() {
+        let masked = [mask("m1@x.io")];
+        let s = summary(
+            addr(None, "bob@y.io"),
+            vec![addr(None, "m1@x.io"), addr(None, "carol@z.io")],
+            vec![addr(None, "me@x.io")],
+        );
+        let d = reply(&s, &body("x"), "me@x.io", true, &[], &masked);
+
+        assert_eq!(d.to, vec![addr(None, "bob@y.io")]);
+        assert_eq!(d.cc, vec![addr(None, "carol@z.io")]);
+        assert_eq!(d.from, Some(addr(None, "m1@x.io")));
+
+        let own = summary(addr(None, "M1@x.io"), vec![addr(None, "bob@y.io")], vec![]);
+
+        assert_eq!(
+            reply(&own, &body("x"), "me@x.io", false, &[], &masked).to,
+            vec![addr(None, "bob@y.io")]
+        );
     }
 
     #[test]
@@ -358,7 +489,7 @@ mod tests {
     fn reply_quotes_and_addresses() {
         let from = addr(Some("Bob"), "bob@y.io");
         let s = summary(from.clone(), vec![addr(None, "me@x.io")], vec![]);
-        let d = reply(&s, &body("hello\nworld"), "me@x.io", false, &[]);
+        let d = reply(&s, &body("hello\nworld"), "me@x.io", false, &[], &[]);
 
         assert_eq!(d.subject, "Re: Lunch");
         assert_eq!(d.to, vec![from]);
@@ -379,14 +510,14 @@ mod tests {
         let mut again = s.clone();
         again.subject = "RE: Lunch".into();
         assert_eq!(
-            reply(&again, &body("x"), "me@x.io", false, &[]).subject,
+            reply(&again, &body("x"), "me@x.io", false, &[], &[]).subject,
             "RE: Lunch"
         );
 
         // Replying to my own mail goes to the original recipients.
         let mine = summary(addr(None, "ME@x.io"), vec![addr(None, "bob@y.io")], vec![]);
         assert_eq!(
-            reply(&mine, &body("x"), "me@x.io", false, &[]).to,
+            reply(&mine, &body("x"), "me@x.io", false, &[], &[]).to,
             vec![addr(None, "bob@y.io")]
         );
     }
@@ -400,14 +531,14 @@ mod tests {
         );
         s.from.push(addr(None, "bob@x.io"));
 
-        let d = reply(&s, &body("x"), "me@x.io", false, &[]);
+        let d = reply(&s, &body("x"), "me@x.io", false, &[], &[]);
 
         assert_eq!(d.to, s.from, "a co-author must stay a recipient");
 
         s.from = vec![addr(None, "me@x.io"), addr(None, "ME@x.io")];
 
         assert_eq!(
-            reply(&s, &body("x"), "me@x.io", false, &[]).to,
+            reply(&s, &body("x"), "me@x.io", false, &[], &[]).to,
             s.to,
             "all authors are me: reply to the recipients"
         );
@@ -427,7 +558,7 @@ mod tests {
                 addr(None, "bob@y.io"),
             ],
         );
-        let d = reply(&s, &body("x"), "me@x.io", true, &[]);
+        let d = reply(&s, &body("x"), "me@x.io", true, &[], &[]);
         assert_eq!(d.to, vec![addr(None, "bob@y.io")]);
         assert_eq!(d.cc, vec![carol, dave]);
     }

@@ -162,6 +162,10 @@ pub enum AccountCmd {
     ///
     /// Output: [{"id": string, "name": string, "email": string}]
     Identities,
+    /// List the cached masked email addresses of --account (default: the first enabled account).
+    ///
+    /// Output: [{"id": string, "email": string, "description": string, "for_domain": string, "state": string, "last_message_at": string|null}]
+    MaskedEmails,
 }
 
 #[derive(Subcommand)]
@@ -170,7 +174,7 @@ pub enum SyncCmd {
     ///
     /// A failing account is reported in its own `error` field and does not stop the others; the command fails only when it syncs a single account that fails or when no account has a token.
     ///
-    /// Output: [{"account_id": string, "mailboxes": number, "emails_added": number, "emails_updated": number, "emails_removed": number, "initial": bool, "identities": number, "inbox_added": [string], "error": string|null}]
+    /// Output: [{"account_id": string, "mailboxes": number, "emails_added": number, "emails_updated": number, "emails_removed": number, "initial": bool, "identities": number, "masked_emails": number, "inbox_added": [string], "error": string|null}]
     Run,
 }
 

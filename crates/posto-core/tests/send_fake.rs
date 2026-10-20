@@ -12,14 +12,33 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SESSION: &str = include_str!("fixtures/session.json");
 
+/// The masked email capability, as the session advertises it.
+const MASKED: &str = "https://www.fastmail.com/dev/maskedemail";
+
 async fn server() -> MockServer {
+    server_with(SESSION.to_string()).await
+}
+
+/// A server whose session also advertises the masked email capability.
+async fn masked_server() -> MockServer {
+    let session = SESSION.replace(
+        r#""urn:ietf:params:jmap:submission": {}"#,
+        &format!(r#""urn:ietf:params:jmap:submission": {{}}, "{MASKED}": {{}}"#),
+    );
+
+    assert_ne!(session, SESSION, "the fixture changed shape");
+
+    server_with(session).await
+}
+
+async fn server_with(session: String) -> MockServer {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
         .and(path("/session"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_string(SESSION.replace("{{base}}", &server.uri()))
+                .set_body_string(session.replace("{{base}}", &server.uri()))
                 .insert_header("content-type", "application/json"),
         )
         .mount(&server)
@@ -451,4 +470,187 @@ async fn send_reports_move_to_sent_failure() {
             "{err:?}"
         );
     }
+}
+
+/// Mounts the MaskedEmail/get reply.
+async fn masked(server: &MockServer, list: Value, times: u64) {
+    mount(
+        server,
+        "MaskedEmail/get",
+        json!([["MaskedEmail/get", { "list": list }, "0"]]),
+        times,
+    )
+    .await;
+}
+
+/// Mounts the reply of a send that goes through.
+async fn submission(server: &MockServer, times: u64) {
+    mount(
+        server,
+        "EmailSubmission/set",
+        submit_responses(json!({ "updated": { "e-new": null } })),
+        times,
+    )
+    .await;
+}
+
+/// The recorded send request: its `identityId` and the Email/set `from`.
+async fn sent_as(server: &MockServer) -> (Value, Value) {
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .find(|b| b["methodCalls"][1][0] == "EmailSubmission/set")
+        .expect("no send request recorded");
+    let calls = &body["methodCalls"];
+
+    (
+        calls[1][1]["create"]["s"]["identityId"].clone(),
+        calls[0][1]["create"]["d"]["from"].clone(),
+    )
+}
+
+/// A draft from `email`.
+fn draft_from(email: &str) -> Draft {
+    Draft {
+        from: Some(Address {
+            name: None,
+            email: email.into(),
+        }),
+        ..draft()
+    }
+}
+
+#[tokio::test]
+async fn send_from_a_masked_address_uses_the_account_identity() {
+    let server = masked_server().await;
+    identities(&server, two_identities()).await;
+    masked(
+        &server,
+        json!([{ "id": "m1", "email": "mask@example.com", "state": "enabled" }]),
+        1,
+    )
+    .await;
+    submission(&server, 1).await;
+
+    send(
+        &cfg(),
+        &store(),
+        &client(&server).await,
+        "a",
+        &draft_from("mask@example.com"),
+    )
+    .await
+    .unwrap();
+
+    let (identity_id, from) = sent_as(&server).await;
+
+    assert_eq!(identity_id, "i2");
+    assert_eq!(from, json!([{ "name": "", "email": "mask@example.com" }]));
+}
+
+#[tokio::test]
+async fn send_from_an_identity_skips_masked_emails() {
+    let server = masked_server().await;
+    identities(&server, two_identities()).await;
+    masked(&server, json!([]), 0).await;
+    submission(&server, 1).await;
+
+    send(
+        &cfg(),
+        &store(),
+        &client(&server).await,
+        "a",
+        &draft_from("other@example.com"),
+    )
+    .await
+    .unwrap();
+
+    let (identity_id, from) = sent_as(&server).await;
+
+    assert_eq!(identity_id, "i1");
+    assert_eq!(from[0]["name"], "Other");
+}
+
+#[tokio::test]
+async fn send_from_a_masked_address_falls_back_to_the_first_identity() {
+    let server = masked_server().await;
+    identities(
+        &server,
+        json!([{ "id": "i1", "name": "Private Name", "email": "other@example.com" }]),
+    )
+    .await;
+    masked(
+        &server,
+        json!([{ "id": "m1", "email": "mask@example.com", "state": "disabled" }]),
+        1,
+    )
+    .await;
+    submission(&server, 1).await;
+
+    send(
+        &cfg(),
+        &store(),
+        &client(&server).await,
+        "a",
+        &draft_from("mask@example.com"),
+    )
+    .await
+    .unwrap();
+
+    let (identity_id, from) = sent_as(&server).await;
+
+    assert_eq!(identity_id, "i1");
+    assert_eq!(from, json!([{ "name": "", "email": "mask@example.com" }]));
+}
+
+#[tokio::test]
+async fn send_from_a_masked_address_needs_an_identity() {
+    let server = masked_server().await;
+    identities(&server, json!([])).await;
+    masked(
+        &server,
+        json!([{ "id": "m1", "email": "mask@example.com", "state": "enabled" }]),
+        1,
+    )
+    .await;
+    submission(&server, 0).await;
+
+    let err = send(
+        &cfg(),
+        &store(),
+        &client(&server).await,
+        "a",
+        &draft_from("mask@example.com"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(&err, Error::NotConfigured(m) if m == "no sending identity"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn send_from_a_masked_address_without_the_capability_is_refused() {
+    let server = server().await;
+    identities(&server, two_identities()).await;
+    masked(&server, json!([]), 0).await;
+    submission(&server, 0).await;
+
+    let err = send(
+        &cfg(),
+        &store(),
+        &client(&server).await,
+        "a",
+        &draft_from("mask@example.com"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(&err, Error::NotConfigured(m) if m.starts_with("no identity for")),
+        "{err}"
+    );
 }

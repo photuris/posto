@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use dioxus::prelude::*;
 use posto_core::classify::{self, Classifier, ClassifyReport, JEV_BASE_URL, JevClient, Tray};
 use posto_core::config::{Account, Config, Secrets, UiConfig};
-use posto_core::provider::{Connection, Identity};
+use posto_core::provider::{Connection, Identity, MaskedEmail};
 use posto_core::shortcuts::{Action, Keymap};
 use posto_core::store::{
     Attachment, EmailBody, EmailSummary, ListQuery, Mailbox, MailboxGroup, MsgRef, mailbox_groups,
@@ -212,6 +212,8 @@ pub static EXPANDED: GlobalSignal<BTreeSet<String>> = Signal::global(BTreeSet::n
 /// Each account's sending identities, as last synced.
 pub static IDENTITIES: GlobalSignal<BTreeMap<String, Vec<Identity>>> =
     Signal::global(BTreeMap::new);
+/// Each account's masked email addresses, as last synced.
+pub static MASKED: GlobalSignal<BTreeMap<String, Vec<MaskedEmail>>> = Signal::global(BTreeMap::new);
 pub static EMAILS: GlobalSignal<Vec<EmailSummary>> = Signal::global(Vec::new);
 /// The selected messages, as row keys (`<account>/<id>`); the focused one is
 /// shown in the reader.
@@ -1071,10 +1073,11 @@ fn refresh_row(r: &MsgRef) {
     }
 }
 
-/// Re-reads every account's cached sending identities.
+/// Re-reads every account's cached sending identities and masked emails.
 pub fn reload_identities() {
     let b = backend().peek().clone();
     let mut all = BTreeMap::new();
+    let mut masked = BTreeMap::new();
 
     for a in &b.cfg.accounts {
         match b.store.identities(&a.id) {
@@ -1083,9 +1086,17 @@ pub fn reload_identities() {
             }
             Err(e) => return fail("Could not read identities", e),
         }
+
+        match b.store.masked_emails(&a.id) {
+            Ok(list) => {
+                masked.insert(a.id.clone(), list);
+            }
+            Err(e) => return fail("Could not read masked emails", e),
+        }
     }
 
     *IDENTITIES.write() = all;
+    *MASKED.write() = masked;
 }
 
 /// The folder to start on: the merged inbox with several accounts, else the
@@ -2041,7 +2052,20 @@ async fn start_reply(all: bool) {
         .cloned()
         .unwrap_or_default();
 
-    open_composer(compose::reply(&summary, &body, &me, all, &identities));
+    let masked = MASKED
+        .peek()
+        .get(&r.account_id)
+        .cloned()
+        .unwrap_or_default();
+
+    open_composer(compose::reply(
+        &summary,
+        &body,
+        &me,
+        all,
+        &identities,
+        &masked,
+    ));
 }
 
 /// The account a new message is written from: the selected mailbox's, else the

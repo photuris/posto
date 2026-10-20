@@ -69,6 +69,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
             } => c::account_login(account, totp, two_password).await,
             AccountCmd::Show => c::account_show(account),
             AccountCmd::Identities => c::account_identities(account),
+            AccountCmd::MaskedEmails => c::account_masked_emails(account),
         },
         Noun::Sync(SyncCmd::Run) => c::sync_run(account).await,
         Noun::Mailbox(MailboxCmd::List) => c::mailbox_list(account),

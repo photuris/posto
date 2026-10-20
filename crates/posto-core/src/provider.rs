@@ -25,6 +25,26 @@ pub struct Identity {
     pub email: String,
 }
 
+/// A Fastmail masked email address the account may send from.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MaskedEmail {
+    /// Server-assigned id.
+    pub id: String,
+    /// The masked address itself.
+    pub email: String,
+    /// What the address is for, as the user wrote it.
+    #[serde(default)]
+    pub description: String,
+    /// The site the address was created for; empty when unset.
+    #[serde(default)]
+    pub for_domain: String,
+    /// `enabled` or `disabled`; other states are never kept.
+    pub state: String,
+    /// RFC 3339 time of the last message received, if any.
+    #[serde(default)]
+    pub last_message_at: Option<String>,
+}
+
 /// What an action changes on the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
@@ -147,6 +167,19 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.identities().await,
             Connection::Proton(s) => s.identities().await,
+        }
+    }
+
+    /// Lists the account's masked email addresses; empty for Proton and for a
+    /// JMAP server that does not advertise the masked email capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call fails or the list is malformed.
+    pub async fn masked_emails(&self) -> Result<Vec<MaskedEmail>> {
+        match self {
+            Connection::Jmap(c) => c.masked_emails().await,
+            Connection::Proton(_) => Ok(Vec::new()),
         }
     }
 
