@@ -130,12 +130,20 @@ no "Receipts" in Proton`). Nothing is created in an account on your
 behalf. A reply offers the identities of every account in From, defaulting
 to the address the original was sent to; replying from another account
 sends through that account (the copy lands in its Sent) and still marks the
-original as answered in the account it arrived in. Settings, General manages
+original as answered in the account it arrived in. Fastmail masked email
+addresses work as senders too: when the API token has the Masked Email
+scope, each sync caches the account's enabled and disabled masked
+addresses. A reply to mail that was sent to one of them defaults its From to
+that address. In the composer, the From menu lists them under the
+account's own address as one collapsed "Masked emails (N)" row. It opens
+into a filterable list (plain Enter picks the first match). A masked
+address goes out as the account's own identity, with no display name.
+`posto account masked-emails` prints the cache. Settings, General manages
 the accounts. In the CLI, `--account <id>` picks an account. Reads
 (`email list`, `email search`, `mailbox list`) cover every account
 without it, and rows carry `account_id`. An email id given without
 `--account` is looked up in every account and is an error when more than
-one has it. `posto account list|add|remove|set|set-token|login|show|identities`
+one has it. `posto account list|add|remove|set|set-token|login|show|identities|masked-emails`
 manage the accounts (`has_token` in their output means "has
 credentials": a token or a Proton login); `posto sync run` syncs each enabled account and
 reports each outcome (a failing account does not stop the others).
@@ -164,6 +172,9 @@ denominator, with these mappings and limits on Proton:
   Classification on a Proton account therefore needs its tray labels (and
   `Unsure`) created in Proton first, as labels, not folders.
 - Nested labels are never created anywhere (Proton labels cannot nest).
+- Masked email addresses are Fastmail's (JMAP `MaskedEmail/get`, fetched
+  only when the session advertises the capability); a Proton account has
+  none in Posto.
 - Sync uses Proton's event feed; a cursor the server no longer knows
   triggers a full refetch of the cached window (`sync.initial_limit`
   newest messages of All Mail).

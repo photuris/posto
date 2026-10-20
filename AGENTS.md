@@ -66,6 +66,16 @@ Read `README.md` first. This file holds what the code does not say.
   request. The integration tests pin the pre-2026-10 trays
   (`legacy_trays`) on purpose: old configs must keep working.
 
+- Masked emails (Fastmail) are senders, not identities: `MaskedEmail/get`
+  goes out only when the session advertises
+  `https://www.fastmail.com/dev/maskedemail`, and only that call adds it to
+  `using` (an unknown capability fails the whole request). They are cached
+  like identities (`<account>/masked_emails` in `sync_state`, no table).
+  `compose::send` sends a masked From as the account's own identity (else
+  the first) with an empty display name. An address that is also an identity
+  of the account is the identity, so the GUI leaves it out of the masked
+  group. From resolution searches the draft's account first.
+
 ## Rules that bit us
 
 - The database is a cache with a schema version (`schema_version` in
