@@ -230,6 +230,8 @@ pub static HAS_MORE: GlobalSignal<bool> = Signal::global(|| false);
 pub static COMPOSER: GlobalSignal<Option<compose::Draft>> = Signal::global(|| None);
 pub static COMPOSER_TO: GlobalSignal<String> = Signal::global(String::new);
 pub static COMPOSER_CC: GlobalSignal<String> = Signal::global(String::new);
+/// Whether the composer's From menu is open.
+pub static FROM_MENU: GlobalSignal<bool> = Signal::global(|| false);
 pub static SHOW_SETTINGS: GlobalSignal<bool> = Signal::global(|| false);
 pub static SHOW_MOVE_PICKER: GlobalSignal<bool> = Signal::global(|| false);
 /// True while the label picker is open.
@@ -804,6 +806,13 @@ fn scroll_to_row(key: &str) {
 
 /// Closes the topmost of composer, settings, pickers, then leaves the search box.
 fn close_top() {
+    if *FROM_MENU.peek() && COMPOSER.peek().is_some() {
+        *FROM_MENU.write() = false;
+        focus_root();
+
+        return;
+    }
+
     if COMPOSER.peek().is_some() {
         *COMPOSER.write() = None;
     } else if *SHOW_SETTINGS.peek() {
@@ -2098,17 +2107,25 @@ pub fn open_composer(mut draft: compose::Draft) {
 
     *COMPOSER_TO.write() = format::addresses_text(&draft.to);
     *COMPOSER_CC.write() = format::addresses_text(&draft.cc);
+    *FROM_MENU.write() = false;
     *COMPOSER.write() = Some(draft);
 }
 
 /// Discards the open draft.
 pub fn close_composer() {
+    *FROM_MENU.write() = false;
     *COMPOSER.write() = None;
     focus_root();
 }
 
 /// Sends the open draft; `archive` also archives the email it replies to.
 pub fn send(archive: bool) {
+    // The filter, if mounted, never sends focusout once the menu is gone.
+    if *FROM_MENU.peek() {
+        *FROM_MENU.write() = false;
+        focus_root();
+    }
+
     run(send_draft(archive));
 }
 

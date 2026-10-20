@@ -28,6 +28,8 @@ pub const NAMES: &[&str] = &[
     "book-open",
     "sun",
     "chevron-down",
+    "chevron-right",
+    "check",
     "square",
     "check-square",
     "minus-square",
@@ -96,6 +98,8 @@ fn shapes(name: &str) -> &'static str {
             r#"<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>"#
         }
         "chevron-down" => r#"<path d="m6 9 6 6 6-6"/>"#,
+        "chevron-right" => r#"<path d="m9 18 6-6-6-6"/>"#,
+        "check" => r#"<path d="M20 6 9 17l-5-5"/>"#,
         "square" => r#"<rect x="3" y="3" width="18" height="18" rx="2"/>"#,
         "check-square" => {
             r#"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="m9 12 2 2 4-4"/>"#
