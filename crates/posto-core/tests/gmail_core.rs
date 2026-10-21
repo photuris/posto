@@ -3,12 +3,14 @@
 //! endpoints.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use posto_core::actions::{self, Action};
+use posto_core::compose::Draft;
 use posto_core::config::{Account, Config};
 use posto_core::gmail::{Endpoints, GoogleClient, connect_with};
-use posto_core::provider::Connection;
+use posto_core::provider::{Connection, Identity};
 use posto_core::store::{EmailSummary, Mailbox, Store};
 use posto_core::sync::{SyncReport, sync_account};
 use posto_core::{Error, Result};
@@ -514,4 +516,44 @@ async fn gmail_actions_follow_the_folder_rules() {
             .keywords
             .contains(&"$seen".to_string())
     );
+}
+
+/// Fails to compile unless the future is `Send`.
+fn assert_send<T: Send>(_: &T) {}
+
+/// The sync futures must be `Send` for every lifetime, or a caller that
+/// spawns them (the GUI's sync pass) does not compile. The evidence is the
+/// compile error, so nothing here is awaited except the spawned `initial`.
+#[tokio::test]
+async fn connection_futures_are_send() {
+    let server = MockServer::start().await;
+    let store = Store::open_memory().unwrap();
+    let conn = Arc::new(connection(&server, "me@gmail.com").await);
+    let identity = Identity {
+        id: "me@gmail.com".into(),
+        name: "Me".into(),
+        email: "me@gmail.com".into(),
+    };
+    let draft = Draft {
+        account_id: "g".into(),
+        ..Draft::default()
+    };
+
+    assert_send(&conn.initial("g", 1));
+    assert_send(&conn.delta("g", "1"));
+    assert_send(&conn.sync_mailboxes(&store, "g"));
+    assert_send(&conn.body("m1"));
+    assert_send(&conn.send(&store, "g", &identity, &draft, "text", "html"));
+
+    // As the GUI spawns its sync pass: the task owns the connection.
+    serve(&server, "me@gmail.com", "500", &four()).await;
+
+    let owned = Arc::clone(&conn);
+    let (emails, cursor) = tokio::spawn(async move { owned.initial("g", 1).await })
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(emails.len(), 1);
+    assert_eq!(cursor, "500");
 }

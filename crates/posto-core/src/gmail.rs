@@ -845,9 +845,11 @@ impl Session {
         account: &str,
         ids: &[String],
     ) -> Result<Vec<(String, Option<EmailSummary>)>> {
-        stream::iter(ids)
+        // Owned items: a stream of borrowed ids makes the future not provably
+        // `Send` for every lifetime, which breaks a caller that spawns a sync.
+        stream::iter(ids.to_vec())
             .map(|id| async move {
-                match self.metadata(id).await {
+                match self.metadata(&id).await {
                     Ok(message) => Ok((id.clone(), summary_from(account, &message))),
                     Err(Error::NotFound(_)) => Ok((id.clone(), None)),
                     Err(e) => Err(e),
