@@ -1564,10 +1564,10 @@ async fn update_sends_batch_modify() {
         .unwrap();
 
     let all = sent().await;
-    let chunk = |i: usize| json_body(&all[i])["ids"].as_array().unwrap().len();
+    let ids = many_ids(1001);
 
     assert_eq!(all.len(), 4);
-    assert_eq!((chunk(2), chunk(3)), (1000, 1));
+    assert_eq!(json_body(&all[2])["ids"], json!(&ids[..1000]));
     assert_eq!(json_body(&all[3])["ids"], json!(["m1000"]));
     assert_eq!(json_body(&all[3])["addLabelIds"], json!(["STARRED"]));
 }
@@ -1594,7 +1594,12 @@ async fn destroy_uses_batch_delete() {
     let ids = many_ids(1001);
 
     assert_eq!(session.destroy(&ids).await.unwrap(), ids);
-    assert_eq!(requests(&server, "/messages/batchDelete").await.len(), 3);
+
+    let sent = requests(&server, "/messages/batchDelete").await;
+
+    assert_eq!(sent.len(), 3);
+    assert_eq!(json_body(&sent[1]), json!({"ids": &ids[..1000]}));
+    assert_eq!(json_body(&sent[2]), json!({"ids": ["m1000"]}));
 }
 
 #[tokio::test]

@@ -1527,12 +1527,13 @@ pub(crate) fn modify_lists(change: &Change) -> Result<Option<(Vec<String>, Vec<S
     }
 
     let is_folder = |id: &str| id == ARCHIVE || FOLDERS.contains(&id);
-    let folder = add.iter().rfind(|id| is_folder(id));
+    let winner = add.iter().rposition(|id| is_folder(id));
+    let folder = winner.map(|at| &add[at]);
     let mut added: Vec<String> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
 
-    for id in add {
-        if is_folder(id) && (id == ARCHIVE || Some(id) != folder) {
+    for (at, id) in add.iter().enumerate() {
+        if is_folder(id) && (id == ARCHIVE || Some(at) != winner) {
             continue;
         }
 
@@ -1556,6 +1557,23 @@ pub(crate) fn modify_lists(change: &Change) -> Result<Option<(Vec<String>, Vec<S
     }
 
     Ok((!added.is_empty() || !removed.is_empty()).then_some((added, removed)))
+}
+
+/// A fresh Message-ID (without angle brackets) in the sender's own domain, so
+/// the machine's hostname never reaches a recipient.
+fn message_id(email: &str) -> String {
+    let domain = email
+        .rsplit_once('@')
+        .map(|(_, domain)| domain)
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or("posto.invalid");
+    let mut bytes = [0u8; 16];
+
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+
+    let unique: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    format!("{unique}@{domain}")
 }
 
 /// The RFC 822 message for a draft: `text` and `html` as alternatives.
@@ -1591,6 +1609,7 @@ pub(crate) fn outgoing(
             .collect()
     };
     let mut message = MessageBuilder::new()
+        .message_id(message_id(&identity.email))
         .from(mailbox(Some(&identity.name), &identity.email))
         .subject(draft.subject.clone())
         .text_body(text.to_owned())
@@ -1881,6 +1900,10 @@ mod tests {
                 Some((ids(&["INBOX"]), ids(&["SPAM", "TRASH"]))),
             ),
             (
+                patch(&["INBOX", "Label_1", "INBOX"], &[]),
+                Some((ids(&["Label_1", "INBOX"]), ids(&["SPAM", "TRASH"]))),
+            ),
+            (
                 patch(&["Label_1", "Label_1"], &[]),
                 Some((ids(&["Label_1"]), ids(&[]))),
             ),
@@ -1908,6 +1931,41 @@ mod tests {
         assert_eq!(decode_raw("aGk=").unwrap(), b"hi");
         assert_eq!(decode_raw("_-8").unwrap(), [0xff, 0xef]);
         assert!(matches!(decode_raw("a$b"), Err(Error::Http(_))));
+    }
+
+    #[test]
+    fn outgoing_message_id_uses_the_sender_domain() {
+        let identity = |email: &str| Identity {
+            id: email.into(),
+            name: String::new(),
+            email: email.into(),
+        };
+        let draft = Draft {
+            to: vec![Address {
+                name: None,
+                email: "b@example.net".into(),
+            }],
+            ..Draft::default()
+        };
+        let id_of = |email: &str| {
+            let bytes = outgoing(&identity(email), &draft, "t", "<p>h</p>").unwrap();
+
+            parse(&bytes).unwrap().message_id().unwrap().to_owned()
+        };
+        let first = id_of("me@gmail.com");
+
+        assert!(first.ends_with("@gmail.com"), "{first}");
+        assert_eq!(first.len(), 32 + "@gmail.com".len());
+        assert_ne!(first, id_of("me@gmail.com"));
+        assert!(id_of("no-at-sign").ends_with("@posto.invalid"));
+        assert!(id_of("me@").ends_with("@posto.invalid"));
+
+        // The old default put the machine's hostname after the `@`.
+        if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
+            let host = host.trim();
+
+            assert!(host.is_empty() || !first.contains(host), "{first}");
+        }
     }
 
     #[test]
