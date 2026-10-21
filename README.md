@@ -1,14 +1,14 @@
 # Posto
 
 A bespoke personal email client. Proof of concept: one or more Fastmail
-(JMAP) and Proton Mail accounts, with a Dioxus desktop GUI and a
+(JMAP), Proton Mail and Gmail accounts, with a Dioxus desktop GUI and a
 scriptable CLI over the same Rust core.
 
 ## Layout
 
 | Crate | What it is |
 |---|---|
-| `crates/posto-core` | All logic: config, secrets, SQLite store (WAL + FTS5), the provider seam (`provider::Connection`) with a JMAP client and a Proton back end (`proton-mail-api`), sync, actions, body fetch, compose/send, HTML sanitising, Markdown, Omarchy theme hints, keyboard shortcut map, UI fixtures. |
+| `crates/posto-core` | All logic: config, secrets, SQLite store (WAL + FTS5), the provider seam (`provider::Connection`) with a JMAP client, a Proton back end (`proton-mail-api`) and a Gmail REST API back end, sync, actions, body fetch, compose/send, HTML sanitising, Markdown, Omarchy theme hints, keyboard shortcut map, UI fixtures. |
 | `crates/posto-cli` | `posto`, a noun-verb CLI. JSON on stdout, JSON errors on stderr, typed exit codes, no prompts. |
 | `crates/posto-gui` | `posto-gui`, a three-pane Dioxus 0.7 desktop app. |
 | `assets/icon` | The SVG icon masters. |
@@ -57,6 +57,25 @@ Add `--totp <code>` when two-factor authentication is on, and
 the account uses a separate mailbox password. In the GUI, add the account
 with provider "Proton Mail", save, then use "Sign in…" on its row.
 
+Gmail (personal accounts; several work side by side):
+
+```sh
+posto account add --id g1 --email you@gmail.com --provider gmail
+posto account google-login --account g1
+posto sync run --account g1
+```
+
+`google-login` prints an address on stderr: open it in a browser, choose
+that Google account, accept Google's "unverified app" screen once, and
+approve. It waits up to five minutes. Posto needs a Google Cloud OAuth
+*desktop* client of your own: save its JSON as `google-client.json` in the
+data directory (the project's consent screen links the pages in `docs/`;
+publish it "In production" so refresh tokens do not expire after seven
+days). The configured email must be the Google account or one of its
+accepted send-as addresses; an empty one is filled in at sign-in. In the
+GUI, add the account with provider "Gmail", save, then use "Sign in with
+Google…" on its row; it opens the browser and shows the address too.
+
 Then start `posto-gui`. It syncs every 5 minutes (configurable, 0 = off)
 and on `g`.
 
@@ -69,9 +88,10 @@ database; sync is single-writer through the lock file.
 ## Accounts
 
 Each account is an `[[accounts]]` entry in `config.toml` with a
-`provider` (`jmap`, the default, or `proton`). A JMAP account's token
+`provider` (`jmap`, the default, `proton` or `gmail`). A JMAP account's token
 lives under `[tokens]` in `secrets.toml`; a Proton account's session and
-mailbox password live under `[proton.<id>]`, keyed by the account id:
+mailbox password live under `[proton.<id>]`; a Gmail account's refresh
+token under `[gmail]`; all keyed by the account id:
 
 ```toml
 # config.toml
@@ -89,6 +109,11 @@ email = "me@proton.me"
 provider = "proton"
 username = "me"            # login name; empty means the email address
 
+[[accounts]]
+id = "g1"
+email = "me@gmail.com"
+provider = "gmail"
+
 [proton]
 app_version = "linux-bridge@3.27.1"   # x-pm-appversion; POSTO_PROTON_APP_VERSION overrides
 ```
@@ -102,11 +127,18 @@ fastmail = "..."
 session = "..."            # the Proton session (tokens + derived key password), rewritten when the tokens rotate
 mailbox_password = "..."   # needed to unlock the mail keys at every start
 generation = 1760...       # identifies one sign-in; an older connection cannot overwrite a newer one
+
+[gmail]
+g1 = "..."                 # Google refresh token; access tokens live only in memory
 ```
 
 `secrets.toml` is mode 0600. A Proton session can only be reopened with
 the mailbox password, which is why it is stored; sign in again in Settings
-or with `posto account login` after changing it.
+or with `posto account login` after changing it. A Gmail refresh token ends
+when you change the Google password, revoke Posto at
+<https://myaccount.google.com/permissions>, or leave it unused for six
+months; then run `posto account google-login` again (or "Sign in with
+Google…").
 
 Files from the single-account version (`[account]`, top-level `token`)
 load as the account `default` and are rewritten in the new layout on the
@@ -148,14 +180,14 @@ the accounts. In the CLI, `--account <id>` picks an account. Reads
 (`email list`, `email search`, `mailbox list`) cover every account
 without it, and rows carry `account_id`. An email id given without
 `--account` is looked up in every account and is an error when more than
-one has it. `posto account list|add|remove|set|set-token|login|show|identities|masked-emails`
+one has it. `posto account list|add|remove|set|set-token|login|google-login|show|identities|masked-emails`
 manage the accounts (`has_token` in their output means "has
-credentials": a token or a Proton login); `posto sync run` syncs each enabled account and
+credentials": a token, a Proton login or a Google sign-in); `posto sync run` syncs each enabled account and
 reports each outcome (a failing account does not stop the others).
 
 ## Providers and what is the same across them
 
-Every feature works the same on both providers, at the lowest common
+Every feature works the same on all providers, at the lowest common
 denominator, with these mappings and limits on Proton:
 
 - Proton *folders* are exclusive (a message sits in one), Proton *labels*
@@ -183,6 +215,29 @@ denominator, with these mappings and limits on Proton:
 - Sync uses Proton's event feed; a cursor the server no longer knows
   triggers a full refetch of the cached window (`sync.initial_limit`
   newest messages of All Mail).
+
+And on Gmail (REST API, no IMAP):
+
+- Gmail's labels map like Proton's: Inbox, Drafts, Sent, Spam and Trash
+  are folders, your own labels are role-less mailboxes, and the folder
+  rules above apply (moving to a label is refused; use Labels…). Gmail
+  has no archive label, so Posto's Archive shows the mail that is in
+  none of Inbox, Drafts, Sent, Spam or Trash, which is what Gmail's
+  "archive" leaves behind. Moving into Sent or Drafts is refused (Gmail
+  sets those itself).
+- Starred is `$flagged`; Important, the category tabs (Promotions,
+  Social, Updates, Forums, Personal), the coloured stars and chats are
+  hidden and never written. Labels are created on demand, so classifier
+  trays become ordinary Gmail labels; a tray named like a built-in
+  (`Archive`, `Trash`) is a config error unless a label of that name
+  exists.
+- Gmail has no answered flag: replying from Posto marks the original
+  answered locally only, until it is next refetched.
+- Unread counts are computed from the local cache. Sync uses Gmail's
+  history; an expired cursor triggers a full refetch of the cached
+  window. Empty Trash/Spam and `email destroy` delete permanently.
+- Sending goes through Gmail (it files the message under Sent and threads
+  replies); a send whose outcome is unknown is reported, never retried.
 
 ## Classification
 
@@ -311,6 +366,8 @@ posto account add --id work --email me@work.example
 printf '%s' "$TOKEN" | posto account set-token --account work --token-stdin
 posto account add --id pm --email me@proton.me --provider proton
 printf '%s\n' "$PASSWORD" | posto account login --account pm --password-stdin --totp 123456
+posto account add --id g1 --email me@gmail.com --provider gmail
+posto account google-login --account g1
 posto email list --mailbox Inbox --unread --jsonl | jq -r .subject
 posto email show <id> --text
 posto email archive <id>...

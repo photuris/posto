@@ -12,15 +12,17 @@ Read `README.md` first. This file holds what the code does not say.
   `.overseer/runs/2026-10-12-posto-poc/PLAN.md` (gitignored ledger of the build
   run, present on the original machine). The doc comments in
   `crates/posto-core/src/*.rs` are the live contract.
-- Two back ends behind one seam: `provider::Connection` is the only type the
-  rest of the core talks to; `jmap.rs` (RFC 8620/8621 + submission) and
-  `proton.rs` (`proton-mail-api`, pinned by git tag) implement its
-  operations and never leak past it. A new provider is a new arm plus a
+- Three back ends behind one seam: `provider::Connection` is the only type the
+  rest of the core talks to; `jmap.rs` (RFC 8620/8621 + submission),
+  `proton.rs` (`proton-mail-api`, pinned by git tag) and `gmail.rs` (Gmail
+  REST API v1, OAuth desktop loopback flow) implement its operations and
+  never leak past it. A new provider is a new arm plus a
   module; sync/actions/body/compose/classify are written once. No IMAP.
 - Features are the lowest common denominator across providers. The binding
   model mapping (roles, hidden Proton system ids, keywords, folder vs label
   semantics, what is `Error::Unsupported`) is in
-  `.overseer/runs/2026-10-15-proton/PLAN.md` (gitignored ledger) and
+  `.overseer/runs/2026-10-15-proton/PLAN.md` and, for Gmail,
+  `.overseer/runs/2026-10-20-gmail/PLAN.md` (gitignored ledgers), and is
   summarised in README "Providers".
 - Multi-account: every store row, sync cursor and action is scoped by the local
   account slug (`account_id`, from `config.toml`; not the server's account id).
@@ -85,6 +87,20 @@ Read `README.md` first. This file holds what the code does not say.
   (alias lists, sending new mail from an alias) is out of reach: the session
   has no `pass` scope, and the Pass API answers 403 with code 9108.
 
+- Gmail: `ARCHIVE` is Posto's own mailbox id (no Gmail label has it) and is
+  never sent to Gmail. `gmail::visible` is the one membership rule: Spam or
+  Trash hide Inbox/Drafts/Sent, and `ARCHIVE` is present exactly when none
+  of the five folder-like built-ins is. Gmail follows the Proton folder
+  rules in `actions::apply` (state `provider = gmail`), plus: changes to
+  `SENT`/`DRAFT` are refused, the mirror keeps an email's `SENT`/`DRAFT`
+  and then goes through `visible`, and the empty-patch guard looks at that
+  result (removing a sole Inbox archives). A Gmail tray must be a role-less
+  label (`ensure_mailbox`). Chats (`CHAT`) are never stored. Attachment
+  `blob_id` is the index in mail-parser's `attachments()` (Gmail's own
+  attachment ids change between fetches). The OAuth client is
+  `<data_dir>/google-client.json`; each account keeps only a refresh token
+  under `[gmail]`; `POSTO_TOKEN` never applies to Gmail.
+
 ## Rules that bit us
 
 - The database is a cache with a schema version (`schema_version` in
@@ -124,6 +140,20 @@ Read `README.md` first. This file holds what the code does not say.
   stored `key_password` and skips the salts; never pin a version below it.
   `map_err` turns a remaining 9101 into `Error::Auth` (stored key password
   stale, e.g. after a password change: sign in again).
+- Gmail errors carry the HTTP status number only, never Google's error text
+  (`error`, `error.status`, `message` can echo request data). The request
+  helper decides on the status before reading a body: a 401/404/429/5xx
+  body is never read. A 401 forgets the cached token only if it is the one
+  the request used, then replays once. `messages.send` is never retried on
+  a transient error, and a malformed 2xx or a non-connect transport error
+  there is the "may have been sent; check Sent" `Error::Other`.
+- Every `Connection` future must be `Send`: the GUI spawns `sync_all` on
+  tokio. Borrowing items across `buffered()` in `gmail::Session::summaries`
+  broke that once; `tests/gmail_core.rs::connection_futures_are_send`
+  guards it.
+- The Gmail Message-ID is set by Posto (`<random hex@sender domain>`) and
+  `mail-builder` is built without default features: its default puts the
+  machine's hostname into every Message-ID.
 - `proton::map_err` uses the crate error's `Display` only. Never append
   `server_message()` (unrestricted server text) and never `{:?}`-format the
   crate error into anything a user, a log or a test failure can see.
@@ -137,7 +167,10 @@ Read `README.md` first. This file holds what the code does not say.
 - Tests never reach the network. A Proton test builds a `Session` against
   wiremock (`Session::for_tests`, resumed blob) and generates its own PGP
   keys; CLI tests validate `account login` inputs with an account that is
-  not Proton, an empty password or an empty app version. One mutation run
+  not Proton, an empty password or an empty app version. A Gmail test never
+  holds both a refresh token and a `google-client.json` in one sandbox (that
+  pair reaches Google); the loopback sign-in is tested only through
+  `gmail::login_with` against wiremock. One mutation run
   that inverted the provider guard sent a real login request (run
   2026-10-15-proton); do not weaken a login guard while running CLI tests.
 - `std::env::set_var` only in a synchronous `main` before any runtime exists.
