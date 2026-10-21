@@ -7,6 +7,7 @@ pub mod compose;
 pub mod config;
 pub mod error;
 pub mod fixtures;
+pub mod gmail;
 pub mod html;
 pub mod jmap;
 pub mod proton;

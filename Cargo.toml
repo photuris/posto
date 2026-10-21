@@ -15,7 +15,9 @@ clap = { version = "4", features = ["derive"] }
 dioxus = { version = "0.7", features = ["desktop"] }
 dirs = "7"
 fd-lock = "4"
+futures-util = "0.3"
 html2text = "0.17"
+mail-parser = "0.11"
 notify = "8"
 percent-encoding = "2"
 proton-mail-api = { git = "https://github.com/photuris/proton-mail-api", tag = "v0.4.1" }
@@ -24,8 +26,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "io-util"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
