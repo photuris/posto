@@ -333,8 +333,8 @@ impl Default for ClassifyConfig {
                 ("alerts", "Alerts"),
                 ("receipts", "Receipts"),
                 ("newsletters", "Newsletters"),
-                ("promotional", "Promos"),
-                ("social", "Social"),
+                ("promotional", "Deals"),
+                ("social", "Social Media"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1022,7 +1022,7 @@ mod tests {
         cfg.save().unwrap();
 
         assert_eq!(Config::load().unwrap(), cfg);
-        assert_eq!(Config::default().classify.trays["promotional"], "Promos");
+        assert_eq!(Config::default().classify.trays["promotional"], "Deals");
     }
 
     #[test]

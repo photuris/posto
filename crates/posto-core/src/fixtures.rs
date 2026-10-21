@@ -27,8 +27,8 @@ const MAILBOXES: [(&str, &str, Option<&str>, i64); 12] = [
     ("mb-receipts", "Receipts", None, 11),
     ("mb-bilag", "Bilag", None, 12),
     ("mb-needs-reply", "Needs reply", None, 13),
-    ("mb-promos", "Promos", None, 15),
-    ("mb-social", "Social", None, 16),
+    ("mb-promos", "Deals", None, 15),
+    ("mb-social", "Social Media", None, 16),
 ];
 
 /// One fixture email with its body.

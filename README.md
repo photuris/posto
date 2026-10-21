@@ -230,7 +230,8 @@ And on Gmail (REST API, no IMAP):
   hidden and never written. Labels are created on demand, so classifier
   trays become ordinary Gmail labels; a tray named like a built-in
   (`Archive`, `Trash`) is a config error unless a label of that name
-  exists.
+  exists. Gmail also refuses label names it reserves (`Social`,
+  `Updates`, `Promos`, `Finance`, …), so trays avoid them.
 - Gmail has no answered flag: replying from Posto marks the original
   answered locally only, until it is next refetched.
 - Unread counts are computed from the local cache. Sync uses Gmail's
@@ -287,8 +288,8 @@ personal = "Personal"
 alerts = "Alerts"
 receipts = "Receipts"
 newsletters = "Newsletters"
-promotional = "Promos"
-social = "Social"
+promotional = "Deals"
+social = "Social Media"
 # bills = "Bills"          # a tray of your own needs a description:
 
 [classify.criteria]        # tray -> description; replaces a built-in one
