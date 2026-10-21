@@ -1,7 +1,9 @@
 //! General page: accounts (provider, credentials, sender, endpoint) and refresh.
 
+use dioxus::core::Task;
 use dioxus::prelude::*;
 use posto_core::config::{Account, Config, ProtonSecret, Provider, Secrets};
+use posto_core::gmail::{self, GoogleClient};
 use posto_core::proton::{self, Login};
 
 use crate::app::{NEEDS_TOKEN, backend, set_status, sync_soon};
@@ -217,57 +219,212 @@ impl SignIn {
         }
     }
 
-    /// After the login was stored: closes the panel, drops old connections
-    /// and fills in a missing sender address.
-    fn signed_in(mut self, mut draft: Signal<Config>, id: &str, email: &str) {
+    /// After the login was stored: closes the panel, then the shared ending.
+    fn signed_in(mut self, draft: Signal<Config>, id: &str, email: &str) {
         self.open.set(false);
         self.error.set(None);
         self.rev += 1;
-        *NEEDS_TOKEN.write() = false;
+        finish_sign_in(draft, id, email);
+    }
+}
 
-        if !email.is_empty()
-            && let Some(a) = draft.write().accounts.iter_mut().find(|a| a.id == id)
-            && a.email.trim().is_empty()
-        {
-            a.email = email.to_string();
+/// The ending every sign-in shares once its credential is stored: clears the
+/// missing-token banner, fills an empty sender address (draft and backend,
+/// saved when the config file is writable), drops old connections and starts
+/// a sync.
+fn finish_sign_in(mut draft: Signal<Config>, id: &str, email: &str) {
+    *NEEDS_TOKEN.write() = false;
+
+    if !email.is_empty()
+        && let Some(a) = draft.write().accounts.iter_mut().find(|a| a.id == id)
+        && a.email.trim().is_empty()
+    {
+        a.email = email.to_string();
+    }
+
+    let mut shared = backend();
+    let mut b = shared.write();
+    let filled = !email.is_empty()
+        && b.cfg
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .is_some_and(|a| {
+                let empty = a.email.is_empty();
+
+                if empty {
+                    a.email = email.to_string();
+                }
+
+                empty
+            });
+    let save_error = if filled && b.config_error.is_none() {
+        b.cfg.save().err()
+    } else {
+        None
+    };
+    let name = b
+        .cfg
+        .account(id)
+        .map_or(id, Account::display_name)
+        .to_string();
+
+    b.reset_client();
+    drop(b);
+
+    match save_error {
+        Some(e) => set_status(format!("Signed in, but config.toml was not saved: {e}")),
+        None => set_status(format!("Signed in to {name}")),
+    }
+
+    sync_soon();
+}
+
+/// Opens `url` in the user's browser. A failure is ignored: the panel shows
+/// the address too.
+fn open_browser(url: &str) {
+    let child = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    if let Ok(mut child) = child {
+        // Reaps the child so it does not stay a zombie.
+        std::thread::spawn(move || child.wait());
+    }
+}
+
+/// The Google sign-in panel and the sign-in it may have running.
+///
+/// `attempt` numbers sign-ins like [`SignIn`]'s does; `task` holds the running
+/// login so Cancel drops its future and with it the loopback listener.
+#[derive(Clone, Copy)]
+struct GoogleSignIn {
+    busy: Signal<bool>,
+    /// The consent address, once the login has built it.
+    url: Signal<Option<String>>,
+    error: Signal<Option<String>>,
+    attempt: Signal<u32>,
+    /// Bumped after a stored login, to re-read the signed-in state.
+    rev: Signal<u32>,
+    task: Signal<Option<Task>>,
+}
+
+impl GoogleSignIn {
+    /// Creates the signals in the calling component's scope.
+    fn new() -> GoogleSignIn {
+        GoogleSignIn {
+            busy: use_signal(|| false),
+            url: use_signal(|| None),
+            error: use_signal(|| None),
+            attempt: use_signal(|| 0),
+            rev: use_signal(|| 0),
+            task: use_signal(|| None),
+        }
+    }
+
+    /// Discards a running sign-in: its result will be stale and its future is
+    /// dropped.
+    fn cancel(mut self) {
+        self.attempt += 1;
+        self.busy.set(false);
+        self.url.set(None);
+        self.error.set(None);
+
+        let task = self.task.write().take();
+
+        if let Some(task) = task {
+            task.cancel();
+        }
+    }
+
+    /// Signs in the saved Gmail account `id`: opens Google's consent page and
+    /// stores the refresh token the login returns, unless the attempt was
+    /// discarded meanwhile.
+    fn start(mut self, draft: Signal<Config>, id: &str) {
+        if *self.busy.peek() {
+            return;
         }
 
-        let mut shared = backend();
-        let mut b = shared.write();
-        let filled = !email.is_empty()
-            && b.cfg
-                .accounts
-                .iter_mut()
-                .find(|a| a.id == id)
-                .is_some_and(|a| {
-                    let empty = a.email.is_empty();
-
-                    if empty {
-                        a.email = email.to_string();
-                    }
-
-                    empty
-                });
-        let save_error = if filled && b.config_error.is_none() {
-            b.cfg.save().err()
-        } else {
-            None
+        // The saved account, not the draft: an unsaved edit must not choose
+        // the Google account.
+        let saved = backend().peek().cfg.account(id).cloned();
+        let Some(saved) = saved.filter(|a| a.provider == Provider::Gmail) else {
+            return;
         };
-        let name = b
+
+        if backend().peek().ui_test {
+            return set_status("UI test mode: nothing is stored.");
+        }
+
+        let client = match GoogleClient::load(&posto_core::config::google_client_path()) {
+            Ok(client) => client,
+            Err(e) => return self.error.set(Some(e.to_string())),
+        };
+
+        self.attempt += 1;
+        self.busy.set(true);
+        self.error.set(None);
+        self.url.set(None);
+
+        let attempt = *self.attempt.peek();
+        let id = saved.id.clone();
+        let mut url = self.url;
+        // Component-owned: closing Settings drops it before it can store anything.
+        let task = spawn(async move {
+            let result = gmail::login(&client, &saved.email, |u| {
+                url.set(Some(u.to_string()));
+                open_browser(u);
+            })
+            .await;
+
+            self.finish(draft, &id, attempt, result, Secrets::set_gmail);
+        });
+
+        self.task.set(Some(task));
+    }
+
+    /// Lands the result of login number `attempt`: stores the refresh token
+    /// through `store` and finishes the sign-in, or shows the error. Does
+    /// nothing when the attempt was discarded meanwhile.
+    fn finish(
+        mut self,
+        draft: Signal<Config>,
+        id: &str,
+        attempt: u32,
+        result: posto_core::Result<gmail::Login>,
+        store: impl FnOnce(&str, &str) -> posto_core::Result<()>,
+    ) {
+        if *self.attempt.peek() != attempt {
+            return;
+        }
+
+        self.busy.set(false);
+        self.url.set(None);
+        self.task.set(None);
+
+        let still_gmail = backend()
+            .peek()
             .cfg
             .account(id)
-            .map_or(id, Account::display_name)
-            .to_string();
+            .is_some_and(|a| a.provider == Provider::Gmail);
 
-        b.reset_client();
-        drop(b);
-
-        match save_error {
-            Some(e) => set_status(format!("Signed in, but config.toml was not saved: {e}")),
-            None => set_status(format!("Signed in to {name}")),
+        if !still_gmail {
+            return self.error.set(Some(
+                "The account changed during sign-in; nothing was stored.".into(),
+            ));
         }
 
-        sync_soon();
+        match result.and_then(|login| store(id, &login.refresh_token).map(|_| login.email)) {
+            Ok(email) => {
+                self.error.set(None);
+                self.rev += 1;
+                finish_sign_in(draft, id, &email);
+            }
+            Err(e) => self.error.set(Some(e.to_string())),
+        }
     }
 }
 
@@ -281,10 +438,12 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
     let mut token_error = use_signal(|| None::<String>);
     let mut confirm_remove = use_signal(|| false);
     let sign_in = SignIn::new();
+    let google = GoogleSignIn::new();
 
     // Re-read the credential state after a save.
     let _ = token_rev();
     let _ = (sign_in.rev)();
+    let _ = (google.rev)();
 
     let cfg = draft();
     let at = selected().min(cfg.accounts.len().saturating_sub(1));
@@ -300,7 +459,9 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
             .flatten()
             .is_some();
     let signed_in = !ui_test && saved && matches!(Secrets::proton(&account.id), Ok(Some(_)));
+    let google_signed_in = !ui_test && saved && matches!(Secrets::gmail(&account.id), Ok(Some(_)));
     let proton = account.provider == Provider::Proton;
+    let gmail = account.provider == Provider::Gmail;
     let removable = cfg.accounts.len() > 1;
 
     rsx! {
@@ -315,6 +476,7 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                             selected.set(i);
                             token_open.set(false);
                             sign_in.reset();
+                            google.cancel();
                             confirm_remove.set(false);
                         },
                         "{a.display_name()}"
@@ -333,6 +495,7 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                         selected.set(d.accounts.len() - 1);
                         token_open.set(false);
                         sign_in.reset();
+                        google.cancel();
                         confirm_remove.set(false);
                     },
                     "+ Add account"
@@ -355,16 +518,16 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                         span { class: "muted", "{provider_label(account.provider)}" }
                     } else {
                         select {
-                            value: if proton { "proton" } else { "jmap" },
+                            value: account.provider.as_str(),
                             onchange: move |evt| {
                                 edit(
                                     draft,
                                     at,
                                     |a| {
-                                        a.provider = if evt.value() == "proton" {
-                                            Provider::Proton
-                                        } else {
-                                            Provider::Jmap
+                                        a.provider = match evt.value().as_str() {
+                                            "proton" => Provider::Proton,
+                                            "gmail" => Provider::Gmail,
+                                            _ => Provider::Jmap,
                                         };
                                         a.session_url = Account::default().session_url;
                                     },
@@ -372,6 +535,7 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                             },
                             option { value: "jmap", "{provider_label(Provider::Jmap)}" }
                             option { value: "proton", "{provider_label(Provider::Proton)}" }
+                            option { value: "gmail", "{provider_label(Provider::Gmail)}" }
                         }
                     }
                 }
@@ -388,6 +552,8 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                 div { class: "hint",
                     if proton {
                         "Replies and drafts use the Proton address matching this address."
+                    } else if gmail {
+                        "Replies and drafts use the Gmail send-as address matching this address. Empty: filled in at sign-in."
                     } else {
                         "Replies and drafts use the Fastmail identity matching this address."
                     }
@@ -404,7 +570,7 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                             oninput: move |evt| edit(draft, at, |a| a.username = evt.value()),
                         }
                     }
-                } else {
+                } else if !gmail {
                     div { class: "setting-row",
                         label { "Session URL" }
                         input {
@@ -434,6 +600,8 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                     div { class: "hint",
                         if proton {
                             "Lower-case letters, digits and '-'. Save the settings, then sign in."
+                        } else if gmail {
+                            "Lower-case letters, digits and '-'. Save the settings, then sign in with Google."
                         } else {
                             "Lower-case letters, digits and '-'. Save the settings, then set the token."
                         }
@@ -543,6 +711,49 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
                     div { class: "hint",
                         "Posto stores the session and the mailbox password in secrets.toml (mode 0600)."
                     }
+                } else if gmail {
+                    div { class: "setting-row",
+                        span { "Google sign-in" }
+                        span { class: "muted",
+                            if google_signed_in {
+                                "Signed in"
+                            } else {
+                                "Not signed in"
+                            }
+                        }
+                        button {
+                            disabled: !saved || (google.busy)(),
+                            onclick: {
+                                let id = account.id.clone();
+
+                                move |_| google.start(draft, &id)
+                            },
+                            "Sign in with Google…"
+                        }
+                    }
+                    if (google.busy)() {
+                        div { class: "hint",
+                            "Finish signing in in your browser. If it did not open, open this address:"
+                        }
+                        div { class: "setting-row",
+                            if let Some(u) = (google.url)() {
+                                input {
+                                    r#type: "text",
+                                    readonly: true,
+                                    value: "{u}",
+                                    onfocusin: focus_in,
+                                    onfocusout: focus_out,
+                                }
+                            }
+                            button { onclick: move |_| google.cancel(), "Cancel" }
+                        }
+                    }
+                    if let Some(e) = (google.error)() {
+                        div { class: "error", "{e}" }
+                    }
+                    div { class: "hint",
+                        "Posto stores the refresh token in secrets.toml (mode 0600)."
+                    }
                 } else {
                     div { class: "setting-row",
                         span { "Fastmail API token" }
@@ -626,6 +837,7 @@ pub fn GeneralPage(mut draft: Signal<Config>) -> Element {
 
                                 selected.set(0);
                                 sign_in.reset();
+                                google.cancel();
                                 confirm_remove.set(false);
                             },
                             "Remove {account.display_name()} and its cached mail"
@@ -682,9 +894,14 @@ mod tests {
     /// account `pm` (no sender address). `config_error` is set so that a
     /// sign-in can never write `config.toml`.
     fn rendered() -> VirtualDom {
+        rendered_with(Account::proton("pm", ""))
+    }
+
+    /// Like [`rendered`], with `account` as the only account.
+    fn rendered_with(account: Account) -> VirtualDom {
         let mut cfg = Config::default();
 
-        cfg.accounts[0] = Account::proton("pm", "");
+        cfg.accounts[0] = account;
 
         let mut dom = VirtualDom::new(App).with_root_context(Backend {
             store: Arc::new(Store::open_memory().unwrap()),
@@ -834,6 +1051,177 @@ mod tests {
             assert_eq!(backend().peek().conn_rev, 1);
             assert_eq!(*STATUS.peek(), "Signed in to me@proton.example");
             assert!(!*crate::app::NEEDS_TOKEN.peek());
+        });
+    }
+
+    /// The Google sign-in signals of a mounted `GeneralPage`: busy, attempt 1.
+    fn google_busy() -> GoogleSignIn {
+        fn new<T: 'static>(value: T) -> Signal<T> {
+            Signal::new_in_scope(value, ScopeId::ROOT)
+        }
+
+        GoogleSignIn {
+            busy: new(true),
+            url: new(Some("https://accounts.example/consent".to_string())),
+            error: new(None),
+            attempt: new(1),
+            rev: new(0),
+            task: new(None),
+        }
+    }
+
+    fn google_login() -> posto_core::Result<gmail::Login> {
+        Ok(gmail::Login {
+            refresh_token: "rt".into(),
+            email: "me@gmail.com".into(),
+        })
+    }
+
+    /// Runs `finish` with a `store` that records its arguments.
+    fn google_finish(
+        g: GoogleSignIn,
+        attempt: u32,
+        result: posto_core::Result<gmail::Login>,
+    ) -> Vec<(String, String)> {
+        let stored = std::cell::RefCell::new(Vec::new());
+
+        g.finish(draft(), "gm", attempt, result, |id, token| {
+            stored
+                .borrow_mut()
+                .push((id.to_string(), token.to_string()));
+            Ok(())
+        });
+
+        stored.into_inner()
+    }
+
+    #[test]
+    fn a_google_sign_in_stores_the_token_and_fills_the_sender() {
+        let dom = rendered_with(Account::gmail("gm", ""));
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let (g, draft) = (google_busy(), draft());
+            let stored = std::cell::RefCell::new(Vec::new());
+
+            *crate::app::NEEDS_TOKEN.write() = true;
+            g.finish(draft, "gm", 1, google_login(), |id, token| {
+                stored
+                    .borrow_mut()
+                    .push((id.to_string(), token.to_string()));
+                Ok(())
+            });
+
+            assert_eq!(
+                stored.into_inner(),
+                vec![("gm".to_string(), "rt".to_string())]
+            );
+            assert_eq!(((g.busy)(), (g.url)(), (g.error)()), (false, None, None));
+            assert_eq!(draft.peek().accounts[0].email, "me@gmail.com");
+            assert_eq!(backend().peek().cfg.accounts[0].email, "me@gmail.com");
+            assert!(!*crate::app::NEEDS_TOKEN.peek());
+            assert_eq!((g.rev)(), 1);
+        });
+    }
+
+    #[test]
+    fn a_failed_google_sign_in_shows_its_error() {
+        let dom = rendered_with(Account::gmail("gm", ""));
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let g = google_busy();
+            let stored = google_finish(g, 1, Err(Error::Other("Google sign-in timed out".into())));
+
+            assert!(stored.is_empty());
+            assert!(!(g.busy)());
+            assert!((g.error)().is_some_and(|e| e.contains("timed out")));
+        });
+    }
+
+    #[test]
+    fn a_stale_google_sign_in_is_ignored() {
+        let dom = rendered_with(Account::gmail("gm", ""));
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let mut g = google_busy();
+
+            g.attempt.set(2);
+
+            assert!(google_finish(g, 1, google_login()).is_empty());
+            assert!((g.busy)());
+            assert_eq!((g.error)(), None);
+            assert_eq!((g.rev)(), 0);
+        });
+    }
+
+    #[test]
+    fn cancel_discards_a_running_google_sign_in() {
+        struct Flag(std::rc::Rc<Cell<bool>>);
+
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let dom = rendered_with(Account::gmail("gm", ""));
+        let dropped = std::rc::Rc::new(Cell::new(false));
+        let guard = Flag(dropped.clone());
+        let mut g = dom.in_scope(ScopeId::ROOT, google_busy);
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let task = spawn(async move {
+                let _guard = guard;
+
+                std::future::pending::<()>().await;
+            });
+
+            g.task.set(Some(task));
+            g.cancel();
+
+            assert_eq!(((g.busy)(), (g.url)(), (g.error)()), (false, None, None));
+            assert_eq!(*g.attempt.peek(), 2);
+            assert!(g.task.peek().is_none());
+        });
+
+        assert!(dropped.get(), "the login future was not dropped");
+
+        dom.in_scope(ScopeId::ROOT, || {
+            assert!(google_finish(g, 1, google_login()).is_empty());
+            assert!(!(g.busy)());
+        });
+    }
+
+    #[test]
+    fn a_google_sign_in_for_a_removed_account_stores_nothing() {
+        let dom = rendered_with(Account::gmail("other", ""));
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let g = google_busy();
+
+            assert!(google_finish(g, 1, google_login()).is_empty());
+            assert!(!(g.busy)());
+            assert!((g.error)().is_some_and(|e| e.contains("nothing was stored")));
+        });
+    }
+
+    #[test]
+    fn a_refused_store_shows_its_error() {
+        let dom = rendered_with(Account::gmail("gm", ""));
+
+        dom.in_scope(ScopeId::ROOT, || {
+            let (g, draft) = (google_busy(), draft());
+
+            *crate::app::NEEDS_TOKEN.write() = true;
+            g.finish(draft, "gm", 1, google_login(), |_, _| {
+                Err(Error::Other("disk full".into()))
+            });
+
+            assert!((g.error)().is_some_and(|e| e.contains("disk full")));
+            assert!(*crate::app::NEEDS_TOKEN.peek());
+            assert_eq!(draft.peek().accounts[0].email, "");
+            assert_eq!(backend().peek().cfg.accounts[0].email, "");
+            assert!(!(g.busy)());
+            assert_eq!((g.rev)(), 0);
         });
     }
 }
