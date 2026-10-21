@@ -922,13 +922,14 @@ impl Session {
                 Err(_) => return Err(uncertain()),
             };
             let status = reply.status();
-            let bytes = match reply.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) if retry => return Err(transport(e)),
-                Err(_) => return Err(uncertain()),
-            };
 
             if status.is_success() {
+                let bytes = match reply.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) if retry => return Err(transport(e)),
+                    Err(_) => return Err(uncertain()),
+                };
+
                 if bytes.is_empty() {
                     return Ok(Value::Null);
                 }
@@ -937,6 +938,8 @@ impl Session {
                     .map_err(|_| if retry { malformed() } else { uncertain() });
             }
 
+            // The status alone decides what happens next; only a 403 needs its
+            // body, and a body that cannot be read is a plain 403.
             match status.as_u16() {
                 401 if !replayed => {
                     replayed = true;
@@ -947,7 +950,7 @@ impl Session {
                 429 | 500 | 502 | 503 | 504 => {
                     self.back_off(retry, &mut attempt, status.as_u16()).await?;
                 }
-                403 if is_rate_limited(&bytes) => {
+                403 if is_rate_limited(&reply.bytes().await.unwrap_or_default()) => {
                     self.back_off(retry, &mut attempt, 403).await?;
                 }
                 403 => return Err(Error::Auth),

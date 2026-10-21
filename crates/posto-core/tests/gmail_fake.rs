@@ -14,6 +14,7 @@ use posto_core::store::{Mailbox, Store};
 use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -82,6 +83,24 @@ async fn connected(server: &MockServer, history_id: &str) -> Session {
     connect_with(endpoints(server), client(), "rt-1")
         .await
         .unwrap()
+}
+
+/// Connects while the profile says `1`, then makes it say `history_id`, so a
+/// cursor read at connect time is told apart from a fresh one.
+async fn connected_at(server: &MockServer, history_id: &str) -> Session {
+    let session = connected(server, "1").await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("{API}/profile")))
+        .respond_with(reply(
+            200,
+            json!({"emailAddress": "me@gmail.com", "historyId": history_id}),
+        ))
+        .with_priority(1)
+        .mount(server)
+        .await;
+
+    session
 }
 
 /// The requests the server saw for `p` (a path below the API root, or a
@@ -605,7 +624,7 @@ async fn mount_list(server: &MockServer, first: Value, second: Option<Value>) {
 #[tokio::test]
 async fn initial_captures_history_before_listing() {
     let server = MockServer::start().await;
-    let session = connected(&server, "500").await;
+    let session = connected_at(&server, "500").await;
 
     mount_list(
         &server,
@@ -639,6 +658,7 @@ async fn initial_captures_history_before_listing() {
         .unwrap();
 
     assert!(last_profile < first_list);
+    assert_eq!(requests(&server, "/profile").await.len(), 2);
 
     let lists = requests(&server, "/messages").await;
 
@@ -673,7 +693,7 @@ async fn initial_captures_history_before_listing() {
     }
 
     let capped = MockServer::start().await;
-    let session = connected(&capped, "500").await;
+    let session = connected_at(&capped, "500").await;
 
     mount_list(
         &capped,
@@ -701,7 +721,7 @@ async fn initial_captures_history_before_listing() {
     );
 
     let none = MockServer::start().await;
-    let session = connected(&none, "500").await;
+    let session = connected_at(&none, "500").await;
     let (emails, cursor) = session.initial("a", 0).await.unwrap();
 
     assert!(emails.is_empty());
@@ -709,7 +729,7 @@ async fn initial_captures_history_before_listing() {
     assert!(requests(&none, "/messages").await.is_empty());
 
     let chats = MockServer::start().await;
-    let session = connected(&chats, "500").await;
+    let session = connected_at(&chats, "500").await;
 
     mount_list(
         &chats,
@@ -1195,4 +1215,138 @@ async fn login_failures() {
     finish(&browser).await;
 
     assert!(matches!(result, Err(Error::Other(_))));
+}
+
+// ── unreadable error bodies ─────────────────────────────────────────────────
+
+/// A response whose body stops after one of the 100 bytes it announced.
+fn truncated(status: &str) -> String {
+    format!("HTTP/1.1 {status}\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")
+}
+
+/// A complete JSON response.
+fn complete(body: &Value) -> String {
+    let body = body.to_string();
+
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A loopback API stub for what wiremock cannot do. `/profile` always answers
+/// the profile; every other request takes the next of `script` (the last
+/// repeats). Returns the API root and the `Authorization` header of each
+/// non-profile request.
+async fn stub_api(script: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+
+    tokio::spawn(async move {
+        let mut next = 0;
+
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let answer = if head.starts_with("GET /profile") {
+                complete(&json!({"emailAddress": "me@gmail.com", "historyId": "100"}))
+            } else {
+                let auth = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or_default();
+
+                log.lock().unwrap().push(auth.to_owned());
+
+                let answer = script[next.min(script.len() - 1)].clone();
+
+                next += 1;
+
+                answer
+            };
+
+            let _ = stream.write_all(answer.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    (root, seen)
+}
+
+/// Endpoints whose API is the stub at `root` and whose token endpoint is
+/// `server`.
+fn stubbed(server: &MockServer, root: &str) -> Endpoints {
+    Endpoints {
+        api: root.to_owned(),
+        ..endpoints(server)
+    }
+}
+
+#[tokio::test]
+async fn unreadable_error_bodies_do_not_change_the_status_handling() {
+    // A 401 whose body breaks off still forgets the token and replays.
+    let server = MockServer::start().await;
+
+    mount_token_once(&server, "at-1").await;
+    mount_token_once(&server, "at-2").await;
+
+    let (root, seen) = stub_api(vec![
+        truncated("401 Unauthorized"),
+        complete(&json!({"labels": []})),
+    ])
+    .await;
+    let session = connect_with(stubbed(&server, &root), client(), "rt-1")
+        .await
+        .unwrap();
+    let store = Store::open_memory().unwrap();
+
+    session.sync_mailboxes(&store, "a").await.unwrap();
+
+    assert_eq!(requests(&server, "/token").await.len(), 2);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["authorization: Bearer at-1", "authorization: Bearer at-2"]
+    );
+
+    // A 404 whose body breaks off is still a history that cannot be read.
+    let server = MockServer::start().await;
+
+    mount_token_once(&server, "at-1").await;
+
+    let (root, _) = stub_api(vec![truncated("404 Not Found")]).await;
+    let session = connect_with(stubbed(&server, &root), client(), "rt-1")
+        .await
+        .unwrap();
+
+    assert_eq!(session.delta("a", "100").await.unwrap(), Delta::Resync);
+
+    // A 503 whose body breaks off is still retried.
+    let server = MockServer::start().await;
+
+    mount_token_once(&server, "at-1").await;
+
+    let (root, seen) = stub_api(vec![
+        truncated("503 Service Unavailable"),
+        truncated("503 Service Unavailable"),
+        complete(&json!({"sendAs": []})),
+    ])
+    .await;
+    let session = connect_with(stubbed(&server, &root), client(), "rt-1")
+        .await
+        .unwrap();
+
+    assert_eq!(session.identities().await.unwrap(), vec![]);
+    assert_eq!(seen.lock().unwrap().len(), 3);
 }
