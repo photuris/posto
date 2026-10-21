@@ -13,8 +13,13 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::alphabet::URL_SAFE;
+use base64::engine::DecodePaddingMode;
+use base64::engine::general_purpose::{
+    GeneralPurpose, GeneralPurposeConfig, URL_SAFE_NO_PAD as B64,
+};
 use futures_util::stream::{self, StreamExt};
+use mail_parser::MimeHeaders;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rand::RngCore;
 use reqwest::{Method, Url};
@@ -24,9 +29,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+use crate::compose::Draft;
 use crate::error::{Error, Result};
-use crate::provider::{Delta, DeltaPage, Identity};
-use crate::store::{Address, EmailSummary, Mailbox, Store};
+use crate::provider::{Change, Delta, DeltaPage, Identity, Updated};
+use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 
 /// The OAuth scope Posto asks for: full access, because permanent delete needs
 /// it.
@@ -58,6 +64,19 @@ pub(crate) const ARCHIVE: &str = "ARCHIVE";
 
 /// The headers the list view needs, requested with `format=metadata`.
 const METADATA_HEADERS: [&str; 5] = ["From", "To", "Cc", "Subject", "Content-Type"];
+
+/// The most ids Gmail takes in one `batchModify` or `batchDelete`.
+const BATCH_MAX: usize = 1000;
+
+/// Base64url that accepts padded and unpadded input, for `format=raw`.
+const B64_ANY: GeneralPurpose = GeneralPurpose::new(
+    &URL_SAFE,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// The folders a message sits in at most one of; a move adds one and removes
+/// the other two. `ARCHIVE` is Posto's own and never sent to Gmail.
+const FOLDERS: [&str; 3] = ["INBOX", "SPAM", "TRASH"];
 
 /// How many metadata requests run at once.
 const IN_FLIGHT: usize = 4;
@@ -960,6 +979,166 @@ impl Session {
         }
     }
 
+    /// The raw RFC 822 bytes of message `id`.
+    async fn raw(&self, id: &str) -> Result<Vec<u8>> {
+        let path = format!("/messages/{}", utf8_percent_encode(id, NON_ALPHANUMERIC));
+        let query = [("format", "raw".to_owned())];
+        let message = self.call(Method::GET, &path, &query, None, true).await?;
+
+        decode_raw(message["raw"].as_str().ok_or_else(malformed)?)
+    }
+
+    /// The body of message `id`, parsed from its raw form; `None` when the
+    /// server no longer has it.
+    ///
+    /// # Errors
+    ///
+    /// Any request error other than a 404, or an unreadable message.
+    pub async fn body(&self, email_id: &str) -> Result<Option<EmailBody>> {
+        let bytes = match self.raw(email_id).await {
+            Err(Error::NotFound(_)) => return Ok(None),
+            other => other?,
+        };
+
+        Ok(Some(body_from(email_id, &parse(&bytes)?)))
+    }
+
+    /// The bytes of attachment `att` of message `email_id`; its `blob_id` is
+    /// the index among the message's attachments.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when the message or the attachment is gone, any
+    /// other request error, or an unreadable message.
+    pub async fn download(&self, email_id: &str, att: &Attachment) -> Result<Vec<u8>> {
+        let missing = || Error::NotFound(format!("attachment {}", att.blob_id));
+        let bytes = match self.raw(email_id).await {
+            Err(Error::NotFound(_)) => return Err(missing()),
+            other => other?,
+        };
+        let index = att.blob_id.parse::<usize>().map_err(|_| missing())?;
+        let message = parse(&bytes)?;
+        let part = message.attachments().nth(index).ok_or_else(missing)?;
+
+        Ok(part.contents().to_vec())
+    }
+
+    /// Applies `change` to `ids` with `batchModify`, 1000 ids per request.
+    ///
+    /// Gmail refuses a batch as a whole, so nothing is reported as refused.
+    /// An error aborts; earlier chunks stay applied and the next delta
+    /// reconciles.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a change to `SENT` or `DRAFT` (before any
+    /// request), or any request error.
+    pub async fn update(&self, ids: &[String], change: &Change) -> Result<Updated> {
+        let Some((add, remove)) = modify_lists(change)? else {
+            return Ok(Updated::default());
+        };
+
+        for chunk in ids.chunks(BATCH_MAX) {
+            let body = json!({"ids": chunk, "addLabelIds": add, "removeLabelIds": remove});
+
+            self.call(Method::POST, "/messages/batchModify", &[], Some(body), true)
+                .await?;
+        }
+
+        Ok(Updated::default())
+    }
+
+    /// Deletes `ids` for good with `batchDelete`, 1000 ids per request, and
+    /// returns them all.
+    ///
+    /// # Errors
+    ///
+    /// Any request error; earlier chunks stay deleted.
+    pub async fn destroy(&self, ids: &[String]) -> Result<Vec<String>> {
+        for chunk in ids.chunks(BATCH_MAX) {
+            self.call(
+                Method::POST,
+                "/messages/batchDelete",
+                &[],
+                Some(json!({"ids": chunk})),
+                true,
+            )
+            .await?;
+        }
+
+        Ok(ids.to_vec())
+    }
+
+    /// True when message `email_id` carries a non-blank `List-Unsubscribe`
+    /// header; any error counts as no.
+    pub async fn has_unsubscribe(&self, email_id: &str) -> bool {
+        let path = format!(
+            "/messages/{}",
+            utf8_percent_encode(email_id, NON_ALPHANUMERIC)
+        );
+        let query = [
+            ("format", "metadata".to_owned()),
+            ("metadataHeaders", "List-Unsubscribe".to_owned()),
+        ];
+        let Ok(message) = self.call(Method::GET, &path, &query, None, true).await else {
+            return false;
+        };
+
+        message["payload"]["headers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|h| {
+                h["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("List-Unsubscribe"))
+                    && h["value"].as_str().is_some_and(|v| !v.trim().is_empty())
+            })
+    }
+
+    /// Sends the draft with `messages.send` and returns the new message id.
+    ///
+    /// A reply goes into the original's thread when the original is a
+    /// message of this account in the store. The request is never retried:
+    /// an outcome that may have reached Gmail is [`Error::Other`] telling the
+    /// caller not to resend.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] for a draft without recipients, a store failure
+    /// while looking up the thread, [`Error::Auth`] when Google rejects the
+    /// token twice, and any request error.
+    pub async fn send(
+        &self,
+        store: &Store,
+        account: &str,
+        identity: &Identity,
+        draft: &Draft,
+        text: &str,
+        html: &str,
+    ) -> Result<String> {
+        let raw = B64.encode(outgoing(identity, draft, text, html)?);
+        let mut body = json!({"raw": raw});
+        let same_account = draft
+            .reply_to_account_id
+            .as_deref()
+            .is_none_or(|a| a == account);
+
+        if let (true, Some(original)) = (same_account, &draft.reply_to_email_id)
+            && let Some(email) = store.email(account, original)?
+        {
+            body["threadId"] = json!(email.thread_id);
+        }
+
+        let reply = self
+            .call(Method::POST, "/messages/send", &[], Some(body), false)
+            .await?;
+
+        non_empty(&reply, "id").map(str::to_owned).ok_or_else(|| {
+            Error::Other("gmail: sent, but the reply has no id; do not resend".into())
+        })
+    }
+
     /// Sleeps before the next try of a transient failure, or gives up with
     /// the status when `retry` is off or three retries are spent.
     async fn back_off(&self, retry: bool, attempt: &mut u32, status: u16) -> Result<()> {
@@ -1237,6 +1416,207 @@ fn summary_from(account: &str, m: &Value) -> Option<EmailSummary> {
     })
 }
 
+// ── Bodies and outgoing mail ────────────────────────────────────────────────
+
+/// Decodes a `raw` field: base64url, padding optional.
+pub(crate) fn decode_raw(raw: &str) -> Result<Vec<u8>> {
+    B64_ANY.decode(raw).map_err(|_| malformed())
+}
+
+/// Parses raw RFC 822 bytes.
+fn parse(bytes: &[u8]) -> Result<mail_parser::Message<'_>> {
+    mail_parser::MessageParser::default()
+        .parse(bytes)
+        .ok_or_else(|| Error::Http("gmail: unreadable message".into()))
+}
+
+/// The text of the first part in `ids` whose content type is `want`
+/// (`text/plain` also matches a part without one).
+fn first_text(message: &mail_parser::Message<'_>, ids: &[u32], want: &str) -> Option<String> {
+    ids.iter()
+        .filter_map(|&id| message.part(id))
+        .find(|part| match part.content_type() {
+            Some(ct) => {
+                ct.ctype().eq_ignore_ascii_case("text")
+                    && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case(want))
+            }
+            None => want == "plain",
+        })
+        .and_then(|part| part.text_contents())
+        .map(str::to_owned)
+}
+
+/// Every id of a message-id header, without angle brackets.
+fn id_list(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    value
+        .as_text_list()
+        .into_iter()
+        .flatten()
+        .map(|id| id.to_string())
+        .collect()
+}
+
+/// The body, attachments and threading headers of a parsed message.
+/// Attachment blob ids are indexes into `message.attachments()`.
+pub(crate) fn body_from(email_id: &str, message: &mail_parser::Message<'_>) -> EmailBody {
+    EmailBody {
+        email_id: email_id.to_owned(),
+        html: first_text(message, &message.html_body, "html"),
+        text: first_text(message, &message.text_body, "plain"),
+        attachments: message
+            .attachments()
+            .enumerate()
+            .map(|(i, part)| Attachment {
+                blob_id: i.to_string(),
+                name: part.attachment_name().unwrap_or("attachment").to_owned(),
+                mime: part.content_type().map_or_else(
+                    || "application/octet-stream".to_owned(),
+                    |ct| match ct.subtype() {
+                        Some(sub) => format!("{}/{sub}", ct.ctype()),
+                        None => "application/octet-stream".to_owned(),
+                    },
+                ),
+                size: i64::try_from(part.contents().len()).unwrap_or(i64::MAX),
+            })
+            .collect(),
+        in_reply_to: id_list(message.in_reply_to()),
+        references: id_list(message.references()),
+        message_id: message
+            .message_id()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        reply_to: addresses(message.reply_to()),
+    }
+}
+
+/// The `(addLabelIds, removeLabelIds)` of the `batchModify` that applies
+/// `change`; `None` when Gmail needs no request.
+///
+/// A folder move adds only the last folder and removes the other two of
+/// `INBOX`, `SPAM` and `TRASH`; `ARCHIVE` is never sent.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] for a change to `SENT` or `DRAFT`, which Gmail sets
+/// itself.
+pub(crate) fn modify_lists(change: &Change) -> Result<Option<(Vec<String>, Vec<String>)>> {
+    let (add, remove): (&[String], &[String]) = match change {
+        Change::Keyword(keyword, on) => {
+            let (label, adds) = match *keyword {
+                "$seen" => ("UNREAD", !on),
+                "$flagged" => ("STARRED", *on),
+                _ => return Ok(None),
+            };
+            let list = vec![label.to_owned()];
+
+            return Ok(Some(if adds { (list, vec![]) } else { (vec![], list) }));
+        }
+        Change::Mailbox(target) => (std::slice::from_ref(target), &[]),
+        Change::Patch { add, remove } => (add, remove),
+    };
+
+    if add
+        .iter()
+        .chain(remove)
+        .any(|id| id == "SENT" || id == "DRAFT")
+    {
+        return Err(Error::Unsupported(
+            "changing Sent or Drafts on Gmail accounts".into(),
+        ));
+    }
+
+    let is_folder = |id: &str| id == ARCHIVE || FOLDERS.contains(&id);
+    let folder = add.iter().rfind(|id| is_folder(id));
+    let mut added: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+
+    for id in add {
+        if is_folder(id) && (id == ARCHIVE || Some(id) != folder) {
+            continue;
+        }
+
+        if !added.contains(id) {
+            added.push(id.clone());
+        }
+    }
+
+    for id in remove {
+        if id != ARCHIVE && !added.contains(id) && !removed.contains(id) {
+            removed.push(id.clone());
+        }
+    }
+
+    if let Some(folder) = folder {
+        for other in FOLDERS {
+            if other != folder && !removed.iter().any(|r| r == other) {
+                removed.push(other.to_owned());
+            }
+        }
+    }
+
+    Ok((!added.is_empty() || !removed.is_empty()).then_some((added, removed)))
+}
+
+/// The RFC 822 message for a draft: `text` and `html` as alternatives.
+///
+/// # Errors
+///
+/// [`Error::Config`] when the draft has no recipient.
+pub(crate) fn outgoing(
+    identity: &Identity,
+    draft: &Draft,
+    text: &str,
+    html: &str,
+) -> Result<Vec<u8>> {
+    use mail_builder::MessageBuilder;
+    use mail_builder::headers::address::Address as Mailbox;
+
+    if draft.to.is_empty() && draft.cc.is_empty() && draft.bcc.is_empty() {
+        return Err(Error::Config(
+            "a message needs at least one recipient".into(),
+        ));
+    }
+
+    let mailbox = |name: Option<&str>, email: &str| {
+        Mailbox::new_address(
+            name.filter(|n| !n.is_empty()).map(str::to_owned),
+            email.to_owned(),
+        )
+    };
+    let list = |people: &[Address]| -> Vec<Mailbox<'static>> {
+        people
+            .iter()
+            .map(|a| mailbox(a.name.as_deref(), &a.email))
+            .collect()
+    };
+    let mut message = MessageBuilder::new()
+        .from(mailbox(Some(&identity.name), &identity.email))
+        .subject(draft.subject.clone())
+        .text_body(text.to_owned())
+        .html_body(html.to_owned());
+
+    for (set, people) in [
+        (MessageBuilder::to as fn(_, _) -> _, &draft.to),
+        (MessageBuilder::cc, &draft.cc),
+        (MessageBuilder::bcc, &draft.bcc),
+    ] {
+        if !people.is_empty() {
+            message = set(message, list(people));
+        }
+    }
+
+    if let Some(id) = &draft.in_reply_to {
+        message = message.in_reply_to(id.clone());
+    }
+
+    if !draft.references.is_empty() {
+        message = message.references(draft.references.clone());
+    }
+
+    Ok(message.write_to_vec()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,6 +1625,9 @@ mod tests {
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
+
+    /// The `(add, remove)` label lists of a `batchModify`.
+    type Lists = (Vec<String>, Vec<String>);
 
     /// Compile-time check that `Session` can live in shared state.
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1438,6 +1821,122 @@ mod tests {
             assert!(matches!(err, Error::Config(_)), "{text}");
             assert!(!err.to_string().contains("csecret"));
         }
+    }
+
+    #[test]
+    fn modify_lists_table() {
+        use Change::{Keyword, Mailbox as Move, Patch};
+
+        let patch = |add: &[&str], remove: &[&str]| Patch {
+            add: ids(add),
+            remove: ids(remove),
+        };
+        let cases: Vec<(Change, Option<Lists>)> = vec![
+            (Keyword("$seen", true), Some((ids(&[]), ids(&["UNREAD"])))),
+            (Keyword("$seen", false), Some((ids(&["UNREAD"]), ids(&[])))),
+            (
+                Keyword("$flagged", true),
+                Some((ids(&["STARRED"]), ids(&[]))),
+            ),
+            (
+                Keyword("$flagged", false),
+                Some((ids(&[]), ids(&["STARRED"]))),
+            ),
+            (Keyword("$answered", true), None),
+            (
+                Move("ARCHIVE".into()),
+                Some((ids(&[]), ids(&["INBOX", "SPAM", "TRASH"]))),
+            ),
+            (
+                Move("TRASH".into()),
+                Some((ids(&["TRASH"]), ids(&["INBOX", "SPAM"]))),
+            ),
+            (
+                Move("INBOX".into()),
+                Some((ids(&["INBOX"]), ids(&["SPAM", "TRASH"]))),
+            ),
+            (
+                patch(&["Label_1"], &["INBOX"]),
+                Some((ids(&["Label_1"]), ids(&["INBOX"]))),
+            ),
+            (
+                patch(&["INBOX", "Label_1"], &[]),
+                Some((ids(&["INBOX", "Label_1"]), ids(&["SPAM", "TRASH"]))),
+            ),
+            (
+                patch(&["ARCHIVE"], &["INBOX"]),
+                Some((ids(&[]), ids(&["INBOX", "SPAM", "TRASH"]))),
+            ),
+            (patch(&[], &["ARCHIVE"]), None),
+            (
+                patch(&["SPAM", "TRASH"], &[]),
+                Some((ids(&["TRASH"]), ids(&["INBOX", "SPAM"]))),
+            ),
+            (
+                patch(&["INBOX", "ARCHIVE"], &[]),
+                Some((ids(&[]), ids(&["INBOX", "SPAM", "TRASH"]))),
+            ),
+            (
+                patch(&["INBOX"], &["INBOX"]),
+                Some((ids(&["INBOX"]), ids(&["SPAM", "TRASH"]))),
+            ),
+            (
+                patch(&["Label_1", "Label_1"], &[]),
+                Some((ids(&["Label_1"]), ids(&[]))),
+            ),
+        ];
+
+        for (change, want) in cases {
+            assert_eq!(modify_lists(&change).unwrap(), want, "{change:?}");
+        }
+
+        for change in [
+            Move("SENT".into()),
+            Move("DRAFT".into()),
+            patch(&[], &["SENT"]),
+        ] {
+            assert!(
+                matches!(modify_lists(&change), Err(Error::Unsupported(_))),
+                "{change:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_raw_accepts_both_paddings() {
+        assert_eq!(decode_raw("aGk").unwrap(), b"hi");
+        assert_eq!(decode_raw("aGk=").unwrap(), b"hi");
+        assert_eq!(decode_raw("_-8").unwrap(), [0xff, 0xef]);
+        assert!(matches!(decode_raw("a$b"), Err(Error::Http(_))));
+    }
+
+    #[test]
+    fn outgoing_needs_a_recipient() {
+        let identity = Identity {
+            id: "me@gmail.com".into(),
+            name: String::new(),
+            email: "me@gmail.com".into(),
+        };
+        let mut draft = Draft::default();
+
+        assert!(matches!(
+            outgoing(&identity, &draft, "t", "<p>h</p>"),
+            Err(Error::Config(_))
+        ));
+
+        draft.bcc.push(Address {
+            name: None,
+            email: "b@example.net".into(),
+        });
+
+        let bytes = outgoing(&identity, &draft, "t", "<p>h</p>").unwrap();
+        let message = parse(&bytes).unwrap();
+        let from = message.from().and_then(|a| a.first()).unwrap();
+
+        assert_eq!(from.name, None);
+        assert_eq!(from.address.as_deref(), Some("me@gmail.com"));
+        assert!(message.to().is_none());
+        assert_eq!(addresses(message.bcc()).len(), 1);
     }
 
     #[test]

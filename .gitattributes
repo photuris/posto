@@ -1,1 +1,2 @@
 graphify-out/graph.json merge=graphify
+crates/posto-core/tests/fixtures/gmail/*.eml -text

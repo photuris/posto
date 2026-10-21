@@ -8,9 +8,10 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use posto_core::Error;
+use posto_core::compose::Draft;
 use posto_core::gmail::{Endpoints, GoogleClient, Login, Session, connect_with, login_with};
-use posto_core::provider::{Delta, Identity};
-use posto_core::store::{Mailbox, Store};
+use posto_core::provider::{Change, Delta, Identity, Updated};
+use posto_core::store::{Address, Attachment, EmailSummary, Mailbox, Store};
 use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1349,4 +1350,544 @@ async fn unreadable_error_bodies_do_not_change_the_status_handling() {
 
     assert_eq!(session.identities().await.unwrap(), vec![]);
     assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+// ── bodies, updates, destroy, unsubscribe, send ─────────────────────────────
+
+/// A fixture message from `tests/fixtures/gmail/`.
+fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/gmail/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+/// Mounts `format=raw` for message `id`: the fixture, base64url without
+/// padding unless `padded`.
+async fn mount_raw(server: &MockServer, id: &str, name: &str, padded: bool) {
+    let bytes = fixture(name);
+    let raw = if padded {
+        base64::engine::general_purpose::URL_SAFE.encode(bytes)
+    } else {
+        B64.encode(bytes)
+    };
+
+    mount_get(
+        server,
+        &format!("/messages/{id}"),
+        200,
+        json!({"id": id, "raw": raw}),
+    )
+    .await;
+}
+
+/// Mounts `POST <API><p>` answering `status` with `body`.
+async fn mount_post(server: &MockServer, p: &str, status: u16, body: Value) {
+    Mock::given(method("POST"))
+        .and(path(format!("{API}{p}")))
+        .respond_with(reply(status, body))
+        .mount(server)
+        .await;
+}
+
+/// A request's JSON body.
+fn json_body(r: &Request) -> Value {
+    serde_json::from_slice(&r.body).unwrap()
+}
+
+/// `n` message ids, `m0`, `m1`, ...
+fn many_ids(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("m{i}")).collect()
+}
+
+/// An address with a name.
+fn person(name: &str, email: &str) -> Address {
+    Address {
+        name: Some(name.into()),
+        email: email.into(),
+    }
+}
+
+#[tokio::test]
+async fn body_parses_raw_mime() {
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    mount_raw(&server, "m1", "mixed.eml", false).await;
+
+    let body = session.body("m1").await.unwrap().unwrap();
+
+    assert_eq!(body.email_id, "m1");
+    assert_eq!(body.text.as_deref().map(str::trim), Some("Hello"));
+    assert!(body.html.as_deref().unwrap().contains("<p>Hello</p>"));
+    assert_eq!(
+        body.attachments,
+        [Attachment {
+            blob_id: "0".into(),
+            name: "a.txt".into(),
+            mime: "text/plain".into(),
+            size: 5,
+        }]
+    );
+    assert_eq!(body.message_id, ["m1@x"]);
+    assert_eq!(body.in_reply_to, ["p@x"]);
+    assert_eq!(body.references, ["r1@x", "p@x"]);
+    assert_eq!(body.reply_to, [person("List", "list@example.org")]);
+    assert_eq!(
+        query_all(&requests(&server, "/messages/m1").await[0], "format"),
+        ["raw"]
+    );
+
+    mount_raw(&server, "padded", "mixed.eml", true).await;
+
+    assert_eq!(
+        session.body("padded").await.unwrap().unwrap().text,
+        body.text
+    );
+
+    mount_raw(&server, "plain", "plain.eml", false).await;
+
+    let plain = session.body("plain").await.unwrap().unwrap();
+
+    assert_eq!(plain.html, None);
+    assert_eq!(plain.text.as_deref().map(str::trim), Some("Only text"));
+
+    mount_raw(&server, "html", "html.eml", false).await;
+
+    let html = session.body("html").await.unwrap().unwrap();
+
+    assert_eq!(html.text, None);
+    assert!(html.html.unwrap().contains("Only html"));
+
+    mount_get(&server, "/messages/gone", 404, json!({})).await;
+
+    assert_eq!(session.body("gone").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn download_returns_the_attachment_bytes() {
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    mount_raw(&server, "m1", "mixed.eml", false).await;
+    mount_get(&server, "/messages/gone", 404, json!({})).await;
+
+    let att = |blob_id: &str| Attachment {
+        blob_id: blob_id.into(),
+        name: "a.txt".into(),
+        mime: "text/plain".into(),
+        size: 5,
+    };
+
+    assert_eq!(session.download("m1", &att("0")).await.unwrap(), b"hello");
+    assert!(matches!(
+        session.download("m1", &att("1")).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        session.download("m1", &att("x")).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        session.download("gone", &att("0")).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn update_sends_batch_modify() {
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    mount_post(&server, "/messages/batchModify", 200, json!({})).await;
+
+    let pair = ["m1".to_owned(), "m2".to_owned()];
+    let sent = || requests(&server, "/messages/batchModify");
+
+    assert_eq!(
+        session
+            .update(&pair, &Change::Mailbox("ARCHIVE".into()))
+            .await
+            .unwrap(),
+        Updated::default()
+    );
+    assert_eq!(
+        json_body(&sent().await[0]),
+        json!({
+            "ids": ["m1", "m2"],
+            "addLabelIds": [],
+            "removeLabelIds": ["INBOX", "SPAM", "TRASH"],
+        })
+    );
+
+    session
+        .update(&pair, &Change::Keyword("$seen", true))
+        .await
+        .unwrap();
+
+    let all = sent().await;
+
+    assert_eq!(all.len(), 2);
+    assert_eq!(json_body(&all[1])["removeLabelIds"], json!(["UNREAD"]));
+    assert_eq!(json_body(&all[1])["addLabelIds"], json!([]));
+
+    assert_eq!(
+        session
+            .update(&pair, &Change::Keyword("$answered", true))
+            .await
+            .unwrap(),
+        Updated::default()
+    );
+    assert_eq!(
+        session
+            .update(&[], &Change::Keyword("$seen", true))
+            .await
+            .unwrap(),
+        Updated::default()
+    );
+    assert_eq!(sent().await.len(), 2);
+
+    for target in ["SENT", "DRAFT"] {
+        for ids in [&pair[..], &[]] {
+            let result = session.update(ids, &Change::Mailbox(target.into())).await;
+
+            assert!(matches!(result, Err(Error::Unsupported(_))), "{target}");
+        }
+    }
+
+    assert_eq!(sent().await.len(), 2);
+
+    session
+        .update(&many_ids(1001), &Change::Keyword("$flagged", true))
+        .await
+        .unwrap();
+
+    let all = sent().await;
+    let chunk = |i: usize| json_body(&all[i])["ids"].as_array().unwrap().len();
+
+    assert_eq!(all.len(), 4);
+    assert_eq!((chunk(2), chunk(3)), (1000, 1));
+    assert_eq!(json_body(&all[3])["ids"], json!(["m1000"]));
+    assert_eq!(json_body(&all[3])["addLabelIds"], json!(["STARRED"]));
+}
+
+#[tokio::test]
+async fn destroy_uses_batch_delete() {
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    mount_post(&server, "/messages/batchDelete", 200, json!({})).await;
+
+    let pair = ["m1".to_owned(), "m2".to_owned()];
+
+    assert_eq!(session.destroy(&pair).await.unwrap(), pair);
+
+    let sent = requests(&server, "/messages/batchDelete").await;
+
+    assert_eq!(sent.len(), 1);
+    assert_eq!(json_body(&sent[0]), json!({"ids": ["m1", "m2"]}));
+
+    assert_eq!(session.destroy(&[]).await.unwrap(), Vec::<String>::new());
+    assert_eq!(requests(&server, "/messages/batchDelete").await.len(), 1);
+
+    let ids = many_ids(1001);
+
+    assert_eq!(session.destroy(&ids).await.unwrap(), ids);
+    assert_eq!(requests(&server, "/messages/batchDelete").await.len(), 3);
+}
+
+#[tokio::test]
+async fn has_unsubscribe_reads_the_header() {
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+    let with = |name: &str, value: &str| json!({"id": "x", "payload": {"headers": [{"name": name, "value": value}]}});
+
+    mount_get(
+        &server,
+        "/messages/yes",
+        200,
+        with("List-Unsubscribe", "<mailto:u@example.org>"),
+    )
+    .await;
+    mount_get(
+        &server,
+        "/messages/lower",
+        200,
+        with("list-unsubscribe", "<mailto:u@example.org>"),
+    )
+    .await;
+    mount_get(
+        &server,
+        "/messages/no",
+        200,
+        json!({"id": "x", "payload": {"headers": []}}),
+    )
+    .await;
+    mount_get(
+        &server,
+        "/messages/blank",
+        200,
+        with("List-Unsubscribe", "  "),
+    )
+    .await;
+    mount_get(&server, "/messages/gone", 404, json!({})).await;
+
+    assert!(session.has_unsubscribe("yes").await);
+    assert!(session.has_unsubscribe("lower").await);
+    assert!(!session.has_unsubscribe("no").await);
+    assert!(!session.has_unsubscribe("blank").await);
+    assert!(!session.has_unsubscribe("gone").await);
+
+    let asked = &requests(&server, "/messages/yes").await[0];
+
+    assert_eq!(query_all(asked, "metadataHeaders"), ["List-Unsubscribe"]);
+    assert_eq!(query_all(asked, "format"), ["metadata"]);
+}
+
+/// A stored email of account `a` in thread `t-9`.
+fn original() -> EmailSummary {
+    EmailSummary {
+        account_id: "a".into(),
+        id: "orig".into(),
+        thread_id: "t-9".into(),
+        received_at: "2023-11-14T22:13:20Z".into(),
+        from: vec![person("Bob", "bob@example.net")],
+        to: vec![],
+        cc: vec![],
+        subject: "Café".into(),
+        preview: String::new(),
+        size: 1,
+        has_attachment: false,
+        mailbox_ids: vec!["INBOX".into()],
+        keywords: vec![],
+    }
+}
+
+/// The draft of the send tests: a reply to `orig`.
+fn reply_draft() -> Draft {
+    Draft {
+        account_id: "a".into(),
+        to: vec![person("Bob", "bob@example.net")],
+        cc: vec![Address {
+            name: None,
+            email: "carol@example.net".into(),
+        }],
+        bcc: vec![Address {
+            name: Some(String::new()),
+            email: "dave@example.net".into(),
+        }],
+        subject: "Re: Café".into(),
+        in_reply_to: Some("p@x".into()),
+        references: vec!["r1@x".into(), "p@x".into()],
+        reply_to_email_id: Some("orig".into()),
+        ..Draft::default()
+    }
+}
+
+/// The identity every send test uses.
+fn me() -> Identity {
+    Identity {
+        id: "me@gmail.com".into(),
+        name: "Me".into(),
+        email: "me@gmail.com".into(),
+    }
+}
+
+#[tokio::test]
+async fn send_posts_raw_mime_in_the_thread() {
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+    let store = Store::open_memory().unwrap();
+
+    store.upsert_emails(&[original()]).unwrap();
+    mount_post(
+        &server,
+        "/messages/send",
+        200,
+        json!({"id": "sent-1", "threadId": "t-9", "labelIds": ["SENT"]}),
+    )
+    .await;
+
+    let send = |draft: Draft| {
+        let (session, store) = (&session, &store);
+
+        async move {
+            session
+                .send(
+                    store,
+                    "a",
+                    &me(),
+                    &draft,
+                    "plain words",
+                    "<p>html words</p>",
+                )
+                .await
+        }
+    };
+
+    assert_eq!(send(reply_draft()).await.unwrap(), "sent-1");
+
+    let sent = requests(&server, "/messages/send").await;
+    let body = json_body(&sent[0]);
+    let raw = body["raw"].as_str().unwrap();
+
+    assert_eq!(body["threadId"], "t-9");
+    assert!(!raw.contains('='));
+
+    let bytes = B64.decode(raw).unwrap();
+    let message = mail_parser::MessageParser::default().parse(&bytes).unwrap();
+    let only = |a: Option<&mail_parser::Address>| {
+        let first = a.unwrap().first().unwrap();
+
+        (
+            first.name.as_deref().map(str::to_owned),
+            first.address.as_deref().unwrap().to_owned(),
+        )
+    };
+
+    assert_eq!(
+        only(message.from()),
+        (Some("Me".into()), "me@gmail.com".into())
+    );
+    assert_eq!(
+        only(message.to()),
+        (Some("Bob".into()), "bob@example.net".into())
+    );
+    assert_eq!(only(message.cc()), (None, "carol@example.net".into()));
+    assert_eq!(only(message.bcc()), (None, "dave@example.net".into()));
+    assert_eq!(message.subject(), Some("Re: Café"));
+    assert_eq!(message.in_reply_to().as_text(), Some("p@x"));
+    assert_eq!(
+        message.references().as_text_list().unwrap(),
+        ["r1@x", "p@x"]
+    );
+    assert!(message.body_text(0).unwrap().contains("plain words"));
+    assert!(message.body_html(0).unwrap().contains("<p>html words</p>"));
+
+    let mut no_reply = reply_draft();
+
+    no_reply.reply_to_email_id = None;
+    no_reply.in_reply_to = None;
+    no_reply.references.clear();
+    send(no_reply).await.unwrap();
+
+    let mut other_account = reply_draft();
+
+    other_account.reply_to_account_id = Some("b".into());
+    send(other_account).await.unwrap();
+
+    let mut own_account = reply_draft();
+
+    own_account.reply_to_account_id = Some("a".into());
+    send(own_account).await.unwrap();
+
+    let sent = requests(&server, "/messages/send").await;
+
+    assert_eq!(sent.len(), 4);
+    assert!(json_body(&sent[1]).get("threadId").is_none());
+    assert!(json_body(&sent[2]).get("threadId").is_none());
+    assert_eq!(json_body(&sent[3])["threadId"], "t-9");
+
+    let mut unknown = reply_draft();
+
+    unknown.reply_to_email_id = Some("nope".into());
+    send(unknown).await.unwrap();
+
+    assert!(
+        json_body(&requests(&server, "/messages/send").await[4])
+            .get("threadId")
+            .is_none()
+    );
+
+    let mut nobody = reply_draft();
+
+    nobody.to.clear();
+    nobody.cc.clear();
+    nobody.bcc.clear();
+
+    assert!(matches!(send(nobody).await, Err(Error::Config(_))));
+    assert_eq!(requests(&server, "/messages/send").await.len(), 5);
+
+    send_outcomes().await;
+}
+
+/// The send outcomes that must never be retried or hidden; run at the end of
+/// `send_posts_raw_mime_in_the_thread`.
+async fn send_outcomes() {
+    let store = Store::open_memory().unwrap();
+    let send = |session: Session| {
+        let store = &store;
+
+        async move {
+            session
+                .send(store, "a", &me(), &reply_draft(), "t", "<p>h</p>")
+                .await
+        }
+    };
+
+    // 503: no retry, plain transport error.
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    mount_post(&server, "/messages/send", 503, json!({})).await;
+
+    assert!(matches!(send(session).await, Err(Error::Http(_))));
+    assert_eq!(requests(&server, "/messages/send").await.len(), 1);
+
+    // 200 that is not JSON: may have been sent.
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("{API}/messages/send")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+
+    let Err(Error::Other(text)) = send(session).await else {
+        panic!("expected Error::Other");
+    };
+
+    assert!(text.contains("resend"), "{text}");
+    assert_eq!(requests(&server, "/messages/send").await.len(), 1);
+
+    // 200 without a usable id.
+    for body in [json!({}), json!({"id": ""})] {
+        let server = MockServer::start().await;
+        let session = connected(&server, "1").await;
+
+        mount_post(&server, "/messages/send", 200, body).await;
+
+        assert!(matches!(send(session).await, Err(Error::Other(_))));
+        assert_eq!(requests(&server, "/messages/send").await.len(), 1);
+    }
+
+    // 401 once: refreshed and replayed.
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    mount_token_once(&server, "at-2").await;
+    Mock::given(method("POST"))
+        .and(path(format!("{API}/messages/send")))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_post(&server, "/messages/send", 200, json!({"id": "sent-2"})).await;
+
+    assert_eq!(send(session).await.unwrap(), "sent-2");
+    assert_eq!(requests(&server, "/messages/send").await.len(), 2);
+    assert_eq!(requests(&server, "/token").await.len(), 2);
+
+    // 401 twice: auth error.
+    let server = MockServer::start().await;
+    let session = connected(&server, "1").await;
+
+    mount_token_once(&server, "at-2").await;
+    mount_post(&server, "/messages/send", 401, json!({})).await;
+
+    assert!(matches!(send(session).await, Err(Error::Auth)));
+    assert_eq!(requests(&server, "/messages/send").await.len(), 2);
 }

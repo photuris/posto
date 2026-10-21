@@ -12,6 +12,7 @@ dirs.workspace = true
 fd-lock.workspace = true
 futures-util.workspace = true
 html2text.workspace = true
+mail-builder.workspace = true
 mail-parser.workspace = true
 notify.workspace = true
 percent-encoding.workspace = true

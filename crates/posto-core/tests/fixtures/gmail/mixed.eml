@@ -1,0 +1,31 @@
+From: Ann <ann@example.org>
+To: me@gmail.com
+Subject: Hi
+Message-ID: <m1@x>
+In-Reply-To: <p@x>
+References: <r1@x>
+ <p@x>
+Reply-To: List <list@example.org>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer"
+
+--outer
+Content-Type: multipart/alternative; boundary="inner"
+
+--inner
+Content-Type: text/plain; charset=utf-8
+
+Hello
+--inner
+Content-Type: text/html; charset=utf-8
+
+<p>Hello</p>
+--inner--
+
+--outer
+Content-Type: text/plain; name="a.txt"
+Content-Disposition: attachment; filename="a.txt"
+Content-Transfer-Encoding: base64
+
+aGVsbG8=
+--outer--
