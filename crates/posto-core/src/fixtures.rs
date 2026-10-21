@@ -26,7 +26,7 @@ const MAILBOXES: [(&str, &str, Option<&str>, i64); 12] = [
     ("mb-newsletters", "Newsletters", None, 10),
     ("mb-receipts", "Receipts", None, 11),
     ("mb-bilag", "Bilag", None, 12),
-    ("mb-needs-reply", "Needs reply", None, 13),
+    ("mb-needs-reply", "Needs Reply", None, 13),
     ("mb-promos", "Deals", None, 15),
     ("mb-social", "Social Media", None, 16),
 ];

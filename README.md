@@ -283,7 +283,7 @@ keep_in_inbox = ["needs_reply", "personal", "alerts"]
 unsure_mailbox = "Unsure"
 
 [classify.trays]           # tray -> mailbox name; spam always goes to junk
-needs_reply = "Needs reply"
+needs_reply = "Needs Reply"
 personal = "Personal"
 alerts = "Alerts"
 receipts = "Receipts"

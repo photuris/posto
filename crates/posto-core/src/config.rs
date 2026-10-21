@@ -328,7 +328,7 @@ impl Default for ClassifyConfig {
                 .to_vec(),
             unsure_mailbox: "Unsure".to_string(),
             trays: [
-                ("needs_reply", "Needs reply"),
+                ("needs_reply", "Needs Reply"),
                 ("personal", "Personal"),
                 ("alerts", "Alerts"),
                 ("receipts", "Receipts"),
