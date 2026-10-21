@@ -33,6 +33,12 @@ pub fn data_dir() -> PathBuf {
         .join("posto")
 }
 
+/// Where the Google OAuth desktop client JSON lives: `google-client.json` in
+/// the data directory.
+pub fn google_client_path() -> PathBuf {
+    data_dir().join("google-client.json")
+}
+
 /// Whole application configuration, stored as `config.toml`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -126,6 +132,8 @@ pub enum Provider {
     Jmap,
     /// Proton Mail.
     Proton,
+    /// Gmail (Google's REST API).
+    Gmail,
 }
 
 impl Provider {
@@ -134,6 +142,7 @@ impl Provider {
         match self {
             Provider::Jmap => "jmap",
             Provider::Proton => "proton",
+            Provider::Gmail => "gmail",
         }
     }
 }
@@ -145,8 +154,9 @@ impl std::str::FromStr for Provider {
         match s {
             "jmap" => Ok(Provider::Jmap),
             "proton" => Ok(Provider::Proton),
+            "gmail" => Ok(Provider::Gmail),
             _ => Err(Error::Config(format!(
-                "unknown provider {s:?}: use jmap or proton"
+                "unknown provider {s:?}: use jmap, proton or gmail"
             ))),
         }
     }
@@ -206,6 +216,14 @@ impl Account {
     pub fn proton(id: &str, email: &str) -> Account {
         Account {
             provider: Provider::Proton,
+            ..Account::new(id, email)
+        }
+    }
+
+    /// A new enabled Gmail account.
+    pub fn gmail(id: &str, email: &str) -> Account {
+        Account {
+            provider: Provider::Gmail,
             ..Account::new(id, email)
         }
     }
@@ -526,6 +544,9 @@ struct SecretsFile {
     /// survives `clear_account` so a generation is never reused.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     proton_generations: BTreeMap<String, u64>,
+    /// Gmail refresh tokens by account id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    gmail: BTreeMap<String, String>,
 }
 
 /// What a Proton account keeps in `secrets.toml`.
@@ -732,8 +753,8 @@ impl Secrets {
         })
     }
 
-    /// Forgets the token and the Proton login of `account_id`; a missing file
-    /// is fine.
+    /// Forgets the token, the Proton login and the Gmail refresh token of
+    /// `account_id`; a missing file is fine.
     ///
     /// # Errors
     ///
@@ -746,7 +767,32 @@ impl Secrets {
         Self::update(|f| {
             f.tokens.remove(account_id);
             f.proton.remove(account_id);
+            f.gmail.remove(account_id);
             // `proton_generations` stays: it keeps generations unique.
+        })
+    }
+
+    /// The Gmail refresh token of `account_id`; `None` without one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `secrets.toml` exists but cannot be read or
+    /// parsed.
+    pub fn gmail(account_id: &str) -> Result<Option<String>> {
+        Ok(Self::read()?
+            .and_then(|mut f| f.gmail.remove(account_id))
+            .filter(|t| !t.is_empty()))
+    }
+
+    /// Stores the Gmail refresh token of `account_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or written.
+    pub fn set_gmail(account_id: &str, refresh_token: &str) -> Result<()> {
+        Self::update(|f| {
+            f.gmail
+                .insert(account_id.to_string(), refresh_token.to_string());
         })
     }
 
@@ -840,11 +886,12 @@ impl Secrets {
     ///
     /// # Errors
     ///
-    /// See [`Secrets::token_for`] and [`Secrets::proton`].
+    /// See [`Secrets::token_for`], [`Secrets::proton`] and [`Secrets::gmail`].
     pub fn has_credentials(cfg: &Config, account: &Account) -> Result<bool> {
         match account.provider {
             Provider::Jmap => Ok(Self::token_for(cfg, &account.id)?.is_some()),
             Provider::Proton => Ok(Self::proton(&account.id)?.is_some()),
+            Provider::Gmail => Ok(Self::gmail(&account.id)?.is_some()),
         }
     }
 
@@ -1332,6 +1379,77 @@ mod tests {
         assert_eq!(old.accounts[0].login_name(), "a@b.c");
         assert_eq!("proton".parse::<Provider>().unwrap(), Provider::Proton);
         assert!(matches!("imap".parse::<Provider>(), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn gmail_provider_round_trips() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolate();
+        let mut cfg = Config::default();
+
+        cfg.add_account(Account::gmail("g", "me@gmail.com"))
+            .unwrap();
+        cfg.save().unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+
+        assert_eq!(text.matches("provider = \"gmail\"").count(), 1, "{text}");
+        assert_eq!(Config::load().unwrap(), cfg);
+        assert_eq!("gmail".parse::<Provider>().unwrap(), Provider::Gmail);
+        assert_eq!(Provider::Gmail.as_str(), "gmail");
+
+        let Err(Error::Config(msg)) = "imap".parse::<Provider>() else {
+            panic!("imap parsed");
+        };
+
+        assert!(msg.contains("jmap, proton or gmail"), "{msg}");
+    }
+
+    #[test]
+    fn gmail_secrets_set_read_and_clear() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = isolate();
+        let secrets_path = dir.path().join("secrets.toml");
+        let cfg = Config::default();
+        let gmail = Account::gmail("g", "me@gmail.com");
+        let jmap = Account::new("j", "j@example.com");
+
+        Secrets::set_gmail("g", "rt").unwrap();
+
+        assert_eq!(Secrets::gmail("g").unwrap().as_deref(), Some("rt"));
+        assert!(Secrets::has_credentials(&cfg, &gmail).unwrap());
+        assert!(!Secrets::has_credentials(&cfg, &jmap).unwrap());
+        assert!(
+            std::fs::read_to_string(&secrets_path)
+                .unwrap()
+                .contains("[gmail]")
+        );
+
+        Secrets::clear_account("g").unwrap();
+
+        assert_eq!(Secrets::gmail("g").unwrap(), None);
+        assert!(
+            !std::fs::read_to_string(&secrets_path)
+                .unwrap()
+                .contains("[gmail]"),
+            "empty [gmail] table written"
+        );
+
+        // POSTO_TOKEN belongs to JMAP: a Gmail default account ignores it.
+        let env_cfg = Config {
+            accounts: vec![gmail.clone()],
+            ..Config::default()
+        };
+
+        // SAFETY: ENV_LOCK is held.
+        unsafe { std::env::set_var("POSTO_TOKEN", "env") };
+
+        let has = Secrets::has_credentials(&env_cfg, &gmail);
+
+        // SAFETY: ENV_LOCK is held.
+        unsafe { std::env::remove_var("POSTO_TOKEN") };
+
+        assert!(!has.unwrap(), "POSTO_TOKEN counted for a Gmail account");
     }
 
     #[test]

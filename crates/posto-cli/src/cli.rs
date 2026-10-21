@@ -78,13 +78,13 @@ pub enum Noun {
 pub enum AccountCmd {
     /// List the configured accounts.
     ///
-    /// `has_token` means "has credentials": a token, or a Proton login.
+    /// `has_token` means "has credentials": a token, a Proton login or a Google sign-in.
     ///
-    /// Output: [{"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool}]
+    /// Output: [{"id": string, "name": string, "email": string, "provider": "jmap"|"proton"|"gmail", "username": string, "session_url": string, "enabled": bool, "has_token": bool}]
     List,
-    /// Add an account (store its token with `account set-token --account <id>`, or sign in to a Proton account with `account login --account <id>`).
+    /// Add an account (store its token with `account set-token --account <id>`, sign in to a Proton account with `account login --account <id>`, or sign in to a Gmail account with `account google-login --account <id>`).
     ///
-    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton"|"gmail", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Add {
         /// New account id: lower-case letters, digits and '-', at most 32.
         #[arg(long)]
@@ -98,7 +98,7 @@ pub enum AccountCmd {
         /// JMAP session URL (default: Fastmail).
         #[arg(long)]
         session_url: Option<String>,
-        /// Mail provider: jmap or proton.
+        /// Mail provider: jmap, proton or gmail.
         #[arg(long, default_value = "jmap")]
         provider: Provider,
         /// Proton login name (default: the email address).
@@ -114,7 +114,7 @@ pub enum AccountCmd {
     },
     /// Read the API token from stdin and store it for the account.
     ///
-    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton"|"gmail", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     SetToken {
         /// Required: read the token from stdin (the CLI never prompts).
         #[arg(long, required = true)]
@@ -122,7 +122,7 @@ pub enum AccountCmd {
     },
     /// Update the account's name, sender email, Proton login name, JMAP session URL or enabled flag.
     ///
-    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton"|"gmail", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Set {
         /// Sender email address.
         #[arg(long)]
@@ -140,9 +140,9 @@ pub enum AccountCmd {
         #[arg(long)]
         enabled: Option<bool>,
     },
-    /// Show the account settings; never the token itself. `has_token` means "has credentials": a token, or a Proton login.
+    /// Show the account settings; never the token itself. `has_token` means "has credentials": a token, a Proton login or a Google sign-in.
     ///
-    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
+    /// Output: {"id": string, "name": string, "email": string, "provider": "jmap"|"proton"|"gmail", "username": string, "session_url": string, "enabled": bool, "has_token": bool, "refresh_minutes": number}
     Show,
     /// Sign in to a Proton account: reads the password from the first line of stdin and, with --two-password, the mailbox password from the second line.
     ///
@@ -158,6 +158,10 @@ pub enum AccountCmd {
         #[arg(long, required = true)]
         password_stdin: bool,
     },
+    /// Sign in to a Gmail account in the browser: prints the address to open on stderr and waits up to five minutes.
+    ///
+    /// Output: the account as `account show` prints it.
+    GoogleLogin,
     /// List the account's cached sending identities (filled by `sync run`).
     ///
     /// Output: [{"id": string, "name": string, "email": string}]

@@ -10,13 +10,13 @@ use posto_core::actions::{self, Action};
 use posto_core::body::{fetch_body, save_attachment};
 use posto_core::classify::{self, JEV_BASE_URL, JevClient, Tray};
 use posto_core::compose::{self, Draft};
-use posto_core::config::{Account, Config, ProtonSecret, Provider, Secrets};
+use posto_core::config::{self, Account, Config, ProtonSecret, Provider, Secrets};
 use posto_core::provider::{self, Connection};
 use posto_core::shortcuts::{self, Keymap};
 use posto_core::store::{
     CLASSIFY_MAX_ATTEMPTS, EmailBody, EmailSummary, ListQuery, Mailbox, Store,
 };
-use posto_core::{Error, Result, fixtures, html, proton, sync, theme};
+use posto_core::{Error, Result, fixtures, gmail, html, proton, sync, theme};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -176,6 +176,7 @@ pub fn account_add(
     let mut account = match provider {
         Provider::Jmap => Account::new(&id, &email),
         Provider::Proton => Account::proton(&id, &email),
+        Provider::Gmail => Account::gmail(&id, &email),
     };
 
     account.name = name.unwrap_or_default();
@@ -220,6 +221,13 @@ pub fn account_set_token(account: Option<&str>) -> Result<Value> {
     if picked.provider == Provider::Proton {
         return Err(Error::Config(format!(
             "account {} is a Proton account: use `account login`",
+            picked.id
+        )));
+    }
+
+    if picked.provider == Provider::Gmail {
+        return Err(Error::Config(format!(
+            "account {} is a Gmail account: use `account google-login`",
             picked.id
         )));
     }
@@ -344,6 +352,43 @@ pub async fn account_login(
             generation: 0,
         },
     )?;
+
+    if picked.email.is_empty()
+        && !login.email.is_empty()
+        && let Some(a) = cfg.accounts.iter_mut().find(|a| a.id == picked.id)
+    {
+        a.email = login.email;
+        cfg.save()?;
+    }
+
+    account_show(Some(&picked.id))
+}
+
+/// Signs in to a Gmail account in the browser and stores the refresh token.
+/// The address to open goes to stderr; stdout stays the account's JSON.
+pub async fn account_google_login(account: Option<&str>) -> Result<Value> {
+    let mut cfg = Config::load()?;
+    let picked = pick_account(&cfg, account)?.clone();
+
+    if picked.provider != Provider::Gmail {
+        return Err(Error::Config(format!(
+            "account {} is not a Gmail account",
+            picked.id
+        )));
+    }
+
+    let client = gmail::GoogleClient::load(&config::google_client_path())?;
+    let who = if picked.email.is_empty() {
+        "the Google account to use"
+    } else {
+        picked.email.as_str()
+    };
+    let login = gmail::login(&client, &picked.email, |url| {
+        eprintln!("Open this address in a browser and sign in as {who}:\n{url}");
+    })
+    .await?;
+
+    Secrets::set_gmail(&picked.id, &login.refresh_token)?;
 
     if picked.email.is_empty()
         && !login.email.is_empty()

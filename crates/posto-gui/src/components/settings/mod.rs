@@ -95,6 +95,7 @@ fn prepare(mut cfg: Config, margin: &str, urgency: &str) -> std::result::Result<
                 return Err("A Proton account needs a username or an email".into());
             }
             Provider::Proton => {}
+            Provider::Gmail => {}
         }
     }
 

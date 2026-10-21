@@ -67,6 +67,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
             AccountCmd::Login {
                 totp, two_password, ..
             } => c::account_login(account, totp, two_password).await,
+            AccountCmd::GoogleLogin => c::account_google_login(account).await,
             AccountCmd::Show => c::account_show(account),
             AccountCmd::Identities => c::account_identities(account),
             AccountCmd::MaskedEmails => c::account_masked_emails(account),

@@ -263,6 +263,108 @@ fn proton_account_add_show_and_sync_without_login() {
 }
 
 #[test]
+fn gmail_account_add_show_and_guards() {
+    let sb = Sandbox::new();
+    let added = sb.json(&[
+        "account",
+        "add",
+        "--id",
+        "g",
+        "--email",
+        "me@gmail.com",
+        "--provider",
+        "gmail",
+    ]);
+
+    assert_eq!(added["provider"], "gmail");
+    assert_eq!(added["has_token"], false);
+
+    let set = sb.run_with(
+        &["account", "set-token", "--account", "g", "--token-stdin"],
+        Some("x"),
+    );
+
+    assert_eq!(set.status.code(), Some(3));
+    assert!(
+        error_text(&set).contains("google-login"),
+        "{}",
+        error_text(&set)
+    );
+    assert!(!sb.0.join("secrets.toml").exists());
+
+    // No client file: the sign-in fails at once, before it opens anything.
+    let started = std::time::Instant::now();
+    let login = sb.run_with(&["account", "google-login", "--account", "g"], None);
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(login.status.code(), Some(3));
+    assert!(
+        error_text(&login).contains("google-client.json"),
+        "{}",
+        error_text(&login)
+    );
+
+    let jmap = sb.run_with(&["account", "google-login", "--account", "default"], None);
+
+    assert_eq!(jmap.status.code(), Some(3));
+    assert!(
+        error_text(&jmap).contains("not a Gmail account"),
+        "{}",
+        error_text(&jmap)
+    );
+
+    // The Proton sign-in refuses a Gmail account, unchanged.
+    let proton = sb.run_with(
+        &["account", "login", "--account", "g", "--password-stdin"],
+        Some("pw"),
+    );
+
+    assert_eq!(proton.status.code(), Some(3));
+
+    let sync = sb.run_with(&["sync", "run", "--account", "g"], None);
+
+    assert_eq!(sync.status.code(), Some(3));
+    assert_eq!(
+        error_text(&sync),
+        "not configured: google sign-in for account g"
+    );
+
+    // A stored refresh token but no client file: the production connect path
+    // stops at the missing file, before any request.
+    let signed_in = Sandbox::new();
+
+    signed_in.json(&[
+        "account",
+        "add",
+        "--id",
+        "g",
+        "--email",
+        "me@gmail.com",
+        "--provider",
+        "gmail",
+    ]);
+    std::fs::write(
+        signed_in.0.join("secrets.toml"),
+        "[gmail]\ng = \"rt-fake\"\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        signed_in.json(&["account", "show", "--account", "g"])["has_token"],
+        true
+    );
+
+    let sync = signed_in.run_with(&["sync", "run", "--account", "g"], None);
+
+    assert_eq!(sync.status.code(), Some(3));
+    assert!(
+        error_text(&sync).contains("google-client.json"),
+        "{}",
+        error_text(&sync)
+    );
+}
+
+#[test]
 fn proton_login_validates_inputs_before_any_network() {
     let sb = Sandbox::new();
     let env = [("POSTO_PROTON_APP_VERSION", "posto-test@0.0.0")];

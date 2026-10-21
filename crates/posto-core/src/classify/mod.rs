@@ -48,7 +48,9 @@ use crate::body::fetch_body;
 use crate::config::{ClassifyConfig, Config, data_dir};
 use crate::error::{Error, Result};
 use crate::provider::Connection;
-use crate::store::{CLASSIFY_MAX_ATTEMPTS, Classified, EmailSummary, MsgRef, QueueRow, Store};
+use crate::store::{
+    CLASSIFY_MAX_ATTEMPTS, Classified, EmailSummary, Mailbox, MsgRef, QueueRow, Store,
+};
 
 /// A mailbox category Jev sorts mail into: `spam` (always the junk
 /// mailbox) or a key of `[classify.trays]`.
@@ -496,7 +498,9 @@ fn own_addresses(cfg: &Config, store: &Store, account: &str) -> Result<Vec<Strin
 
 /// The id of the top-level mailbox `name` in `account`, created on the
 /// server (and stored) when missing. A Proton account only accepts an existing
-/// label: a folder is a config error and nothing is created.
+/// label: a folder is a config error and nothing is created. A Gmail account
+/// needs a label too: a user label wins over a built-in of the same name, a
+/// name only a built-in has is a config error, and a missing one is created.
 async fn ensure_mailbox(
     store: &Store,
     client: Option<&Connection>,
@@ -507,7 +511,31 @@ async fn ensure_mailbox(
         return Err(Error::Config("a classifier mailbox name is empty".into()));
     }
 
-    let proton = store.account_state(account, "provider")?.as_deref() == Some("proton");
+    let provider = store.account_state(account, "provider")?;
+    let proton = provider.as_deref() == Some("proton");
+
+    if provider.as_deref() == Some("gmail") {
+        let wanted = name.to_lowercase();
+        let matching: Vec<Mailbox> = store
+            .mailboxes(account)?
+            .into_iter()
+            .filter(|m| m.parent_id.is_none() && m.name.to_lowercase() == wanted)
+            .collect();
+
+        if let Some(label) = matching
+            .iter()
+            .filter(|m| m.role.is_none())
+            .min_by(|a, b| (a.sort_order, &a.id).cmp(&(b.sort_order, &b.id)))
+        {
+            return Ok(label.id.clone());
+        }
+
+        if !matching.is_empty() {
+            return Err(Error::Config(format!(
+                "mailbox {name} is a Gmail system mailbox; pick another tray name"
+            )));
+        }
+    }
 
     match store.top_level_mailbox_by_name(account, name)? {
         Some(m) if !proton || m.role.is_none() => return Ok(m.id),
@@ -920,6 +948,39 @@ mod tests {
         assert!(matches!(
             ensure_mailbox(&store, None, "a", "Missing").await,
             Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_mailbox_on_gmail_prefers_labels_and_refuses_built_ins() {
+        let store = Store::open_memory().unwrap();
+
+        store.set_account_state("a", "provider", "gmail").unwrap();
+        store
+            .upsert_mailboxes(&[mailbox("ARCHIVE", "Archive", Some("archive"))])
+            .unwrap();
+
+        // Only the built-in has the name: a tray must be a label.
+        assert!(matches!(
+            ensure_mailbox(&store, None, "a", "Archive").await,
+            Err(Error::Config(_))
+        ));
+
+        // A user label of the same name wins, though the built-in sorts first.
+        store
+            .upsert_mailboxes(&[mailbox("Label_7", "Archive", None)])
+            .unwrap();
+
+        assert_eq!(
+            ensure_mailbox(&store, None, "a", "Archive").await.unwrap(),
+            "Label_7"
+        );
+
+        // Neither: Gmail creates labels, and without a connection that is
+        // the same NotFound as on JMAP.
+        assert!(matches!(
+            ensure_mailbox(&store, None, "a", "Missing").await,
+            Err(Error::NotFound(_))
         ));
     }
 

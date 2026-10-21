@@ -27,6 +27,7 @@ fn provider_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Jmap => "Fastmail (JMAP)",
         Provider::Proton => "Proton Mail",
+        Provider::Gmail => "Gmail",
     }
 }
 

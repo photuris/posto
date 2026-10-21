@@ -1,4 +1,4 @@
-//! Provider-neutral types shared by the JMAP and Proton back ends.
+//! Provider-neutral types shared by the JMAP, Proton and Gmail back ends.
 //!
 //! The rest of the core talks to one connection type, [`Connection`], and never
 //! to `jmap::Client` or `proton::Session` directly. The types here are the
@@ -7,8 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compose::Draft;
-use crate::config::{Account, Config, ProtonSecret, Provider, Secrets};
+use crate::config::{self, Account, Config, ProtonSecret, Provider, Secrets};
 use crate::error::{Error, Result};
+use crate::gmail;
 use crate::jmap;
 use crate::proton;
 use crate::store::{Attachment, EmailBody, EmailSummary, Mailbox, Store};
@@ -100,6 +101,8 @@ pub enum Connection {
     Jmap(jmap::Client),
     /// A Proton Mail account.
     Proton(proton::Session),
+    /// A Gmail account.
+    Gmail(gmail::Session),
 }
 
 impl std::fmt::Debug for Connection {
@@ -107,6 +110,7 @@ impl std::fmt::Debug for Connection {
         match self {
             Connection::Jmap(c) => c.fmt(f),
             Connection::Proton(s) => s.fmt(f),
+            Connection::Gmail(s) => s.fmt(f),
         }
     }
 }
@@ -130,6 +134,7 @@ impl Connection {
         match self {
             Connection::Jmap(_) => Provider::Jmap,
             Connection::Proton(_) => Provider::Proton,
+            Connection::Gmail(_) => Provider::Gmail,
         }
     }
 
@@ -138,6 +143,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => &c.session().account_id,
             Connection::Proton(s) => s.server_account_id(),
+            Connection::Gmail(s) => s.server_account_id(),
         }
     }
 
@@ -146,6 +152,7 @@ impl Connection {
         match self {
             Connection::Jmap(_) => "jmap",
             Connection::Proton(s) => s.provider_name(),
+            Connection::Gmail(s) => s.provider_name(),
         }
     }
 
@@ -155,6 +162,7 @@ impl Connection {
         match self {
             Connection::Jmap(_) => false,
             Connection::Proton(s) => s.local_counts(),
+            Connection::Gmail(s) => s.local_counts(),
         }
     }
 
@@ -167,10 +175,11 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.identities().await,
             Connection::Proton(s) => s.identities().await,
+            Connection::Gmail(s) => s.identities().await,
         }
     }
 
-    /// Lists the account's masked email addresses; empty for Proton and for a
+    /// Lists the account's masked email addresses; empty for Proton and Gmail and for a
     /// JMAP server that does not advertise the masked email capability.
     ///
     /// # Errors
@@ -179,7 +188,7 @@ impl Connection {
     pub async fn masked_emails(&self) -> Result<Vec<MaskedEmail>> {
         match self {
             Connection::Jmap(c) => c.masked_emails().await,
-            Connection::Proton(_) => Ok(Vec::new()),
+            Connection::Proton(_) | Connection::Gmail(_) => Ok(Vec::new()),
         }
     }
 
@@ -193,6 +202,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.create_mailbox(name).await,
             Connection::Proton(s) => s.create_mailbox(name).await,
+            Connection::Gmail(s) => s.create_mailbox(name).await,
         }
     }
 
@@ -205,6 +215,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.sync_mailboxes(store, account).await,
             Connection::Proton(s) => s.sync_mailboxes(store, account).await,
+            Connection::Gmail(s) => s.sync_mailboxes(store, account).await,
         }
     }
 
@@ -222,6 +233,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.initial(account, limit).await,
             Connection::Proton(s) => s.initial(account, limit).await,
+            Connection::Gmail(s) => s.initial(account, limit).await,
         }
     }
 
@@ -234,6 +246,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.delta(account, since).await,
             Connection::Proton(s) => s.delta(account, since).await,
+            Connection::Gmail(s) => s.delta(account, since).await,
         }
     }
 
@@ -246,6 +259,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.body(email_id).await,
             Connection::Proton(s) => s.body(email_id).await,
+            Connection::Gmail(s) => s.body(email_id).await,
         }
     }
 
@@ -263,6 +277,7 @@ impl Connection {
                 c.download_blob(&att.blob_id, &att.name, &att.mime).await
             }
             Connection::Proton(s) => s.download(email_id, att).await,
+            Connection::Gmail(s) => s.download(email_id, att).await,
         }
     }
 
@@ -275,6 +290,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.update(ids, change).await,
             Connection::Proton(s) => s.update(ids, change).await,
+            Connection::Gmail(s) => s.update(ids, change).await,
         }
     }
 
@@ -287,6 +303,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.destroy(ids).await,
             Connection::Proton(s) => s.destroy(ids).await,
+            Connection::Gmail(s) => s.destroy(ids).await,
         }
     }
 
@@ -296,6 +313,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.has_unsubscribe(email_id).await,
             Connection::Proton(s) => s.has_unsubscribe(email_id).await,
+            Connection::Gmail(s) => s.has_unsubscribe(email_id).await,
         }
     }
 
@@ -320,6 +338,7 @@ impl Connection {
         match self {
             Connection::Jmap(c) => c.send(store, account, identity, draft, text, html).await,
             Connection::Proton(s) => s.send(store, account, identity, draft, text, html).await,
+            Connection::Gmail(s) => s.send(store, account, identity, draft, text, html).await,
         }
     }
 }
@@ -331,6 +350,8 @@ pub enum Credentials {
     Token(String),
     /// A Proton login.
     Proton(ProtonSecret),
+    /// A Gmail refresh token.
+    Gmail(String),
 }
 
 /// Connects `account` with its stored credentials; `Ok(None)` when it has
@@ -339,8 +360,9 @@ pub enum Credentials {
 /// # Errors
 ///
 /// Returns [`Error::NotConfigured`] when a Proton account has no
-/// `proton.app_version`, [`Error::Auth`] on 401/403, and any other network,
-/// server or secrets-file error.
+/// `proton.app_version` or a Gmail account has no `google-client.json`,
+/// [`Error::Auth`] on 401/403 (or when Google rejects the refresh token), and
+/// any other network, server or secrets-file error.
 pub async fn connect(cfg: &Config, account: &Account) -> Result<Option<Connection>> {
     if !Secrets::has_credentials(cfg, account)? {
         return Ok(None);
@@ -349,6 +371,7 @@ pub async fn connect(cfg: &Config, account: &Account) -> Result<Option<Connectio
     let credentials = match account.provider {
         Provider::Jmap => Secrets::token_for(cfg, &account.id)?.map(Credentials::Token),
         Provider::Proton => Secrets::proton(&account.id)?.map(Credentials::Proton),
+        Provider::Gmail => Secrets::gmail(&account.id)?.map(Credentials::Gmail),
     };
 
     match credentials {
@@ -364,7 +387,9 @@ pub async fn connect(cfg: &Config, account: &Account) -> Result<Option<Connectio
 ///
 /// # Errors
 ///
-/// As for [`connect`]; credentials of the other provider are
+/// As for [`connect`] (a Gmail account without the Google client file is
+/// [`Error::NotConfigured`], before any request); credentials of the other
+/// provider are
 /// [`Error::NotConfigured`] (see [`credential_error`]).
 #[doc(hidden)]
 pub async fn connect_with_credentials(
@@ -394,6 +419,11 @@ pub async fn connect_with_credentials(
 
             Ok(Connection::Proton(session))
         }
+        (Provider::Gmail, Credentials::Gmail(token)) => {
+            let client = gmail::GoogleClient::load(&config::google_client_path())?;
+
+            Ok(Connection::Gmail(gmail::connect(client, &token).await?))
+        }
         _ => Err(credential_error(account)),
     }
 }
@@ -406,5 +436,6 @@ pub fn credential_error(account: &Account) -> Error {
     match account.provider {
         Provider::Jmap => Error::NotConfigured(format!("token for account {id}")),
         Provider::Proton => Error::NotConfigured(format!("proton login for account {id}")),
+        Provider::Gmail => Error::NotConfigured(format!("google sign-in for account {id}")),
     }
 }
