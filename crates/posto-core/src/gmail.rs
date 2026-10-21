@@ -1954,18 +1954,24 @@ mod tests {
         };
         let first = id_of("me@gmail.com");
 
-        assert!(first.ends_with("@gmail.com"), "{first}");
-        assert_eq!(first.len(), 32 + "@gmail.com".len());
+        let split = |id: &str| {
+            let (local, domain) = id.split_once('@').unwrap();
+
+            (local.to_owned(), domain.to_owned())
+        };
+        let (local, domain) = split(&first);
+
+        assert_eq!(domain, "gmail.com");
+        assert!(
+            local.len() == 32
+                && local
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{local}"
+        );
         assert_ne!(first, id_of("me@gmail.com"));
-        assert!(id_of("no-at-sign").ends_with("@posto.invalid"));
-        assert!(id_of("me@").ends_with("@posto.invalid"));
-
-        // The old default put the machine's hostname after the `@`.
-        if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
-            let host = host.trim();
-
-            assert!(host.is_empty() || !first.contains(host), "{first}");
-        }
+        assert_eq!(split(&id_of("no-at-sign")).1, "posto.invalid");
+        assert_eq!(split(&id_of("me@")).1, "posto.invalid");
     }
 
     #[test]
