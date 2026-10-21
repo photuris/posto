@@ -516,6 +516,23 @@ async fn gmail_actions_follow_the_folder_rules() {
             .keywords
             .contains(&"$seen".to_string())
     );
+
+    // Removing the only folder is sent as is; the mirror files it in Archive.
+    let patch = Action::PatchMailboxes {
+        add: Vec::new(),
+        remove: vec!["INBOX".into()],
+    };
+    let applied = actions::apply(&store, Some(&conn), "g", &one("m1"), patch)
+        .await
+        .unwrap();
+
+    assert_eq!(applied, 1);
+    assert_eq!(modify().await.len(), 3);
+    assert_eq!(
+        json_body(&modify().await[2]),
+        json!({"ids": ["m1"], "addLabelIds": [], "removeLabelIds": ["INBOX"]})
+    );
+    assert_eq!(mailbox_ids(&store, "g", "m1"), ["ARCHIVE"]);
 }
 
 /// Fails to compile unless the future is `Send`.

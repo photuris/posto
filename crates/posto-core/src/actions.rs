@@ -146,7 +146,7 @@ pub async fn empty_mailbox(
 /// Without a client, only emails the store knows are counted.
 ///
 /// A [`Action::PatchMailboxes`] never leaves an email without a mailbox: ids
-/// whose local copy would end up empty are dropped before anything is sent and
+/// whose local copy would end up empty (after the folder rules below) are dropped before anything is sent and
 /// not counted (ids unknown locally are sent; the server enforces its own
 /// rule), and the mirror recomputes from the local copy as it is after the
 /// server answered, skipping and not counting an id whose result would be empty
@@ -165,7 +165,8 @@ pub async fn empty_mailbox(
 /// The Gmail mirror of a move or patch keeps the email's `SENT` and `DRAFT`
 /// memberships and passes the result through [`gmail::visible`] (Trash and
 /// Spam hide Inbox, Drafts and Sent; `ARCHIVE` is present exactly when no
-/// other built-in folder is).
+/// other built-in folder is). So a Gmail patch that removes the last folder
+/// is not empty: it leaves the email in `ARCHIVE`.
 ///
 /// # Errors
 ///
@@ -229,6 +230,23 @@ pub async fn apply(
         }
     }
 
+    // What a patch leaves the email in: the folder rule, then Gmail's mirror
+    // rule. Both empty-result checks look at this, so Gmail (which files a
+    // message with no folder under Archive) is never skipped as empty.
+    let patch_mirror = |current: &[String], add: &[String], remove: &[String]| {
+        let mut mirror = patched(current, add, remove);
+
+        // The server keeps one folder: the last folder added.
+        if folder_rules && let Some(keep) = add.iter().rev().find(|m| !is_label(m)) {
+            mirror.retain(|m| is_label(m) || m == keep);
+        }
+
+        if gmail {
+            mirror = gmail_mirror(mirror, current);
+        }
+
+        mirror
+    };
     let mut refused: Vec<String> = Vec::new();
     let ids: Vec<String> = match &change {
         Change::Patch { add, remove } => {
@@ -237,7 +255,7 @@ pub async fn apply(
             for id in ids {
                 let empties = store
                     .email(account, id)?
-                    .is_some_and(|e| patched(&e.mailbox_ids, add, remove).is_empty());
+                    .is_some_and(|e| patch_mirror(&e.mailbox_ids, add, remove).is_empty());
 
                 if !empties {
                     keep.push(id.clone());
@@ -278,19 +296,10 @@ pub async fn apply(
                 store.set_mailbox_ids(account, id, &mirror)?
             }
             Change::Patch { add, remove } => {
-                let mut mirror = patched(&email.mailbox_ids, add, remove);
-
-                // The server keeps one folder: the last folder added.
-                if folder_rules && let Some(keep) = add.iter().rev().find(|m| !is_label(m)) {
-                    mirror.retain(|m| is_label(m) || m == keep);
-                }
+                let mirror = patch_mirror(&email.mailbox_ids, add, remove);
 
                 if mirror.is_empty() {
                     continue;
-                }
-
-                if gmail {
-                    mirror = gmail_mirror(mirror, &email.mailbox_ids);
                 }
 
                 store.set_mailbox_ids(account, id, &mirror)?
@@ -443,6 +452,17 @@ mod tests {
 
         assert!(matches!(result, Err(Error::Unsupported(_))), "{result:?}");
         assert_eq!(after, ["INBOX", "DRAFT"]);
+
+        // Removing the only folder is a valid patch: the email lands in Archive.
+        let store = gmail_store(&["INBOX"]);
+        let patch = Action::PatchMailboxes {
+            add: Vec::new(),
+            remove: vec!["INBOX".into()],
+        };
+        let (result, after) = run(&store, patch).await;
+
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(after, ["ARCHIVE"]);
 
         // Destroy is not a mailbox change.
         let store = gmail_store(&["SENT"]);
