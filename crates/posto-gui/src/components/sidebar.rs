@@ -5,8 +5,8 @@ use posto_core::store::mailbox_groups;
 
 use crate::app::{
     EXPANDED, FOCUS_SEARCH, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SHOW_SETTINGS, SidebarRow,
-    UNSURE, backend, enabled_ids, open_empty_menu, open_settings, search_input, select_mailbox,
-    sidebar_rows, toggle_expanded, toggle_sidebar,
+    TRIAGE, UNSURE, backend, enabled_ids, open_empty_menu, open_settings, search_input,
+    select_mailbox, sidebar_rows, toggle_expanded, toggle_sidebar,
 };
 use crate::components::{Icon, focus_in, focus_out};
 use crate::state::Folder;
@@ -152,13 +152,14 @@ fn eyebrow(roles: &[bool], at: usize) -> Option<&'static str> {
 
 /// Left pane: search, mailboxes with unread badges, and Settings at the foot.
 /// With one account the list is flat; with several, one row per mailbox group
-/// (a double click lists the accounts' own mailboxes under it). One Unsure
-/// row covers every account.
+/// (a double click lists the accounts' own mailboxes under it). One Triage row at the top and one
+/// Unsure row cover every account.
 #[component]
 pub fn Sidebar() -> Element {
     let selected = SELECTED_MAILBOX();
     let mailboxes = MAILBOXES();
     let unsure = UNSURE();
+    let triage = TRIAGE();
     let expanded = EXPANDED();
     // The third field: whether the classifier is on for the account.
     let accounts: Vec<(String, String, bool)> = {
@@ -221,6 +222,13 @@ pub fn Sidebar() -> Element {
         nav { class: "sidebar",
             SideHead {}
             div { class: "mailboxes",
+                Entry {
+                    icon: "check-square",
+                    name: "Triage",
+                    unread: triage as i64,
+                    selected: selected == Some(Folder::Triage),
+                    folder: Folder::Triage,
+                }
                 for (at , row) in rows.into_iter().enumerate() {
                     if let Some(title) = eyebrow(&group_roles, at) {
                         div { key: "eyebrow-{title}", class: "group-head", "{title}" }

@@ -30,6 +30,9 @@ pub enum Folder {
     },
     /// The classifier's unsure, uncorrected messages of every account.
     Unsure,
+    /// What the user still owes someone, across every enabled account
+    /// (`Store::list_triage`), oldest first.
+    Triage,
 }
 
 /// Stands in for Jev in UI test mode, so no key and no network are needed: a

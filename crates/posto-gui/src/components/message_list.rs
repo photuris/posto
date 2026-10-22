@@ -6,7 +6,7 @@ use posto_core::store::mailbox_groups;
 
 use crate::app::{
     CLASSIFIED, EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION,
-    SIDEBAR_OPEN, backend, click_email, dispatch, enabled_ids, load_more, tray_label,
+    SIDEBAR_OPEN, TRIAGE, backend, click_email, dispatch, enabled_ids, load_more, tray_label,
 };
 use crate::components::{Icon, SidebarOpen};
 use crate::format;
@@ -44,7 +44,8 @@ pub fn MessageList() -> Element {
         .map(|a| (a.id.clone(), a.display_name().to_string()))
         .collect();
     // Rows of several accounts say which account they belong to.
-    let tag_accounts = accounts.len() > 1 && (group.is_some() || searching);
+    let tag_accounts =
+        accounts.len() > 1 && (group.is_some() || searching || current == Some(Folder::Triage));
     // Sent and drafts are about who the mail went to.
     let folder_role = mailbox
         .as_ref()
@@ -54,6 +55,7 @@ pub fn MessageList() -> Element {
     let (title, counts) = match (&mailbox, searching) {
         (_, true) => ("Search".to_string(), format!("{} results", emails.len())),
         (None, _) => match &current {
+            Some(Folder::Triage) => ("Triage".to_string(), format!("{} to deal with", TRIAGE())),
             Some(Folder::Unsure) => (
                 "Unsure".to_string(),
                 format!("{} messages to review", emails.len()),
@@ -91,7 +93,13 @@ pub fn MessageList() -> Element {
             }
             div { class: "rows",
                 if emails.is_empty() {
-                    div { class: "empty", "No messages" }
+                    div { class: "empty",
+                        if current == Some(Folder::Triage) && !searching {
+                            "Nothing owed"
+                        } else {
+                            "No messages"
+                        }
+                    }
                 }
                 for (key, e) in rows_for_display(&emails) {
                     {
@@ -121,7 +129,7 @@ pub fn MessageList() -> Element {
                                         Some(Folder::Merged { .. }) => !group.as_ref().is_some_and(|g| {
                                             g.members.iter().any(|(a, id)| *a == m.account_id && *id == m.id)
                                         }),
-                                        Some(Folder::Unsure) | None => true,
+                                        Some(Folder::Unsure | Folder::Triage) | None => true,
                                     })
                                     .map(|m| (m.name.clone(), format::avatar_hue(&m.name))),
                             )

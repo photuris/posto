@@ -82,12 +82,12 @@ pub fn empty_prompt(folder: Folder, name: &str, total: i64) -> Confirm {
     }
 }
 
-/// The `(account, mailbox)` pairs a folder stands for; none for Unsure.
+/// The `(account, mailbox)` pairs a folder stands for; none for Unsure and Triage.
 fn folder_members(folder: &Folder) -> Vec<(String, String)> {
     match folder {
         Folder::Merged { key } => group_by_key(key).map(|g| g.members).unwrap_or_default(),
         Folder::Mailbox { account_id, id } => vec![(account_id.clone(), id.clone())],
-        Folder::Unsure => Vec::new(),
+        Folder::Unsure | Folder::Triage => Vec::new(),
     }
 }
 
@@ -241,6 +241,8 @@ pub static SHOW_CLASSIFY_PICKER: GlobalSignal<bool> = Signal::global(|| false);
 pub static CLASSIFIED: GlobalSignal<HashMap<String, (String, bool)>> = Signal::global(HashMap::new);
 /// Unsure, uncorrected messages per account.
 pub static UNSURE: GlobalSignal<BTreeMap<String, usize>> = Signal::global(BTreeMap::new);
+/// Owed emails over the enabled accounts (`Store::triage_email_ids`).
+pub static TRIAGE: GlobalSignal<usize> = Signal::global(|| 0);
 pub static CONFIRM: GlobalSignal<Option<Confirm>> = Signal::global(|| None);
 /// The open right-click menu, if any.
 pub static MENU: GlobalSignal<Option<Menu>> = Signal::global(|| None);
@@ -1136,7 +1138,7 @@ fn folder_exists(folder: &Folder, mailboxes: &[Mailbox], accounts: &[String]) ->
         Folder::Mailbox { account_id, id } => mailboxes
             .iter()
             .any(|m| m.account_id == *account_id && m.id == *id),
-        Folder::Unsure => true,
+        Folder::Unsure | Folder::Triage => true,
     }
 }
 
@@ -1272,6 +1274,7 @@ pub fn reload_mailboxes() {
 
     *MAILBOXES.write() = all;
     reload_unsure_counts();
+    reload_triage_counts();
 }
 
 /// Re-counts each enabled account's unsure, uncorrected messages.
@@ -1290,6 +1293,23 @@ fn reload_unsure_counts() {
 
     if *UNSURE.peek() != counts {
         *UNSURE.write() = counts;
+    }
+}
+
+/// Re-counts the owed emails of the enabled accounts.
+fn reload_triage_counts() {
+    let b = backend().peek().clone();
+    let mut total = 0;
+
+    for a in b.cfg.accounts_enabled() {
+        match b.store.triage_email_ids(&a.id) {
+            Ok(ids) => total += ids.len(),
+            Err(e) => return set_status(format!("Could not read triage: {e}")),
+        }
+    }
+
+    if *TRIAGE.peek() != total {
+        *TRIAGE.write() = total;
     }
 }
 
@@ -1348,6 +1368,7 @@ pub async fn reload_list() {
                     ..Default::default()
                 },
             ),
+            Some(Folder::Triage) => store.list_triage(&accounts, limit, 0),
             Some(Folder::Unsure) => {
                 let mut all = Vec::new();
 
@@ -1518,6 +1539,7 @@ async fn settle_selection<T>(change: impl Future<Output = Result<T>>) -> Result<
     let done = change.await?;
 
     reload_unsure_counts();
+    reload_triage_counts();
     reload_list().await;
 
     let order = list_order();
@@ -2196,6 +2218,7 @@ async fn send_draft(archive: bool) {
 
     if !archive && let Some(r) = &replied_to {
         refresh_row(r);
+        let _ = settle_selection(async { Ok(()) }).await;
     }
 
     if toast != "Sent" {
@@ -3883,6 +3906,162 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The ids of the listed emails, in list order.
+    fn listed_ids() -> Vec<String> {
+        EMAILS.peek().iter().map(|e| e.id.clone()).collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn triage_folder_lists_owed_mail_oldest_first() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        posto_core::fixtures::seed(&backend().peek().store).unwrap();
+        reload_mailboxes();
+
+        assert_eq!(*TRIAGE.peek(), 4);
+
+        *SELECTED_MAILBOX.write() = Some(Folder::Triage);
+        reload_list().await;
+
+        assert_eq!(listed_ids(), ["fx-07", "fx-05", "fx-03", "fx-11"]);
+
+        act_on_emails(&[MsgRef::new("default", "fx-07")], actions::Action::Archive)
+            .await
+            .unwrap();
+
+        assert_eq!(listed_ids(), ["fx-05", "fx-03", "fx-11"]);
+        assert_eq!(*TRIAGE.peek(), 3);
+
+        act_on_emails(&[MsgRef::new("default", "fx-03")], actions::Action::Unflag)
+            .await
+            .unwrap();
+
+        assert_eq!(listed_ids(), ["fx-05", "fx-11"]);
+        assert_eq!(*TRIAGE.peek(), 2);
+
+        for id in ["fx-05", "fx-11"] {
+            act_on_emails(&[MsgRef::new("default", id)], actions::Action::Archive)
+                .await
+                .unwrap();
+        }
+
+        assert!(EMAILS.peek().is_empty());
+        assert_eq!(*TRIAGE.peek(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn triage_row_is_always_shown_and_titles_the_list() {
+        use dioxus::core::Mutation;
+
+        let mut dom = VirtualDom::new(App).with_root_context(backend_with(Config::default()));
+        let first = dom.rebuild_to_vec();
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        assert!(
+            first
+                .edits
+                .iter()
+                .any(|m| matches!(m, Mutation::CreateTextNode { value, .. } if value == "Triage"))
+        );
+        assert_eq!(*TRIAGE.peek(), 0);
+
+        posto_core::fixtures::seed(&backend().peek().store).unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Triage);
+        reload_list().await;
+
+        assert!(edits(&mut dom).iter().any(|m| matches!(
+            m,
+            Mutation::CreateTextNode { value, .. } | Mutation::SetText { value, .. }
+                if value == "4 to deal with"
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn triage_drops_a_replied_original_after_send() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let store = backend().peek().store.clone();
+
+        posto_core::fixtures::seed(&store).unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Triage);
+        reload_list().await;
+
+        assert_eq!(listed_ids(), ["fx-07", "fx-05", "fx-03", "fx-11"]);
+
+        // UI test mode skips `compose::send`, which marks the original answered.
+        store
+            .set_keywords("default", "fx-05", &["$seen".into(), "$answered".into()])
+            .unwrap();
+
+        assert_eq!(listed_ids(), ["fx-07", "fx-05", "fx-03", "fx-11"]);
+
+        let to = "a@b.io";
+
+        *COMPOSER.write() = Some(compose::Draft {
+            account_id: "default".into(),
+            reply_to_email_id: Some("fx-05".into()),
+            reply_to_account_id: Some("default".into()),
+            to: vec![Address {
+                name: None,
+                email: to.into(),
+            }],
+            ..Default::default()
+        });
+        *COMPOSER_TO.write() = to.into();
+        in_root(&dom, send_draft(false)).await;
+
+        assert_eq!(listed_ids(), ["fx-07", "fx-03", "fx-11"]);
+        assert_eq!(*TRIAGE.peek(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn triage_tags_accounts_with_several_accounts() {
+        use dioxus::core::Mutation;
+
+        let (mut dom, store) = two_accounts();
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let flagged = |account: &str, id: &str, received_at: &str| EmailSummary {
+            received_at: received_at.into(),
+            keywords: vec!["$flagged".into()],
+            ..labelled_in(account, id, &["inbox"])
+        };
+
+        store
+            .upsert_mailboxes(&[
+                named_box("default", "inbox", "Inbox", Some("inbox"), None),
+                named_box("work", "inbox", "Inbox", Some("inbox"), None),
+            ])
+            .unwrap();
+        store
+            .upsert_emails(&[
+                flagged("default", "e1", "2026-10-12T10:00:00Z"),
+                flagged("work", "e2", "2026-10-11T10:00:00Z"),
+            ])
+            .unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Triage);
+        reload_list().await;
+
+        assert_eq!(list_order(), ["work/e2", "default/e1"]);
+        assert_eq!(*TRIAGE.peek(), 2);
+        assert!(
+            edits(&mut dom)
+                .iter()
+                .any(|m| matches!(m, Mutation::CreateTextNode { value, .. } if value == "Work"))
+        );
     }
 }
 
