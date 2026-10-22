@@ -237,7 +237,8 @@ pub static SHOW_MOVE_PICKER: GlobalSignal<bool> = Signal::global(|| false);
 /// True while the label picker is open.
 pub static SHOW_LABEL_PICKER: GlobalSignal<bool> = Signal::global(|| false);
 pub static SHOW_CLASSIFY_PICKER: GlobalSignal<bool> = Signal::global(|| false);
-/// The tray in force and whether it is unsure, for each listed message (by row key).
+/// The tray in force and whether it is unsure, for each listed message (by row key)
+/// whose classification is not applied yet; once applied, its labels say it.
 pub static CLASSIFIED: GlobalSignal<HashMap<String, (String, bool)>> = Signal::global(HashMap::new);
 /// Unsure, uncorrected messages per account.
 pub static UNSURE: GlobalSignal<BTreeMap<String, usize>> = Signal::global(BTreeMap::new);
@@ -1313,7 +1314,8 @@ fn reload_triage_counts() {
     }
 }
 
-/// Re-reads the classification of every listed message.
+/// Re-reads the unapplied classification of every listed message. An applied
+/// one is left out: the user may have edited its labels since.
 fn reload_classified() {
     let b = backend().peek().clone();
     let refs: Vec<MsgRef> = EMAILS.peek().iter().map(EmailSummary::msg_ref).collect();
@@ -1322,6 +1324,7 @@ fn reload_classified() {
         Ok(rows) => {
             *CLASSIFIED.write() = rows
                 .into_iter()
+                .filter(|c| !c.applied)
                 .map(|c| {
                     let key = MsgRef::new(&c.account_id, &c.email_id).to_string();
 
@@ -2821,10 +2824,8 @@ mod tests {
         let ids: Vec<String> = EMAILS.peek().iter().map(|e| e.id.clone()).collect();
 
         assert_eq!(ids, ["fx-05"]);
-        assert_eq!(
-            CLASSIFIED.peek().get("default/fx-05"),
-            Some(&("needs_reply".to_string(), true))
-        );
+        // Applied, so its labels speak for it.
+        assert_eq!(CLASSIFIED.peek().get("default/fx-05"), None);
         assert_eq!(tray_label(&b.cfg, &Tray::SPAM), "Junk");
         assert_eq!(tray_label(&b.cfg, &Tray::new("receipts")), "Receipts");
 
@@ -3802,7 +3803,7 @@ mod tests {
                 input_tokens: 0,
                 classified_at: "2026-10-12T10:00:00Z".into(),
                 corrected_tray: None,
-                applied: true,
+                applied: false,
                 apply_error: None,
             })
             .unwrap();
