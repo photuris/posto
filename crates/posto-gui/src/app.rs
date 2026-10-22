@@ -3975,8 +3975,11 @@ mod tests {
         posto_core::fixtures::seed(&backend().peek().store).unwrap();
         reload_mailboxes();
         *SELECTED_MAILBOX.write() = Some(Folder::Triage);
+        // A page smaller than the total, so the title cannot be the loaded row count.
+        *LIST_LIMIT.write() = 2;
         reload_list().await;
 
+        assert_eq!(EMAILS.peek().len(), 2);
         assert!(edits(&mut dom).iter().any(|m| matches!(
             m,
             Mutation::CreateTextNode { value, .. } | Mutation::SetText { value, .. }
