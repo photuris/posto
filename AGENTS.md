@@ -68,6 +68,15 @@ Read `README.md` first. This file holds what the code does not say.
   request. The integration tests pin the pre-2026-10 trays
   (`legacy_trays`) on purpose: old configs must keep working.
 
+- Triage is a store query, not state: `Store::triage_email_ids` /
+  `list_triage` (one SQL rule: inbox, not trash/junk/draft, and flagged or
+  classifier-owed and not answered; answered = `$answered` or a later
+  same-thread email in that account's Sent, thread id non-empty). The GUI's
+  `Folder::Triage` and the `TRIAGE` count are recomputed wherever the
+  Unsure counts are, plus after a reply without archive (`send_draft` ends
+  in `settle_selection`). The list title shows the total, not the loaded
+  page. The CLI's `--triage` covers enabled accounts unless `--account`
+  names one.
 - Masked emails (Fastmail) are senders, not identities: `MaskedEmail/get`
   goes out only when the session advertises
   `https://www.fastmail.com/dev/maskedemail`, and only that call adds it to

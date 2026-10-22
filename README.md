@@ -254,6 +254,19 @@ stays in the inbox and also goes into the `Unsure` mailbox. Mail is queued
 at sync time and classified afterwards; the first sync of an account
 queues nothing.
 
+**Triage.** The `Triage` row at the top of the sidebar lists, across every
+enabled account and oldest first, the inbox mail you still owe something:
+flagged messages, and messages Jev filed as needing a reply or an action
+that you have not answered yet. "Answered" means the message carries the
+answered flag or a later message of its thread sits in that account's Sent,
+so a reply from your phone counts too. A flag is yours to clear: a flagged
+message stays until you unflag or archive it (Jev flags urgent mail by
+itself, so urgent items stay after a reply until you archive them). The
+same list is `posto email list --triage`. Known limits: one reply settles
+every earlier message of its thread; a reply sent from another account
+marks a Gmail or Proton original answered only until it is next refetched;
+the badge counts owed mail from blocked senders, which the list hides.
+
 **Sender memory.** When you file two messages in a row from one sender
 under the same tray, later mail from that sender goes there without asking
 Jev (no cost, no flag). A correction to another tray starts the count again.
@@ -370,10 +383,11 @@ printf '%s\n' "$PASSWORD" | posto account login --account pm --password-stdin --
 posto account add --id g1 --email me@gmail.com --provider gmail
 posto account google-login --account g1
 posto email list --mailbox Inbox --unread --jsonl | jq -r .subject
+posto email list --triage            # what you still owe, oldest first
 posto email show <id> --text
 posto email archive <id>...
-posto email label Promos <id>...
-posto email unlabel Promos <id>...
+posto email label Deals <id>...
+posto email unlabel Deals <id>...
 posto email destroy <id>... --yes   # permanent; `email delete` only moves to Trash
 posto mailbox empty Trash --yes     # permanent, every account that has the mailbox
 posto email reply <id> --body-file reply.md --markdown
