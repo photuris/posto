@@ -1,6 +1,6 @@
 # Maintainer: Joshua Pruitt
 pkgname=posto-git
-pkgver=r124.e52932e
+pkgver=r126.fce1d0a
 pkgrel=1
 pkgdesc="Email client for Fastmail (JMAP) and Proton Mail, with a GUI and a CLI"
 arch=(x86_64 aarch64)
