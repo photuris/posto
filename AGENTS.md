@@ -206,6 +206,12 @@ Read `README.md` first. This file holds what the code does not say.
   `document::Style` inserts once, so dynamic CSS goes in a plain `style {}`
   element; create signals in the scope that uses them or the runtime logs
   `copy_value_hoisted` warnings.
+- Dioxus `value` is volatile: every re-render of the component re-sends it,
+  and a value the input has not reported yet (a keystroke in flight) resets
+  it and moves the caret to the end. The composer's fields are uncontrolled
+  (`initial_value` from a `use_hook` snapshot; `oninput` still writes the
+  draft); never bind `value` on a field the user types into while other
+  signals re-render it.
 
 ## Checks before claiming done
 

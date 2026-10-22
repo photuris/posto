@@ -587,6 +587,17 @@ pub fn Composer() -> Element {
         .markdown
         .then(|| frame_doc(&compose::render_markdown(&draft.body)));
     let focus_body = !draft.to.is_empty();
+    // The fields are uncontrolled: a re-render that pushed a value the input
+    // had not reported yet (a keystroke in flight) would reset it and move the
+    // caret to the end. The composer mounts per draft, so these are its own.
+    let initial = use_hook(|| {
+        (
+            COMPOSER_TO.peek().clone(),
+            COMPOSER_CC.peek().clone(),
+            draft.subject.clone(),
+            draft.body.clone(),
+        )
+    });
 
     rsx! {
         div { class: "overlay",
@@ -629,7 +640,7 @@ pub fn Composer() -> Element {
                     input {
                         id: "compose-to",
                         r#type: "text",
-                        value: "{COMPOSER_TO}",
+                        initial_value: "{initial.0}",
                         onmounted: move |evt| async move {
                             if !focus_body {
                                 let _ = evt.set_focus(true).await;
@@ -644,7 +655,7 @@ pub fn Composer() -> Element {
                     label { "Cc:" }
                     input {
                         r#type: "text",
-                        value: "{COMPOSER_CC}",
+                        initial_value: "{initial.1}",
                         onfocusin: focus_in,
                         onfocusout: focus_out,
                         oninput: |evt| *COMPOSER_CC.write() = evt.value(),
@@ -654,7 +665,7 @@ pub fn Composer() -> Element {
                     label { "Subject:" }
                     input {
                         r#type: "text",
-                        value: "{draft.subject}",
+                        initial_value: "{initial.2}",
                         onfocusin: focus_in,
                         onfocusout: focus_out,
                         oninput: |evt| edit(|d| d.subject = evt.value()),
@@ -663,7 +674,7 @@ pub fn Composer() -> Element {
                 div { class: if preview.is_some() { "composer-body split" } else { "composer-body" },
                     textarea {
                         id: "compose-body",
-                        value: "{draft.body}",
+                        initial_value: "{initial.3}",
                         onmounted: move |evt| async move {
                             if focus_body {
                                 let _ = evt.set_focus(true).await;
@@ -1166,6 +1177,34 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typing_and_rerenders_never_push_a_field_value() {
+        let mut dom = mount(two_accounts(), |_| {});
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        open_composer(Draft {
+            account_id: "default".into(),
+            subject: "Re: hi".into(),
+            body: "> quoted".into(),
+            ..Draft::default()
+        });
+        pump(&mut dom).await;
+        // What a keystroke does, then a status line from a sync.
+        edit(|d| d.body = "x\n> quoted".into());
+        *COMPOSER_TO.write() = "a@x.io".into();
+        *STATUS.write() = "Synced".into();
+
+        let edits = pump(&mut dom).await;
+
+        assert!(texts(&edits).contains(&"Synced".to_string()));
+        assert!(
+            !edits.iter().any(
+                |m| matches!(m, Mutation::SetAttribute { name, .. } if name.contains("value"))
+            ),
+            "a re-render reset a field the user is typing in"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
