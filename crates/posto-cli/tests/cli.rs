@@ -619,6 +619,10 @@ fn email_list_triage() {
 
     assert!(!out.status.success());
 
+    let out = sb.run_with(&["email", "list", "--triage", "--unread"], None);
+
+    assert!(!out.status.success());
+
     sb.json(&[
         "account",
         "set",

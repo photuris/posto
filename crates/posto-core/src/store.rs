@@ -3391,7 +3391,7 @@ mod tests {
         ("t02", "a", (2, 9), &["in"], &[], None, NR),
         ("t03", "a", (3, 9), &["in"], &[], None, Some(("needs_reply", None, 0.0, true))),
         ("t04", "a", (4, 9), &["in"], &[], None, Some(("receipts", None, 0.7, false))),
-        ("t05", "a", (5, 9), &["in"], &[], None, Some(("receipts", Some("receipts"), 0.7, false))),
+        ("t05", "a", (5, 9), &["in"], &[], None, Some(("needs_reply", Some("receipts"), 0.7, false))),
         ("t06", "a", (6, 9), &["in"], &[], None, Some(("receipts", Some("needs_reply"), 0.0, false))),
         ("t07", "a", (7, 9), &["in"], &[], None, Some(("spam", None, 0.9, false))),
         ("t08", "a", (8, 9), &["in"], &["$answered"], None, NR),
@@ -3399,7 +3399,7 @@ mod tests {
         ("t10", "a", (10, 9), &["in"], &[], Some("th-x"), NR),
         ("r10", "a", (10, 10), &["snt"], &["$seen"], Some("th-x"), None),
         ("t11", "a", (11, 9), &["in"], &[], Some("th-y"), NR),
-        ("r11", "a", (11, 8), &["snt"], &["$seen"], Some("th-y"), None),
+        ("r11", "a", (11, 9), &["snt"], &["$seen"], Some("th-y"), None),
         ("t12", "a", (12, 9), &["arc"], &[], None, NR),
         ("t13", "a", (13, 9), &["in", "trs"], &["$flagged"], None, None),
         ("t14", "a", (14, 9), &["in", "jnk"], &[], None, NR),
@@ -3522,6 +3522,7 @@ mod tests {
         let ids = |v: Vec<EmailSummary>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
         let ab = ["a".to_string(), "b".to_string()];
         let ba = ["b".to_string(), "a".to_string()];
+        let aba = ["a".to_string(), "b".to_string(), "a".to_string()];
         let all = store.list_triage(&ab, 0, 0).unwrap();
 
         assert_eq!(
@@ -3543,7 +3544,8 @@ mod tests {
                 .all(|e| (e.account_id == "b") == ["b1", "b2", "b3"].contains(&e.id.as_str()))
         );
 
-        assert_eq!(ids(store.list_triage(&ba, 0, 0).unwrap()), ids(all));
+        assert_eq!(ids(store.list_triage(&ba, 0, 0).unwrap()), ids(all.clone()));
+        assert_eq!(ids(store.list_triage(&aba, 0, 0).unwrap()), ids(all));
         assert_eq!(
             ids(store.list_triage(&ab, 3, 1).unwrap()),
             ["t01", "t02", "b2"]
