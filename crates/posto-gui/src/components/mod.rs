@@ -55,8 +55,9 @@ pub fn focus_out(_: FocusEvent) {
     *TYPING.write() = false;
 }
 
-/// Wraps untrusted HTML for a sandboxed `srcdoc` iframe: links target a new
-/// window. The mail renders on the light canvas its sender designed for; a
+/// Wraps untrusted HTML for a sandboxed `srcdoc` iframe: links target the
+/// top frame, where the webview's navigation handler opens them in the
+/// browser (a `_blank` popup is blocked by the sandbox). The mail renders on the light canvas its sender designed for; a
 /// dark system scheme inverts it with hue kept, and inverts media back, so
 /// its own backgrounds darken with the text instead of staying light under
 /// light default text.
@@ -65,7 +66,7 @@ pub fn focus_out(_: FocusEvent) {
 // `html::sanitize` if that shows up in real mail.
 pub fn frame_doc(inner: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><base target=\"_blank\">\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><base target=\"_top\">\
          <style>:root{{color-scheme:light}}\
          body{{margin:16px;font-family:system-ui,sans-serif;overflow-wrap:anywhere}}\
          img{{max-width:100%;height:auto}}\
@@ -81,7 +82,7 @@ pub fn frame_doc(inner: &str) -> String {
 /// scroll sideways instead of wrapping.
 pub fn reader_frame_doc(inner: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><base target=\"_blank\">\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><base target=\"_top\">\
          <style>:root{{color-scheme:light dark}}\
          body{{max-width:680px;margin:0 auto;padding:28px 24px;\
          font-family:Georgia,\"Noto Serif\",serif;font-size:17px;line-height:1.6;overflow-wrap:anywhere}}\

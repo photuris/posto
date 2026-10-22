@@ -130,7 +130,7 @@ pub fn sanitize(html: &str, allow_remote: bool) -> Sanitised {
     let html = builder
         .clean(html)
         .to_string()
-        .replace("<a ", "<a target=\"_blank\" ");
+        .replace("<a ", "<a target=\"_top\" ");
 
     Sanitised {
         html,
@@ -560,9 +560,9 @@ mod tests {
     }
 
     #[test]
-    fn links_open_in_new_window() {
+    fn links_target_the_top_frame() {
         let out = sanitize(r#"<a href="https://example.com">x</a>"#, false).html;
-        assert!(out.contains(r#"target="_blank""#), "{out}");
+        assert!(out.contains(r#"target="_top""#), "{out}");
         assert!(out.contains(r#"rel="noopener noreferrer""#), "{out}");
     }
 

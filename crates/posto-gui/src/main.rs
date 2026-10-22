@@ -42,7 +42,12 @@ fn main() {
     // `with_window` replaces the whole window builder, so the icon goes on after it.
     let mut cfg = Config::new()
         .with_window(window)
-        .with_menu(app_menu(&backend.cfg.shortcuts));
+        .with_menu(app_menu(&backend.cfg.shortcuts))
+        // Mail links target the top frame. Dioxus hands http(s)/mailto to the
+        // browser and blocks them here; anything else a message could point
+        // the window at (`data:`, `cid:`) is refused too. `about:` stays so
+        // the srcdoc iframes load.
+        .with_navigation_handler(|url| url.starts_with("about:"));
 
     if let Some(icon) = window_icon() {
         cfg = cfg.with_icon(icon);

@@ -239,7 +239,7 @@ pub fn Reader() -> Element {
                 if let Some(error) = BODY_ERROR() {
                     div { class: "empty", "{error}" }
                 } else if let Some(doc) = reader_doc.filter(|_| reader_mode) {
-                    iframe { class: "mail", "sandbox": "", srcdoc: "{doc}" }
+                    iframe { class: "mail", "sandbox": "allow-top-navigation-by-user-activation", srcdoc: "{doc}" }
                 } else if reader_mode || html_doc.is_none() {
                     match text {
                         Some(text) => rsx! {
@@ -250,7 +250,7 @@ pub fn Reader() -> Element {
                         },
                     }
                 } else if let Some(doc) = html_doc {
-                    iframe { class: "mail", "sandbox": "", srcdoc: "{doc}" }
+                    iframe { class: "mail", "sandbox": "allow-top-navigation-by-user-activation", srcdoc: "{doc}" }
                 }
             }
             if !attachments.is_empty() {

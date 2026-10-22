@@ -1,6 +1,7 @@
 /target
 .overseer/
 graphify-out
+ROADMAP.md
 .codex
 .claude
 *.db

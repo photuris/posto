@@ -187,6 +187,12 @@ Read `README.md` first. This file holds what the code does not say.
 - The theme watcher's notify callback only sends on a channel; a worker thread
   owns the watcher and does the re-watching (calling `watch`/`unwatch` inside
   the callback deadlocks).
+- Mail links target the top frame (`html::sanitize` sets `target="_top"`,
+  the reader iframes allow `allow-top-navigation-by-user-activation`). The
+  webview's navigation handler (`main.rs`) then opens http(s)/mailto in the
+  browser and refuses every other top navigation except `about:`. A
+  `_blank` link inside the sandbox is silently dropped: Dioxus has no
+  new-window hook.
 - Dioxus 0.7: `iframe` has no typed `sandbox` attribute (use `"sandbox": ""`);
   `document::Style` inserts once, so dynamic CSS goes in a plain `style {}`
   element; create signals in the scope that uses them or the runtime logs
