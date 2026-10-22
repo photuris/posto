@@ -53,20 +53,51 @@ pub fn accept(what: Accept) {
     }
 }
 
-/// A right-click menu on a Trash or Spam row.
+/// A right-click menu at a viewport position.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Menu {
-    /// Viewport position of the click.
     pub x: f64,
     pub y: f64,
-    /// The folder to empty and its display name.
-    pub folder: Folder,
-    pub name: String,
+    pub kind: MenuKind,
+}
+
+/// What a right-click menu offers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuKind {
+    /// "Empty …" on a Trash or Spam row: the folder and its display name.
+    Empty { folder: Folder, name: String },
+    /// Archive and Delete for the selected messages.
+    Messages,
 }
 
 /// Opens the right-click menu for a Trash or Spam row.
 pub fn open_empty_menu(folder: Folder, name: String, x: f64, y: f64) {
-    *MENU.write() = Some(Menu { x, y, folder, name });
+    *MENU.write() = Some(Menu {
+        x,
+        y,
+        kind: MenuKind::Empty { folder, name },
+    });
+}
+
+/// Opens the message menu for a right-click on row `key`: a row outside the
+/// selection becomes the selection first, a row inside it keeps it.
+pub fn open_message_menu(key: &str, x: f64, y: f64) {
+    if !SELECTION.peek().is_selected(key) {
+        click_email(key, Click::Plain);
+    }
+
+    *MENU.write() = Some(Menu {
+        x,
+        y,
+        kind: MenuKind::Messages,
+    });
+}
+
+/// Closes the menu and runs `action` on the selection.
+pub fn menu_action(action: Action) {
+    *MENU.write() = None;
+    focus_root();
+    dispatch(action);
 }
 
 /// The question to ask before emptying `name`, which holds `total` messages.
@@ -93,10 +124,14 @@ fn folder_members(folder: &Folder) -> Vec<(String, String)> {
 
 /// Closes the menu and asks before emptying its folder.
 pub fn confirm_empty() {
-    let Some(menu) = MENU.write().take() else {
+    let Some(Menu {
+        kind: MenuKind::Empty { folder, name },
+        ..
+    }) = MENU.write().take()
+    else {
         return;
     };
-    let members = folder_members(&menu.folder);
+    let members = folder_members(&folder);
     let total = MAILBOXES
         .peek()
         .iter()
@@ -108,7 +143,7 @@ pub fn confirm_empty() {
         .map(|m| m.total)
         .sum();
 
-    *CONFIRM.write() = Some(empty_prompt(menu.folder, &menu.name, total));
+    *CONFIRM.write() = Some(empty_prompt(folder, &name, total));
 }
 
 /// Permanently deletes everything in `folder`, account by account; every
@@ -121,13 +156,6 @@ async fn empty_folder(folder: Folder) {
     let (mut deleted, mut failures) = (0, Vec::new());
 
     for (account, mailbox) in folder_members(&folder) {
-        let before: Vec<EmailSummary> = b
-            .store
-            .email_ids_in_mailbox(&account, &mailbox)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|id| b.store.email(&account, id).ok().flatten())
-            .collect();
         let result = match get_client(&account).await {
             Ok(client) => {
                 actions::empty_mailbox(&b.store, client.as_deref(), &account, &mailbox).await
@@ -135,18 +163,13 @@ async fn empty_folder(folder: Folder) {
             Err(e) => Err(e),
         };
 
-        for old in &before {
-            let new = b.store.email(&account, &old.id).ok().flatten();
-
-            bump_counts(old, new.as_ref());
-        }
-
         match result {
             Ok(n) => deleted += n,
             Err(e) => failures.push(format!("{account}: {e}")),
         }
     }
 
+    reload_mailboxes();
     change_selection(|s| *s = Selection::default());
     reload_list().await;
 
@@ -1021,8 +1044,8 @@ pub async fn get_client(account_id: &str) -> Result<Option<Arc<Connection>>> {
     result
 }
 
-/// Applies `action` to the server and store, account by account, and mirrors
-/// it in the mailbox badges.
+/// Applies `action` to the server and store, account by account, and re-reads
+/// the mailbox badges.
 async fn apply_local(refs: &[MsgRef], action: actions::Action) -> Result<usize> {
     let mut applied = 0;
 
@@ -1033,8 +1056,9 @@ async fn apply_local(refs: &[MsgRef], action: actions::Action) -> Result<usize> 
     Ok(applied)
 }
 
-/// Applies `action` to `ids` of one `account` and mirrors it in the mailbox
-/// badges; returns how many emails the core reports as changed.
+/// Applies `action` to `ids` of one `account` and re-reads the mailbox badges
+/// (the store moves the counts); returns how many emails the core reports as
+/// changed.
 async fn apply_one_account(
     account: &str,
     ids: &[String],
@@ -1042,36 +1066,11 @@ async fn apply_one_account(
 ) -> Result<usize> {
     let b = backend().peek().clone();
     let client = get_client(account).await?;
-    let before: Vec<EmailSummary> = ids
-        .iter()
-        .filter_map(|id| b.store.email(account, id).ok().flatten())
-        .collect();
-    let applied = actions::apply(&b.store, client.as_deref(), account, ids, action).await?;
+    let applied = actions::apply(&b.store, client.as_deref(), account, ids, action).await;
 
-    for old in &before {
-        let new = b.store.email(account, &old.id).ok().flatten();
+    reload_mailboxes();
 
-        bump_counts(old, new.as_ref());
-    }
-
-    Ok(applied)
-}
-
-/// Adjusts the mailbox badges for an email that changed from `old` to `new`
-/// (`None`: it is gone).
-fn bump_counts(old: &EmailSummary, new: Option<&EmailSummary>) {
-    for m in MAILBOXES
-        .write()
-        .iter_mut()
-        .filter(|m| m.account_id == old.account_id)
-    {
-        let was = old.mailbox_ids.contains(&m.id);
-        let is = new.is_some_and(|n| n.mailbox_ids.contains(&m.id));
-
-        m.total += i64::from(is) - i64::from(was);
-        m.unread += i64::from(is && new.is_some_and(EmailSummary::is_unread))
-            - i64::from(was && old.is_unread());
-    }
+    applied
 }
 
 /// Replaces the visible row of a message with its current state.
@@ -1284,7 +1283,10 @@ fn reload_unsure_counts() {
     let mut counts = BTreeMap::new();
 
     for a in b.cfg.accounts_enabled() {
-        match b.store.unsure_email_ids(&a.id) {
+        match b
+            .store
+            .unsure_email_ids(&a.id, &b.cfg.classify.unsure_mailbox)
+        {
             Ok(ids) => {
                 counts.insert(a.id.clone(), ids.len());
             }
@@ -1349,6 +1351,7 @@ pub async fn reload_list() {
         _ => Vec::new(),
     };
     let accounts = enabled_ids(&b.cfg);
+    let unsure_mailbox = b.cfg.classify.unsure_mailbox.clone();
 
     let loaded = tokio::task::spawn_blocking(move || {
         if !q.is_empty() {
@@ -1376,7 +1379,7 @@ pub async fn reload_list() {
                 let mut all = Vec::new();
 
                 for account in &accounts {
-                    let ids = store.unsure_email_ids(account)?;
+                    let ids = store.unsure_email_ids(account, &unsure_mailbox)?;
 
                     all.extend(
                         store.list_emails_by_ids(account, &ids[..ids.len().min(limit as usize)])?,
@@ -1963,46 +1966,18 @@ async fn correct_refs(
     let (mut filed, mut first_error) = (0, None);
 
     for r in refs {
-        let before = b.store.email(&r.account_id, &r.id).ok().flatten();
-
         match classify::correct(&b.cfg, &b.store, clients, r, tray.clone()).await {
             Ok(()) => filed += 1,
             Err(e) => {
                 first_error.get_or_insert(e);
             }
         }
-
-        adopt_new_mailboxes(&r.account_id);
-
-        // Moves already made count even when a later step failed.
-        if let (Some(old), Ok(Some(new))) = (before, b.store.email(&r.account_id, &r.id)) {
-            bump_counts(&old, Some(&new));
-        }
     }
+
+    // Moves already made count even when a later step failed.
+    reload_mailboxes();
 
     (filed, first_error)
-}
-
-/// Adds the mailboxes of `account` that the store has and the sidebar lacks
-/// (a correction can create the tray folder), leaving the other badges alone.
-fn adopt_new_mailboxes(account: &str) {
-    let Ok(stored) = backend().peek().store.mailboxes(account) else {
-        return;
-    };
-    let mut all = MAILBOXES.write();
-
-    for m in stored {
-        if all.iter().any(|x| x.account_id == account && x.id == m.id) {
-            continue;
-        }
-
-        let at = all
-            .iter()
-            .rposition(|x| x.account_id == account)
-            .map_or(all.len(), |i| i + 1);
-
-        all.insert(at, m);
-    }
 }
 
 /// The mailbox name of `tray` in `cfg`; spam always goes to Junk.
@@ -2882,6 +2857,137 @@ mod tests {
                 .contains(&receipts.id)
         );
         assert!(STATUS.peek().contains("Classified 1"), "{}", STATUS.peek());
+
+        // The badges follow the classifier's moves, not the pre-classification counts.
+        let badges: Vec<(String, i64, i64)> = MAILBOXES
+            .peek()
+            .iter()
+            .filter(|m| m.total > 0)
+            .map(|m| (m.id.clone(), m.total, m.unread))
+            .collect();
+
+        assert_eq!(badges, {
+            let mut counted = b.store.counts("default").unwrap();
+            let order: Vec<String> = MAILBOXES.peek().iter().map(|m| m.id.clone()).collect();
+
+            counted.sort_by_key(|(id, ..)| order.iter().position(|o| o == id));
+            counted
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn message_menu_archives_the_selection_it_was_opened_on() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+        reload_list().await;
+
+        let keys: Vec<String> = EMAILS
+            .peek()
+            .iter()
+            .take(3)
+            .map(|e| e.msg_ref().to_string())
+            .collect();
+
+        // A right-click outside the selection selects that row alone.
+        click_email(&keys[0], Click::Plain);
+        click_email(&keys[1], Click::Toggle);
+        open_message_menu(&keys[2], 5.0, 6.0);
+
+        assert_eq!(selected_refs().len(), 1);
+        assert_eq!(
+            MENU.peek().as_ref().map(|m| &m.kind),
+            Some(&MenuKind::Messages)
+        );
+
+        // One inside it keeps the whole selection.
+        click_email(&keys[0], Click::Plain);
+        click_email(&keys[1], Click::Toggle);
+        open_message_menu(&keys[1], 5.0, 6.0);
+
+        let picked = selected_refs();
+
+        assert_eq!(picked.len(), 2);
+
+        dom.in_scope(ScopeId::ROOT, || menu_action(Action::Archive));
+        assert!(MENU.peek().is_none());
+
+        let archive = b
+            .store
+            .mailbox_by_role("default", "archive")
+            .unwrap()
+            .unwrap();
+        let archived = || {
+            picked.iter().all(|r| {
+                b.store
+                    .email(&r.account_id, &r.id)
+                    .unwrap()
+                    .unwrap()
+                    .mailbox_ids
+                    == [archive.id.clone()]
+            })
+        };
+
+        for _ in 0..50 {
+            if archived() {
+                break;
+            }
+
+            let _ = tokio::time::timeout(Duration::from_millis(20), dom.wait_for_work()).await;
+            dom.render_immediate_to_vec();
+        }
+
+        assert!(archived(), "the menu's Archive did not run");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn taking_the_unsure_label_off_settles_the_message() {
+        // UI test mode: no connection, so nothing reaches a server.
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Unsure);
+        reload_list().await;
+
+        assert_eq!(UNSURE.peek().get("default"), Some(&1));
+
+        let r = MsgRef::new("default", "fx-05");
+
+        apply_local(
+            std::slice::from_ref(&r),
+            actions::Action::PatchMailboxes {
+                add: vec![],
+                remove: vec!["mb-unsure".into()],
+            },
+        )
+        .await
+        .unwrap();
+        reload_list().await;
+
+        assert!(EMAILS.peek().is_empty(), "{:?}", EMAILS.peek());
+        assert_eq!(UNSURE.peek().get("default"), Some(&0));
+        assert_eq!(
+            MAILBOXES
+                .peek()
+                .iter()
+                .find(|m| m.id == "mb-unsure")
+                .map(|m| m.total),
+            Some(0)
+        );
     }
 
     /// Answers the calls a correction makes: creating a mailbox and patching mail.

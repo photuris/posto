@@ -125,7 +125,7 @@ fn mailbox_list_after_seed() {
     let v = Sandbox::seeded().json(&["mailbox", "list"]);
     let list = v.as_array().unwrap();
 
-    assert_eq!(list.len(), 12);
+    assert_eq!(list.len(), 13);
     assert_eq!(list[0]["role"], "inbox");
     assert_eq!(list[0]["account_id"], "default");
 }

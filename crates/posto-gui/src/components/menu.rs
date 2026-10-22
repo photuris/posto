@@ -1,8 +1,10 @@
-//! Right-click menu driven by [`MENU`]: one item, "Empty <folder>…".
+//! Right-click menu driven by [`MENU`]: "Empty <folder>…" on a Trash or Spam
+//! row, Archive and Delete on messages.
 
 use dioxus::prelude::*;
+use posto_core::shortcuts::Action;
 
-use crate::app::{MENU, confirm_empty, focus_root};
+use crate::app::{MENU, MenuKind, confirm_empty, focus_root, menu_action};
 
 /// A transparent overlay that closes the menu on any click or right-click,
 /// with the menu itself at the click position.
@@ -37,7 +39,15 @@ pub fn ContextMenu() -> Element {
                     focus_root();
                 }
             },
-            button { onclick: |_| confirm_empty(), "Empty {menu.name}…" }
+            match menu.kind {
+                MenuKind::Empty { name, .. } => rsx! {
+                    button { onclick: |_| confirm_empty(), "Empty {name}…" }
+                },
+                MenuKind::Messages => rsx! {
+                    button { onclick: |_| menu_action(Action::Archive), "Archive" }
+                    button { onclick: |_| menu_action(Action::Delete), "Delete" }
+                },
+            }
         }
     }
 }

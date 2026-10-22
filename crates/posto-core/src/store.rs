@@ -683,6 +683,24 @@ fn delete_email(conn: &Connection, account: &str, id: &str) -> rusqlite::Result<
     Ok(())
 }
 
+/// Adds `sign` (1 or -1) for email `id` to the `total` and, when it is unread,
+/// the `unread` of each mailbox it is in, never below 0. Local changes keep the
+/// stored counts in step this way until the next sync replaces them.
+fn count_email(conn: &Connection, account: &str, id: &str, sign: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        &format!(
+            "UPDATE mailboxes SET total = MAX(total + ?3, 0), \
+             unread = MAX(unread + ?3 * COALESCE((SELECT CASE WHEN {UNREAD_SQL} THEN 1 ELSE 0 END \
+                 FROM emails e WHERE e.account_id = ?1 AND e.id = ?2), 0), 0) \
+             WHERE account_id = ?1 AND id IN (SELECT mailbox_id FROM email_mailboxes \
+                 WHERE account_id = ?1 AND email_id = ?2)"
+        ),
+        params![account, id, sign],
+    )?;
+
+    Ok(())
+}
+
 /// Queues emails for classification; ids already queued keep their attempts.
 fn enqueue(conn: &Connection, account: &str, ids: &[String]) -> rusqlite::Result<()> {
     for id in ids {
@@ -1134,7 +1152,8 @@ impl Store {
         Ok(n as usize)
     }
 
-    /// Deletes emails of `account` and everything hanging off them.
+    /// Deletes emails of `account` and everything hanging off them; their
+    /// mailboxes' counts drop with them.
     ///
     /// # Errors
     ///
@@ -1144,6 +1163,7 @@ impl Store {
         let tx = conn.transaction()?;
 
         for id in ids {
+            count_email(&tx, account, id, -1)?;
             delete_email(&tx, account, id)?;
         }
 
@@ -1486,20 +1506,29 @@ impl Store {
     }
 
     /// Ids of the cached emails of `account` whose classification is unsure
-    /// and uncorrected, newest first.
+    /// and uncorrected, newest first. Once applied, the message must also
+    /// still be in the top-level mailbox `unsure_mailbox` (found as
+    /// [`Store::top_level_mailbox_by_name`] does): taking the label off, here
+    /// or in another client, settles it.
     ///
     /// # Errors
     ///
     /// Returns an error on database failure.
-    pub fn unsure_email_ids(&self, account: &str) -> Result<Vec<String>> {
+    pub fn unsure_email_ids(&self, account: &str, unsure_mailbox: &str) -> Result<Vec<String>> {
+        let label = self
+            .top_level_mailbox_by_name(account, unsure_mailbox)?
+            .map(|m| m.id);
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT e.id FROM emails e \
              JOIN classified c ON c.account_id = e.account_id AND c.email_id = e.id \
              WHERE e.account_id = ?1 AND c.unsure = 1 AND c.corrected_tray IS NULL \
+             AND (c.applied = 0 OR EXISTS (SELECT 1 FROM email_mailboxes em \
+                 WHERE em.account_id = e.account_id AND em.email_id = e.id \
+                 AND em.mailbox_id = ?2)) \
              ORDER BY e.received_at DESC, e.id",
         )?;
-        let rows = stmt.query_map([account], |r| r.get(0))?;
+        let rows = stmt.query_map(params![account, label], |r| r.get(0))?;
 
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -2057,21 +2086,29 @@ impl Store {
             .optional()?)
     }
 
-    /// Replaces an email's keywords. Unknown ids are a no-op.
+    /// Replaces an email's keywords and moves its mailboxes' unread counts
+    /// with it. Unknown ids are a no-op.
     ///
     /// # Errors
     ///
     /// Returns an error on database failure.
     pub fn set_keywords(&self, account: &str, id: &str, keywords: &[String]) -> Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        count_email(&tx, account, id, -1)?;
+        tx.execute(
             "UPDATE emails SET keywords_json = ?3 WHERE account_id = ?1 AND id = ?2",
             params![account, id, to_json(keywords)?],
         )?;
+        count_email(&tx, account, id, 1)?;
+        tx.commit()?;
 
         Ok(())
     }
 
-    /// Replaces an email's mailboxes. Unknown ids are a no-op.
+    /// Replaces an email's mailboxes and moves the counts with it. Unknown ids
+    /// are a no-op.
     ///
     /// # Errors
     ///
@@ -2079,6 +2116,9 @@ impl Store {
     pub fn set_mailbox_ids(&self, account: &str, id: &str, mailbox_ids: &[String]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+
+        count_email(&tx, account, id, -1)?;
+
         let changed = tx.execute(
             "UPDATE emails SET mailbox_ids_json = ?3 WHERE account_id = ?1 AND id = ?2",
             params![account, id, to_json(mailbox_ids)?],
@@ -2088,6 +2128,7 @@ impl Store {
             write_email_mailboxes(&tx, account, id, mailbox_ids)?;
         }
 
+        count_email(&tx, account, id, 1)?;
         tx.commit()?;
 
         Ok(())
@@ -2809,6 +2850,42 @@ mod tests {
         );
         assert_eq!(store.search(None, "first", 0).unwrap().len(), 0);
         assert_eq!(store.search(None, "second", 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn local_changes_move_the_stored_counts() {
+        let store = Store::open_memory().unwrap();
+        let counted = |id: &str, total, unread| Mailbox {
+            total,
+            unread,
+            ..mailbox(id, id, None)
+        };
+        let counts = || -> Vec<(String, i64, i64)> {
+            store
+                .mailboxes("a")
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.id, m.total, m.unread))
+                .collect()
+        };
+
+        // Server counts above what the cache holds stay above it.
+        store
+            .upsert_mailboxes(&[counted("in", 10, 4), counted("tray", 0, 0)])
+            .unwrap();
+        store
+            .upsert_emails(&[email("e", "2026-10-01T10:00:00Z", "s", &["in"])])
+            .unwrap();
+
+        store.set_mailbox_ids("a", "e", &["tray".into()]).unwrap();
+        assert_eq!(counts(), [("in".into(), 9, 3), ("tray".into(), 1, 1)]);
+
+        store.set_keywords("a", "e", &["$seen".into()]).unwrap();
+        assert_eq!(counts(), [("in".into(), 9, 3), ("tray".into(), 1, 0)]);
+
+        store.set_mailbox_ids("a", "nope", &["in".into()]).unwrap();
+        store.delete_emails("a", &["e".into()]).unwrap();
+        assert_eq!(counts(), [("in".into(), 9, 3), ("tray".into(), 0, 0)]);
     }
 
     #[test]
@@ -3562,30 +3639,39 @@ mod tests {
         let store = Store::open_memory().unwrap();
 
         store
+            .upsert_mailboxes(&[mailbox("u", "unsure", None)])
+            .unwrap();
+        store
             .upsert_emails(&[
-                email("e1", "2026-10-01T10:00:00Z", "one", &[]),
-                email("e2", "2026-10-02T10:00:00Z", "two", &[]),
-                email("e3", "2026-10-03T10:00:00Z", "three", &[]),
-                email_in("b", "e2", "2026-10-04T10:00:00Z", "other", &[]),
+                email("e1", "2026-10-01T10:00:00Z", "one", &["u"]),
+                email("e2", "2026-10-02T10:00:00Z", "two", &["u"]),
+                email("e3", "2026-10-03T10:00:00Z", "three", &["u"]),
+                email("e4", "2026-10-05T10:00:00Z", "unlabelled", &[]),
+                email("e5", "2026-10-06T10:00:00Z", "pending", &[]),
+                email_in("b", "e2", "2026-10-04T10:00:00Z", "other", &["u"]),
             ])
             .unwrap();
 
-        for (account, id, unsure) in [
-            ("a", "e1", true),
-            ("a", "e2", true),
-            ("a", "e3", false),
-            ("a", "gone", true),
-            ("b", "e2", true),
+        for (account, id, unsure, applied) in [
+            ("a", "e1", true, true),
+            ("a", "e2", true, true),
+            ("a", "e3", false, true),
+            ("a", "e4", true, true),
+            ("a", "e5", true, false),
+            ("a", "gone", true, true),
+            ("b", "e2", true, true),
         ] {
             store
-                .put_classification(&classified(account, id, unsure, true))
+                .put_classification(&classified(account, id, unsure, applied))
                 .unwrap();
         }
 
         store.set_correction("a", "e1", "social").unwrap();
 
-        // Corrected, sure, uncached and other-account rows are out.
-        assert_eq!(store.unsure_email_ids("a").unwrap(), ["e2"]);
+        // Corrected, sure, uncached, other-account rows and an applied one
+        // whose Unsure label is gone are out; one not applied yet is in.
+        assert_eq!(store.unsure_email_ids("a", "Unsure").unwrap(), ["e5", "e2"]);
+        assert_eq!(store.unsure_email_ids("a", "Elsewhere").unwrap(), ["e5"]);
 
         let ids = ["e3".to_string(), "e1".to_string(), "nope".to_string()];
         let listed: Vec<String> = store

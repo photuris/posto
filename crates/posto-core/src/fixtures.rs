@@ -16,7 +16,7 @@ const SHOP: &str = "shop@example.com";
 /// Mailboxes: id, name, role, sort order. The last three, Newsletters and
 /// Receipts are the classifier's tray mailboxes, present so a correction
 /// works offline.
-const MAILBOXES: [(&str, &str, Option<&str>, i64); 12] = [
+const MAILBOXES: [(&str, &str, Option<&str>, i64); 13] = [
     ("mb-inbox", "Inbox", Some("inbox"), 1),
     ("mb-drafts", "Drafts", Some("drafts"), 2),
     ("mb-sent", "Sent", Some("sent"), 3),
@@ -27,6 +27,7 @@ const MAILBOXES: [(&str, &str, Option<&str>, i64); 12] = [
     ("mb-receipts", "Receipts", None, 11),
     ("mb-bilag", "Bilag", None, 12),
     ("mb-needs-reply", "Needs Reply", None, 13),
+    ("mb-unsure", "Unsure", None, 14),
     ("mb-promos", "Deals", None, 15),
     ("mb-social", "Social Media", None, 16),
 ];
@@ -122,7 +123,8 @@ const EMAILS: [Fx; 14] = [
         from: ("Ola Nordmann", "ola@example.net"),
         subject: "Lunch Thursday?",
         preview: "Are you free around noon? The new ramen place opened.",
-        mailboxes: &["mb-inbox"],
+        // Applied unsure: kept in the inbox, labelled Unsure.
+        mailboxes: &["mb-inbox", "mb-unsure"],
         keywords: &["$seen"],
         html: None,
         text: Some("Are you free around noon on Thursday?\nThe new ramen place opened.\n"),
@@ -431,7 +433,7 @@ mod tests {
 
         seed(&store).unwrap();
 
-        assert_eq!(store.mailboxes(ACCOUNT).unwrap().len(), 12);
+        assert_eq!(store.mailboxes(ACCOUNT).unwrap().len(), 13);
         assert_eq!(store.identities(ACCOUNT).unwrap().len(), 2);
         assert_eq!(
             store

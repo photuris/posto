@@ -6,7 +6,8 @@ use posto_core::store::mailbox_groups;
 
 use crate::app::{
     CLASSIFIED, EMAILS, HAS_MORE, MAILBOXES, SEARCH_QUERY, SELECTED_MAILBOX, SELECTION,
-    SIDEBAR_OPEN, TRIAGE, backend, click_email, dispatch, enabled_ids, load_more, tray_label,
+    SIDEBAR_OPEN, TRIAGE, backend, click_email, dispatch, enabled_ids, load_more,
+    open_message_menu, tray_label,
 };
 use crate::components::{Icon, SidebarOpen};
 use crate::format;
@@ -165,6 +166,7 @@ pub fn MessageList() -> Element {
                             class.push_str(" unread");
                         }
                         let row_id = key.clone();
+                        let menu_id = key.clone();
                         let archive_id = key.clone();
                         let delete_id = key.clone();
 
@@ -187,6 +189,13 @@ pub fn MessageList() -> Element {
                                     };
 
                                     click_email(&row_id, kind);
+                                },
+                                oncontextmenu: move |evt| {
+                                    let at = evt.client_coordinates();
+
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                    open_message_menu(&menu_id, at.x, at.y);
                                 },
                                 div {
                                     class: "avatar",

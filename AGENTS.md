@@ -206,6 +206,18 @@ Read `README.md` first. This file holds what the code does not say.
   `document::Style` inserts once, so dynamic CSS goes in a plain `style {}`
   element; create signals in the scope that uses them or the runtime logs
   `copy_value_hoisted` warnings.
+- Badges come from the stored mailbox counts. A local change moves them in
+  the store (`set_mailbox_ids`, `set_keywords`, `delete_emails` call
+  `count_email`) until the next sync replaces them; the GUI re-reads them
+  with `reload_mailboxes` and never patches `MAILBOXES` counts itself (a
+  later reload threw such patches away, and the classifier's moves were
+  never counted).
+- Unsure is unsure, uncorrected and, once applied, still labelled with
+  `classify.unsure_mailbox` (`Store::unsure_email_ids`): taking the label
+  off, in Posto or another client, settles a message without a correction.
+- A GUI test that applies an action needs `ui_test = true`: otherwise
+  `get_client` reads the real `secrets.toml` and connects the real account
+  behind the slug (`default` has one on this machine).
 - Dioxus `value` is volatile: every re-render of the component re-sends it,
   and a value the input has not reported yet (a keystroke in flight) resets
   it and moves the caret to the end. The composer's fields are uncontrolled
