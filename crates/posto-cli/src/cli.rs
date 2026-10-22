@@ -211,7 +211,7 @@ pub struct Ids {
 
 #[derive(Subcommand)]
 pub enum EmailCmd {
-    /// List emails, newest first, across all accounts or only `--account`.
+    /// List emails, newest first, across all accounts or only `--account`; `--triage` lists the owed ones oldest first.
     ///
     /// Output: [{"account_id": string, "id": string, "thread_id": string, "received_at": string, "from": [{"name": string|null, "email": string}], "to": [address], "cc": [address], "subject": string, "preview": string, "size": number, "has_attachment": bool, "mailbox_ids": [string], "keywords": [string]}]
     List {
@@ -227,6 +227,9 @@ pub enum EmailCmd {
         /// Only unread emails.
         #[arg(long)]
         unread: bool,
+        /// Only emails still owed a reply or action (the GUI's Triage), oldest first.
+        #[arg(long, conflicts_with_all = ["mailbox", "unread"])]
+        triage: bool,
     },
     /// Show one email with its body (fetched and cached if needed); an id found in several accounts needs `--account`.
     ///

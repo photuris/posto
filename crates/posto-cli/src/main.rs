@@ -83,7 +83,8 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
                 limit,
                 offset,
                 unread,
-            } => c::email_list(account, mailbox, limit, offset, unread),
+                triage,
+            } => c::email_list(account, mailbox, limit, offset, unread, triage),
             EmailCmd::Show { id, text } => c::email_show(account, &id, text).await,
             EmailCmd::Search { query, limit } => c::email_search(account, &query, limit),
             EmailCmd::Archive(a) => {

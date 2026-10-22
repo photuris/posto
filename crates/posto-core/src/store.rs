@@ -1504,6 +1504,90 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The ids of `account`'s emails the user still owes something, oldest
+    /// first (`received_at`, then id): in the inbox, not in trash or junk, not
+    /// a draft, and flagged, or not answered and owed by the classifier
+    /// (effective tray `needs_reply`, or uncorrected, not spam and `action` at
+    /// least [`crate::classify::ACTION_AT`]). Answered: `$answered`, or a later
+    /// email of the same (non-empty) thread in a sent mailbox of the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn triage_email_ids(&self, account: &str) -> Result<Vec<String>> {
+        // `alias` is in a mailbox of its own account with one of `roles`.
+        let in_role = |alias: &str, roles: &str| {
+            format!(
+                "EXISTS (SELECT 1 FROM email_mailboxes em \
+                 JOIN mailboxes m ON m.account_id = em.account_id AND m.id = em.mailbox_id \
+                 WHERE em.account_id = {alias}.account_id AND em.email_id = {alias}.id \
+                 AND m.role IN ({roles}))"
+            )
+        };
+        let has = |kw: &str| {
+            format!("EXISTS (SELECT 1 FROM json_each(e.keywords_json) WHERE value = '{kw}')")
+        };
+        let (inbox, junked, sent) = (
+            in_role("e", "'inbox'"),
+            in_role("e", "'trash', 'junk'"),
+            in_role("r", "'sent'"),
+        );
+        let (draft, flagged, answered) = (has("$draft"), has("$flagged"), has("$answered"));
+
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.id FROM emails e WHERE e.account_id = ?1 \
+             AND {inbox} AND NOT {junked} AND NOT {draft} \
+             AND ({flagged} OR (NOT {answered} \
+               AND NOT (e.thread_id <> '' AND EXISTS (SELECT 1 FROM emails r \
+                 WHERE r.account_id = e.account_id AND r.thread_id = e.thread_id \
+                 AND r.id <> e.id AND r.received_at > e.received_at AND {sent})) \
+               AND EXISTS (SELECT 1 FROM classified c \
+                 WHERE c.account_id = e.account_id AND c.email_id = e.id \
+                 AND (COALESCE(c.corrected_tray, c.tray) = 'needs_reply' \
+                   OR (c.corrected_tray IS NULL AND c.tray <> 'spam' AND c.action >= ?2))))) \
+             ORDER BY e.received_at, e.id"
+        ))?;
+        let rows = stmt.query_map(params![account, crate::classify::ACTION_AT], |r| r.get(0))?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The owed emails (see [`Store::triage_email_ids`]) of `accounts`, merged
+    /// oldest first: `received_at` ascending, then account id, then email id;
+    /// `offset` rows skipped, at most `limit` (0 means 200). Accounts outside
+    /// the slice are never listed; the slice order does not matter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn list_triage(
+        &self,
+        accounts: &[String],
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<EmailSummary>> {
+        let limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
+        let mut rows: Vec<EmailSummary> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for account in accounts.iter().filter(|a| seen.insert(*a)) {
+            let ids = self.triage_email_ids(account)?;
+
+            rows.extend(self.list_emails_by_ids(account, &ids)?);
+        }
+
+        rows.sort_by(|a, b| {
+            (&a.received_at, &a.account_id, &a.id).cmp(&(&b.received_at, &b.account_id, &b.id))
+        });
+
+        Ok(rows
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
     /// Ids of every email of `account` in `mailbox_id`, newest first.
     ///
     /// # Errors
@@ -3284,6 +3368,191 @@ mod tests {
             applied,
             apply_error: None,
         }
+    }
+
+    /// One triage fixture row: id, account, day and hour of `received_at`,
+    /// mailboxes, keywords, thread (default `th-<id>`) and the classification
+    /// as (tray, corrected tray, action, unsure).
+    type TriageRow = (
+        &'static str,
+        &'static str,
+        (u8, u8),
+        &'static [&'static str],
+        &'static [&'static str],
+        Option<&'static str>,
+        Option<(&'static str, Option<&'static str>, f64, bool)>,
+    );
+
+    const NR: Option<(&str, Option<&str>, f64, bool)> = Some(("needs_reply", None, 0.0, false));
+
+    #[rustfmt::skip]
+    const TRIAGE_ROWS: &[TriageRow] = &[
+        ("t01", "a", (1, 9), &["in"], &["$flagged"], None, None),
+        ("t02", "a", (2, 9), &["in"], &[], None, NR),
+        ("t03", "a", (3, 9), &["in"], &[], None, Some(("needs_reply", None, 0.0, true))),
+        ("t04", "a", (4, 9), &["in"], &[], None, Some(("receipts", None, 0.7, false))),
+        ("t05", "a", (5, 9), &["in"], &[], None, Some(("receipts", Some("receipts"), 0.7, false))),
+        ("t06", "a", (6, 9), &["in"], &[], None, Some(("receipts", Some("needs_reply"), 0.0, false))),
+        ("t07", "a", (7, 9), &["in"], &[], None, Some(("spam", None, 0.9, false))),
+        ("t08", "a", (8, 9), &["in"], &["$answered"], None, NR),
+        ("t09", "a", (9, 9), &["in"], &["$answered", "$flagged"], None, NR),
+        ("t10", "a", (10, 9), &["in"], &[], Some("th-x"), NR),
+        ("r10", "a", (10, 10), &["snt"], &["$seen"], Some("th-x"), None),
+        ("t11", "a", (11, 9), &["in"], &[], Some("th-y"), NR),
+        ("r11", "a", (11, 8), &["snt"], &["$seen"], Some("th-y"), None),
+        ("t12", "a", (12, 9), &["arc"], &[], None, NR),
+        ("t13", "a", (13, 9), &["in", "trs"], &["$flagged"], None, None),
+        ("t14", "a", (14, 9), &["in", "jnk"], &[], None, NR),
+        ("t15", "a", (15, 9), &["in"], &["$draft", "$flagged"], None, None),
+        ("t16", "a", (16, 9), &["in"], &[], None, Some(("receipts", None, 0.49, false))),
+        ("t17", "a", (17, 9), &["in"], &[], None, Some(("receipts", None, 0.5, false))),
+        ("t18", "a", (18, 9), &["in"], &[], Some("th-z"), NR),
+        ("r18", "b", (18, 10), &["b-snt"], &["$seen"], Some("th-z"), None),
+        ("t19", "a", (19, 9), &["in"], &[], Some("th-w"), NR),
+        ("r19", "a", (19, 10), &["arc"], &["$seen"], Some("th-w"), None),
+        ("t20", "a", (20, 9), &["in"], &[], None, None),
+        ("t21", "a", (21, 9), &["in"], &[], Some(""), NR),
+        ("r21", "a", (21, 10), &["snt"], &["$seen"], Some(""), None),
+        ("dup", "a", (22, 9), &["arc"], &[], None, NR),
+        ("dup", "b", (22, 9), &["b-in"], &[], None, None),
+        ("t23", "a", (23, 9), &["in"], &[], Some("th-v"), NR),
+        ("r23a", "a", (22, 10), &["snt"], &["$seen"], Some("th-v"), None),
+        ("r23b", "a", (22, 11), &["snt"], &["$seen"], Some("th-v"), None),
+        ("t25", "a", (24, 9), &["in"], &["$flagged"], None, None),
+        ("t24", "a", (24, 9), &["in"], &["$flagged"], None, None),
+        ("r10b", "a", (10, 11), &["snt"], &["$seen"], Some("th-x"), None),
+        ("b1", "b", (1, 8), &["b-in"], &["$flagged"], None, None),
+        ("b2", "b", (2, 9), &["b-in"], &["$flagged"], None, None),
+        ("b3", "b", (3, 9), &["b-in", "arc"], &["$flagged"], None, None),
+        ("t26", "a", (26, 9), &["in"], &["$answered"], None, Some(("receipts", None, 0.7, false))),
+        ("t27", "a", (27, 9), &["in"], &[], Some("th-u"), Some(("receipts", None, 0.7, false))),
+        ("r27", "a", (27, 10), &["snt"], &["$seen"], Some("th-u"), None),
+    ];
+
+    /// A store holding [`TRIAGE_ROWS`] and two accounts' mailboxes.
+    fn triage_store() -> Store {
+        let store = Store::open_memory().unwrap();
+        let b = |id: &str, name: &str, role: &str| Mailbox {
+            account_id: "b".into(),
+            ..mailbox(id, name, Some(role))
+        };
+
+        store
+            .upsert_mailboxes(&[
+                mailbox("in", "Inbox", Some("inbox")),
+                mailbox("arc", "Archive", Some("archive")),
+                mailbox("snt", "Sent", Some("sent")),
+                mailbox("trs", "Trash", Some("trash")),
+                mailbox("jnk", "Junk", Some("junk")),
+                b("b-in", "Inbox", "inbox"),
+                b("b-snt", "Sent", "sent"),
+                b("arc", "Archive", "inbox"),
+            ])
+            .unwrap();
+
+        // Reverse of the table order: no order may lean on insertion order.
+        for &(id, account, (day, hour), mailboxes, keywords, thread, class) in
+            TRIAGE_ROWS.iter().rev()
+        {
+            let at = format!("2026-10-{day:02}T{hour:02}:00:00Z");
+            let mut e = email_in(account, id, &at, id, mailboxes);
+
+            e.keywords = keywords.iter().map(|k| k.to_string()).collect();
+
+            if let Some(thread) = thread {
+                e.thread_id = thread.into();
+            }
+
+            store.upsert_emails(&[e]).unwrap();
+
+            if let Some((tray, corrected, action, unsure)) = class {
+                store
+                    .put_classification(&Classified {
+                        tray: tray.into(),
+                        corrected_tray: corrected.map(String::from),
+                        action,
+                        ..classified(account, id, unsure, true)
+                    })
+                    .unwrap();
+            }
+        }
+
+        store
+            .put_classification(&Classified {
+                tray: "needs_reply".into(),
+                ..classified("a", "ghost", false, true)
+            })
+            .unwrap();
+
+        store
+    }
+
+    #[test]
+    fn triage_ids_follow_the_rule() {
+        let store = triage_store();
+
+        assert_eq!(
+            store.triage_email_ids("a").unwrap(),
+            [
+                "t01", "t02", "t03", "t04", "t06", "t09", "t11", "t17", "t18", "t19", "t21", "t23",
+                "t24", "t25"
+            ]
+        );
+        assert_eq!(store.triage_email_ids("b").unwrap(), ["b1", "b2", "b3"]);
+        assert!(store.triage_email_ids("nobody").unwrap().is_empty());
+
+        // Unflagging an answered email drops it; a flag on an owed one is no change.
+        store
+            .set_keywords("a", "t09", &["$answered".into()])
+            .unwrap();
+        assert!(!store.triage_email_ids("a").unwrap().contains(&"t09".into()));
+
+        store
+            .set_keywords("a", "t02", &["$flagged".into()])
+            .unwrap();
+        assert!(store.triage_email_ids("a").unwrap().contains(&"t02".into()));
+
+        store.set_keywords("a", "t02", &[]).unwrap();
+        assert!(store.triage_email_ids("a").unwrap().contains(&"t02".into()));
+    }
+
+    #[test]
+    fn triage_list_merges_accounts_oldest_first() {
+        let store = triage_store();
+        let ids = |v: Vec<EmailSummary>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+        let ab = ["a".to_string(), "b".to_string()];
+        let ba = ["b".to_string(), "a".to_string()];
+        let all = store.list_triage(&ab, 0, 0).unwrap();
+
+        assert_eq!(
+            ids(all.clone()),
+            [
+                "b1", "t01", "t02", "b2", "t03", "b3", "t04", "t06", "t09", "t11", "t17", "t18",
+                "t19", "t21", "t23", "t24", "t25"
+            ]
+        );
+
+        let pairs: std::collections::HashSet<_> = all
+            .iter()
+            .map(|e| (e.account_id.clone(), e.id.clone()))
+            .collect();
+
+        assert_eq!(pairs.len(), all.len());
+        assert!(
+            all.iter()
+                .all(|e| (e.account_id == "b") == ["b1", "b2", "b3"].contains(&e.id.as_str()))
+        );
+
+        assert_eq!(ids(store.list_triage(&ba, 0, 0).unwrap()), ids(all));
+        assert_eq!(
+            ids(store.list_triage(&ab, 3, 1).unwrap()),
+            ["t01", "t02", "b2"]
+        );
+        assert_eq!(
+            ids(store.list_triage(&["b".into()], 0, 0).unwrap()),
+            ["b1", "b2", "b3"]
+        );
+        assert!(store.list_triage(&[], 0, 0).unwrap().is_empty());
     }
 
     #[test]

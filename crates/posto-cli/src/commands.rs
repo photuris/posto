@@ -536,9 +536,21 @@ pub fn email_list(
     limit: u32,
     offset: u32,
     unread: bool,
+    triage: bool,
 ) -> Result<Value> {
     let cfg = Config::load()?;
     let store = open_store()?;
+
+    if triage {
+        // The GUI's Triage covers enabled accounts only; `--account` names one.
+        let accounts = match account {
+            Some(_) => scope(&cfg, account)?,
+            None => cfg.accounts_enabled().map(|a| a.id.clone()).collect(),
+        };
+
+        return to_json(&store.list_triage(&accounts, limit, offset)?);
+    }
+
     let accounts = scope(&cfg, account)?;
     let query = |mailbox_id: Option<String>, limit: u32, offset: u32| ListQuery {
         mailbox_id,

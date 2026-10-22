@@ -598,6 +598,44 @@ fn legacy_files_load_through_the_cli() {
 }
 
 #[test]
+fn email_list_triage() {
+    let sb = Sandbox::seeded();
+    let ids = |v: Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let owed = ["fx-07", "fx-05", "fx-03", "fx-11"];
+
+    assert_eq!(ids(sb.json(&["email", "list", "--triage"])), owed);
+    assert_eq!(
+        ids(sb.json(&["email", "list", "--triage", "--limit", "2", "--offset", "1"])),
+        ["fx-05", "fx-03"]
+    );
+
+    let out = sb.run_with(&["email", "list", "--triage", "--mailbox", "Inbox"], None);
+
+    assert!(!out.status.success());
+
+    sb.json(&[
+        "account",
+        "set",
+        "--account",
+        "default",
+        "--enabled",
+        "false",
+    ]);
+
+    assert!(ids(sb.json(&["email", "list", "--triage"])).is_empty());
+    assert_eq!(
+        ids(sb.json(&["email", "list", "--triage", "--account", "default"])),
+        owed
+    );
+}
+
+#[test]
 fn email_list_filters_by_mailbox_name() {
     let sb = Sandbox::seeded();
     let news = sb.json(&["email", "list", "--mailbox", "Newsletters"]);
