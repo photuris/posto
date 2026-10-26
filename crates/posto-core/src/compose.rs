@@ -404,6 +404,7 @@ mod tests {
             references: vec!["r0@x".into()],
             message_id: vec!["m1@x".into()],
             reply_to: vec![],
+            unsubscribe: None,
         }
     }
 

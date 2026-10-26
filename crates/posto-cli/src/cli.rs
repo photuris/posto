@@ -233,7 +233,7 @@ pub enum EmailCmd {
     },
     /// Show one email with its body (fetched and cached if needed); an id found in several accounts needs `--account`.
     ///
-    /// Output: {"summary": email summary (see `email list`), "body": {"text": string|null, "html": string|null, "attachments": [{"blob_id": string, "name": string, "mime": string, "size": number}], "reply_to": [address]}}
+    /// Output: {"summary": email summary (see `email list`), "body": {"text": string|null, "html": string|null, "attachments": [{"blob_id": string, "name": string, "mime": string, "size": number}], "reply_to": [address], "unsubscribe": {"https": string|null, "mailto": string|null, "one_click": bool}|null}}
     Show {
         /// Email id.
         id: String,
@@ -337,6 +337,13 @@ pub enum EmailCmd {
         /// Send from this identity address instead of the one the original was sent to.
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Unsubscribe from the email's mailing list: the one-click POST when offered, else a mail to the list's mailto link from the address it was sent to, else print the web page to open.
+    ///
+    /// Output: {"method": "one-click"|"mail"|"web", "id": string (mail: the sent email), "url": string (web)}
+    Unsubscribe {
+        /// Email id.
+        id: String,
     },
     /// Send a new email from `--account` (default: the first enabled account).
     ///

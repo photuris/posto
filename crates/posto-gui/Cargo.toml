@@ -18,6 +18,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+webbrowser.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

@@ -591,6 +591,7 @@ async fn delta_sync_recovers_from_cannot_calculate() -> Result<()> {
             references: vec![],
             message_id: vec![],
             reply_to: vec![],
+            unsubscribe: None,
         },
     )?;
 
@@ -1240,7 +1241,10 @@ async fn body_reads_reply_to() -> Result<()> {
             json!({ "replyTo": [
                 { "name": "R", "email": "ra@passmail.com" },
                 { "name": null, "email": "r2@x.io" },
-            ] }),
+            ],
+            "header:List-Unsubscribe:asText": " <https://x.io/u>",
+            "header:List-Unsubscribe-Post:asText": " List-Unsubscribe=One-Click",
+            }),
         ),
         ("e2", json!({ "replyTo": null })),
         ("e3", json!({})),
@@ -1266,7 +1270,8 @@ async fn body_reads_reply_to() -> Result<()> {
 
         async move { c.body(id).await.map(|b| b.unwrap().reply_to) }
     };
-    let got = reply_to("e1").await?;
+    let e1 = c.body("e1").await?.unwrap();
+    let got = e1.reply_to;
 
     assert_eq!(
         got.iter()
@@ -1276,6 +1281,11 @@ async fn body_reads_reply_to() -> Result<()> {
     );
     assert!(reply_to("e2").await?.is_empty());
     assert!(reply_to("e3").await?.is_empty());
+
+    let unsubscribe = e1.unsubscribe.unwrap();
+
+    assert_eq!(unsubscribe.https.as_deref(), Some("https://x.io/u"));
+    assert!(unsubscribe.one_click);
 
     let requests = server.received_requests().await.unwrap();
     let gets: Vec<Value> = requests
@@ -1696,6 +1706,7 @@ async fn destroy_removes_locally_and_skips_not_destroyed() -> Result<()> {
             references: vec![],
             message_id: vec![],
             reply_to: vec![],
+            unsubscribe: None,
         },
     )?;
 

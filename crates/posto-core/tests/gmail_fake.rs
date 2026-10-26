@@ -12,6 +12,7 @@ use posto_core::compose::Draft;
 use posto_core::gmail::{Endpoints, GoogleClient, Login, Session, connect_with, login_with};
 use posto_core::provider::{Change, Delta, Identity, Updated};
 use posto_core::store::{Address, Attachment, EmailSummary, Mailbox, Store};
+use posto_core::unsubscribe::Unsubscribe;
 use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1434,6 +1435,14 @@ async fn body_parses_raw_mime() {
     assert_eq!(body.in_reply_to, ["p@x"]);
     assert_eq!(body.references, ["r1@x", "p@x"]);
     assert_eq!(body.reply_to, [person("List", "list@example.org")]);
+    assert_eq!(
+        body.unsubscribe,
+        Some(Unsubscribe {
+            https: Some("https://example.org/u?t=1".into()),
+            mailto: Some("mailto:u@example.org".into()),
+            one_click: true,
+        })
+    );
     assert_eq!(
         query_all(&requests(&server, "/messages/m1").await[0], "format"),
         ["raw"]

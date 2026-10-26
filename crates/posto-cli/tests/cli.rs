@@ -131,6 +131,21 @@ fn mailbox_list_after_seed() {
 }
 
 #[test]
+fn email_show_and_unsubscribe_read_the_list_headers() {
+    let sb = Sandbox::seeded();
+    let shown = sb.json(&["email", "show", "fx-04"]);
+
+    assert_eq!(shown["body"]["unsubscribe"]["one_click"], true);
+    assert!(shown["body"]["unsubscribe"]["mailto"].is_null());
+
+    // A message without the headers is refused before anything is sent.
+    // (fx-04 is not unsubscribed here: that would POST to the network.)
+    let out = sb.run_with(&["email", "unsubscribe", "fx-05"], None);
+
+    assert_eq!(out.status.code(), Some(6));
+}
+
+#[test]
 fn account_add_list_remove_and_scoped_token() {
     let sb = Sandbox::seeded();
     let added = sb.json(&["account", "add", "--id", "work", "--email", "w@x.io"]);
@@ -512,6 +527,7 @@ fn email_ids_resolve_across_accounts() {
                     references: vec![],
                     message_id: vec![],
                     reply_to: vec![],
+                    unsubscribe: None,
                 },
             )
             .unwrap();

@@ -16,6 +16,7 @@ use posto_core::shortcuts::{self, Keymap};
 use posto_core::store::{
     CLASSIFY_MAX_ATTEMPTS, EmailBody, EmailSummary, ListQuery, Mailbox, Store,
 };
+use posto_core::unsubscribe::{self, Method};
 use posto_core::{Error, Result, fixtures, gmail, html, proton, sync, theme};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -604,8 +605,39 @@ pub async fn email_show(account: Option<&str>, id: &str, text: bool) -> Result<V
             "html": body.html,
             "attachments": body.attachments,
             "reply_to": body.reply_to,
+            "unsubscribe": body.unsubscribe,
         },
     }))
+}
+
+/// Unsubscribes from email `id`'s list (see [`unsubscribe::method`]).
+pub async fn email_unsubscribe(account: Option<&str>, id: &str) -> Result<Value> {
+    let cfg = Config::load()?;
+    let store = open_store()?;
+    let summary = find_email(&store, &cfg, account, id)?;
+    let body = body_for(&store, &cfg, &summary).await?;
+    let owner = configured(&cfg, &summary.account_id)?;
+    let identities = store.identities(&owner.id)?;
+    let masked = store.masked_emails(&owner.id)?;
+    let offer = body
+        .unsubscribe
+        .ok_or_else(|| Error::NotFound(format!("unsubscribe link in {id}")))?;
+
+    match unsubscribe::method(&offer, &summary, &owner.email, &identities, &masked) {
+        Some(Method::OneClick(url)) => {
+            unsubscribe::one_click(&url).await?;
+
+            Ok(json!({ "method": "one-click" }))
+        }
+        Some(Method::Mail(draft)) => {
+            let client = client_for(&cfg, owner).await?;
+            let sent = compose::send(&cfg, &store, &client, &owner.id, &draft).await?;
+
+            Ok(json!({ "method": "mail", "id": sent }))
+        }
+        Some(Method::Web(url)) => Ok(json!({ "method": "web", "url": url })),
+        None => Err(Error::NotFound(format!("unsubscribe link in {id}"))),
+    }
 }
 
 pub fn email_search(account: Option<&str>, query: &str, limit: u32) -> Result<Value> {
@@ -844,6 +876,7 @@ fn dry_state(cfg: &Config, store: &Store, account: &str, id: &str) -> Result<Str
         references: Vec::new(),
         message_id: Vec::new(),
         reply_to: Vec::new(),
+        unsubscribe: None,
     });
     let mut own: Vec<String> = store
         .identities(account)?

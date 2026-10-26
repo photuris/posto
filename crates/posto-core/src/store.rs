@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::provider::{Identity, MaskedEmail};
+use crate::unsubscribe::Unsubscribe;
 
 /// Version of the table layout below; stored in `sync_state` as `schema_version`.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// Database schema; every statement is idempotent.
 const SCHEMA: &str = "
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS emails(account_id TEXT NOT NULL, id TEXT NOT NULL, th
 CREATE INDEX IF NOT EXISTS emails_received ON emails(received_at DESC);
 CREATE TABLE IF NOT EXISTS email_mailboxes(account_id TEXT NOT NULL, email_id TEXT NOT NULL, mailbox_id TEXT NOT NULL, PRIMARY KEY(account_id, email_id, mailbox_id));
 CREATE INDEX IF NOT EXISTS email_mailboxes_box ON email_mailboxes(account_id, mailbox_id);
-CREATE TABLE IF NOT EXISTS bodies(account_id TEXT NOT NULL, email_id TEXT NOT NULL, html TEXT, text TEXT, attachments_json TEXT NOT NULL, in_reply_to_json TEXT NOT NULL, references_json TEXT NOT NULL, message_id_json TEXT NOT NULL, reply_to_json TEXT NOT NULL, PRIMARY KEY(account_id, email_id));
+CREATE TABLE IF NOT EXISTS bodies(account_id TEXT NOT NULL, email_id TEXT NOT NULL, html TEXT, text TEXT, attachments_json TEXT NOT NULL, in_reply_to_json TEXT NOT NULL, references_json TEXT NOT NULL, message_id_json TEXT NOT NULL, reply_to_json TEXT NOT NULL, unsubscribe_json TEXT NOT NULL, PRIMARY KEY(account_id, email_id));
 CREATE VIRTUAL TABLE IF NOT EXISTS emails_fts USING fts5(account_id UNINDEXED, email_id UNINDEXED, subject, from_text, preview, body_text);
 CREATE TABLE IF NOT EXISTS classified(account_id TEXT NOT NULL, email_id TEXT NOT NULL, tray TEXT NOT NULL, probs_json TEXT NOT NULL, urgency INTEGER NOT NULL, personal REAL NOT NULL, unsure INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, classified_at TEXT NOT NULL, corrected_tray TEXT, applied INTEGER NOT NULL DEFAULT 0, apply_error TEXT, owned_trays TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, action REAL NOT NULL DEFAULT 0, PRIMARY KEY(account_id, email_id));
 CREATE TABLE IF NOT EXISTS classify_queue(account_id TEXT NOT NULL, email_id TEXT NOT NULL, added_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, PRIMARY KEY(account_id, email_id));
@@ -226,6 +227,10 @@ pub struct EmailBody {
     /// `Reply-To` addresses; empty when the message has none.
     #[serde(default)]
     pub reply_to: Vec<Address>,
+    /// How to unsubscribe, read from `List-Unsubscribe`; `None` when the
+    /// message offers no usable link.
+    #[serde(default)]
+    pub unsubscribe: Option<Unsubscribe>,
 }
 
 /// What the classifier recorded about one email.
@@ -2146,7 +2151,8 @@ impl Store {
         tx.execute(
             "INSERT OR REPLACE INTO bodies(account_id, email_id, html, text, \
              attachments_json, in_reply_to_json, references_json, \
-             message_id_json, reply_to_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             message_id_json, reply_to_json, unsubscribe_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 account,
                 b.email_id,
@@ -2157,6 +2163,7 @@ impl Store {
                 to_json(&b.references)?,
                 to_json(&b.message_id)?,
                 to_json(&b.reply_to)?,
+                to_json(&b.unsubscribe)?,
             ],
         )?;
         tx.execute(
@@ -2182,7 +2189,8 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT email_id, html, text, attachments_json, \
-                 in_reply_to_json, references_json, message_id_json, reply_to_json \
+                 in_reply_to_json, references_json, message_id_json, reply_to_json, \
+                 unsubscribe_json \
                  FROM bodies WHERE account_id = ?1 AND email_id = ?2",
                 [account, email_id],
                 |r| {
@@ -2195,6 +2203,7 @@ impl Store {
                         references: json_col(r, 5)?,
                         message_id: json_col(r, 6)?,
                         reply_to: json_col(r, 7)?,
+                        unsubscribe: json_col(r, 8)?,
                     })
                 },
             )
@@ -2382,6 +2391,7 @@ mod tests {
             references: vec![],
             message_id: vec![],
             reply_to: vec![],
+            unsubscribe: None,
         }
     }
 
@@ -2710,7 +2720,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("7"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("8"));
         assert_eq!(store.account_state("a", "email_state").unwrap(), None);
         assert_eq!(store.state("email_state").unwrap(), None);
         assert_eq!(store.state("identities").unwrap(), None);
@@ -3252,7 +3262,7 @@ mod tests {
             store.account_state("b", "email_state").unwrap().as_deref(),
             Some("s1")
         );
-        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("7"));
+        assert_eq!(store.state("schema_version").unwrap().as_deref(), Some("8"));
         assert_eq!(store.search(None, "subject", 0).unwrap().len(), 1);
     }
 

@@ -167,6 +167,12 @@ original's Reply-To when it has one, and otherwise to its From. With
 Reply-To, Reply all also leaves the original sender out of Cc. This is how
 replies to Proton Pass alias mail work: Pass sets Reply-To to a reverse
 alias, and replying to that address sends the reply out as the alias.
+Mail from a mailing list gets an Unsubscribe button in the reader. When
+the sender supports the RFC 8058 one-click unsubscribe, Posto sends that
+request itself: a bare POST with no cookies, over https to a public host
+name, with redirects not followed. Otherwise it opens a composer on the
+list's mailto address, from the address the mail was sent to, or else
+opens the list's https page in the browser.
 Fastmail masked email
 addresses work as senders too: when the API token has the Masked Email
 scope, each sync caches the account's enabled and disabled masked
@@ -391,6 +397,7 @@ posto email unlabel Deals <id>...
 posto email destroy <id>... --yes   # permanent; `email delete` only moves to Trash
 posto mailbox empty Trash --yes     # permanent, every account that has the mailbox
 posto email reply <id> --body-file reply.md --markdown
+posto email unsubscribe <id>        # one-click POST, else mails the list, else prints the page
 ```
 
 ## UI test mode

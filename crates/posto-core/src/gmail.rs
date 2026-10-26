@@ -33,6 +33,7 @@ use crate::compose::Draft;
 use crate::error::{Error, Result};
 use crate::provider::{Change, Delta, DeltaPage, Identity, Updated};
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
+use crate::unsubscribe;
 
 /// The OAuth scope Posto asks for: full access, because permanent delete needs
 /// it.
@@ -1489,6 +1490,9 @@ pub(crate) fn body_from(email_id: &str, message: &mail_parser::Message<'_>) -> E
             .into_iter()
             .collect(),
         reply_to: addresses(message.reply_to()),
+        unsubscribe: message
+            .header_raw("List-Unsubscribe")
+            .and_then(|h| unsubscribe::parse(h, message.header_raw("List-Unsubscribe-Post"))),
     }
 }
 

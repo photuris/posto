@@ -891,6 +891,10 @@ async fn body_download_and_unsubscribe_with_real_keys() {
     assert_eq!(body.references, ["r1@x", "p@x"]);
     assert_eq!(body.attachments.len(), 1);
     assert_eq!(body.attachments[0].blob_id, "att1");
+    assert_eq!(
+        body.unsubscribe.and_then(|u| u.mailto).as_deref(),
+        Some("mailto:u@x")
+    );
     assert!(session.has_unsubscribe("m1").await);
     assert!(!session.has_unsubscribe("m404").await);
 

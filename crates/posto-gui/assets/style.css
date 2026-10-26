@@ -213,6 +213,7 @@ button.tool:hover { background: var(--hover); }
 button.link { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; padding: 2px 0; color: var(--posto-muted); }
 .reader-side button.link + button.link { margin-left: 14px; }
 button.link.active, button.link.active .icon { color: var(--posto-accent); font-weight: 600; }
+button.link.primary, button.link.primary .icon { color: var(--posto-accent); }
 .remote-bar {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 20px; background: var(--posto-lighter-background);

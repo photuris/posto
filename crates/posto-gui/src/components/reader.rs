@@ -8,7 +8,7 @@ use posto_core::store::{Address, EmailSummary};
 
 use crate::app::{
     ALLOW_REMOTE, BODY, BODY_ERROR, EMAILS, MAILBOXES, READER_MODE, SELECTION, backend, dispatch,
-    mark_selected, save_attachment, selected_ref, trust_domain,
+    mark_selected, run, save_attachment, selected_ref, trust_domain, unsubscribe_focused,
 };
 use crate::components::{Icon, frame_doc, reader_frame_doc};
 use crate::format;
@@ -118,6 +118,7 @@ pub fn Reader() -> Element {
         };
     };
     let body = BODY().map(|(_, body)| body);
+    let can_unsubscribe = body.as_ref().is_some_and(|b| b.unsubscribe.is_some());
     let reader_mode = READER_MODE();
     let allow_remote = ALLOW_REMOTE();
     let sender = email.from.first().cloned();
@@ -183,6 +184,16 @@ pub fn Reader() -> Element {
                     }
                     div { class: "reader-side",
                         div { class: "long-date", {format::long_date(&email.received_at)} }
+                        if can_unsubscribe {
+                            button {
+                                class: "link primary",
+                                onmousedown: |evt| evt.prevent_default(),
+                                onclick: |_| run(unsubscribe_focused()),
+                                title: "Unsubscribe from this mailing list",
+                                Icon { name: "bell-off" }
+                                " Unsubscribe"
+                            }
+                        }
                         button {
                             class: if reader_mode { "link active" } else { "link" },
                             onmousedown: |evt| evt.prevent_default(),

@@ -18,6 +18,7 @@ use crate::compose::Draft;
 use crate::error::{Error, Result};
 use crate::provider::{Change, Delta, DeltaPage, Identity, Updated};
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
+use crate::unsubscribe;
 
 /// Messages per page of the initial sync (the API maximum).
 const PAGE_SIZE: usize = 150;
@@ -358,6 +359,13 @@ pub(crate) fn body_from(
         references: header_ids(&message.header, "References"),
         message_id: header_ids(&message.header, "Message-ID"),
         reply_to: message.meta.reply_tos.iter().map(address_from).collect(),
+        unsubscribe: header_values(&message.header, "List-Unsubscribe")
+            .first()
+            .and_then(|h| {
+                let post = header_values(&message.header, "List-Unsubscribe-Post");
+
+                unsubscribe::parse(h, post.first().map(String::as_str))
+            }),
     }
 }
 

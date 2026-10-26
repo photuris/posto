@@ -113,7 +113,7 @@ Read `README.md` first. This file holds what the code does not say.
 ## Rules that bit us
 
 - The database is a cache with a schema version (`schema_version` in
-  `sync_state`, now 7). `Store::open` drops and recreates every cache table,
+  `sync_state`, now 8). `Store::open` drops and recreates every cache table,
   cursor and identity when the version is missing or older, and refuses a newer
   one. A table or column change means bumping `SCHEMA_VERSION`; never write a
   data migration for the cache. The one exception is `sender_trays` (sender
@@ -218,6 +218,14 @@ Read `README.md` first. This file holds what the code does not say.
 - A GUI test that applies an action needs `ui_test = true`: otherwise
   `get_client` reads the real `secrets.toml` and connects the real account
   behind the slug (`default` has one on this machine).
+- Unsubscribe is read once, at body fetch: each provider hands the raw
+  `List-Unsubscribe`/`-Post` values to `unsubscribe::parse` (http links
+  dropped), stored as `EmailBody.unsubscribe`. `unsubscribe::one_click` is
+  the only request Posto sends to a URL taken from a message: https, no
+  IP literal or `localhost`, no redirects followed, form body only, and its
+  errors carry the status number only (the URL holds the subscriber token).
+  Tests aim `post` at wiremock; a test never unsubscribes a fixture
+  (`sundaylongread.example` is one-click) outside UI test mode.
 - Dioxus `value` is volatile: every re-render of the component re-sends it,
   and a value the input has not reported yet (a keystroke in flight) resets
   it and moves the caret to the end. The composer's fields are uncontrolled

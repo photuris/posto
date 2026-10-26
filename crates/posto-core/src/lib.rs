@@ -16,5 +16,6 @@ pub mod shortcuts;
 pub mod store;
 pub mod sync;
 pub mod theme;
+pub mod unsubscribe;
 
 pub use error::{Error, Result};

@@ -114,6 +114,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value> {
             EmailCmd::Unlabel { mailbox, ids } => {
                 c::email_label(account, &mailbox, ids, false).await
             }
+            EmailCmd::Unsubscribe { id } => c::email_unsubscribe(account, &id).await,
             EmailCmd::Reply {
                 id,
                 body_file,

@@ -24,6 +24,7 @@ percent-encoding = "2"
 proton-mail-api = { git = "https://github.com/photuris/proton-mail-api", tag = "v0.4.1" }
 pulldown-cmark = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+webbrowser = "1.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

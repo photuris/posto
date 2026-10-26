@@ -432,6 +432,7 @@ mod tests {
             references: vec![],
             message_id: vec![],
             reply_to: vec![],
+            unsubscribe: None,
         }
     }
 

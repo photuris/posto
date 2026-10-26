@@ -16,6 +16,7 @@ use posto_core::store::{
     mailbox_path,
 };
 use posto_core::theme::{self, Theme, Watcher};
+use posto_core::unsubscribe::{self, Method};
 use posto_core::{Error, Result, actions, body, compose, sync};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -2050,22 +2051,7 @@ async fn start_reply(all: bool) {
             Err(e) => return fail("Could not load the message to reply to", e),
         },
     };
-    let me = b
-        .cfg
-        .account(&r.account_id)
-        .map(|a| a.email.clone())
-        .unwrap_or_default();
-    let identities = IDENTITIES
-        .peek()
-        .get(&r.account_id)
-        .cloned()
-        .unwrap_or_default();
-
-    let masked = MASKED
-        .peek()
-        .get(&r.account_id)
-        .cloned()
-        .unwrap_or_default();
+    let (me, identities, masked) = own_addresses(&r.account_id);
 
     open_composer(compose::reply(
         &summary,
@@ -2075,6 +2061,74 @@ async fn start_reply(all: bool) {
         &identities,
         &masked,
     ));
+}
+
+/// `account`'s configured address, sending identities and masked emails.
+fn own_addresses(account: &str) -> (String, Vec<Identity>, Vec<MaskedEmail>) {
+    let me = backend()
+        .peek()
+        .cfg
+        .account(account)
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    let identities = IDENTITIES.peek().get(account).cloned().unwrap_or_default();
+    let masked = MASKED.peek().get(account).cloned().unwrap_or_default();
+
+    (me, identities, masked)
+}
+
+/// Unsubscribes from the focused email's list (see [`unsubscribe::method`]):
+/// the one-click POST, else a composer on the mailto link, else the page in
+/// the browser. UI test mode sends and opens nothing.
+pub async fn unsubscribe_focused() {
+    let Some(r) = focus_ref() else {
+        return;
+    };
+    let b = backend().peek().clone();
+    let Ok(Some(summary)) = b.store.email(&r.account_id, &r.id) else {
+        return;
+    };
+    let Some(offer) = BODY
+        .peek()
+        .as_ref()
+        .filter(|(key, _)| *key == r)
+        .and_then(|(_, body)| body.unsubscribe.clone())
+    else {
+        return;
+    };
+    let (me, identities, masked) = own_addresses(&r.account_id);
+    let sender = summary
+        .from
+        .first()
+        .map_or_else(String::new, |a| format::who(a).to_string());
+
+    match unsubscribe::method(&offer, &summary, &me, &identities, &masked) {
+        Some(Method::OneClick(url)) => {
+            set_status(format!("Unsubscribing from {sender}…"));
+
+            let done = if b.ui_test {
+                Ok(())
+            } else {
+                unsubscribe::one_click(&url).await
+            };
+
+            match done {
+                Ok(()) => set_status(format!("Unsubscribed from {sender}")),
+                Err(e) => fail("Could not unsubscribe", e),
+            }
+        }
+        Some(Method::Mail(draft)) => open_composer(*draft),
+        Some(Method::Web(url)) => {
+            let opened = b.ui_test || webbrowser::open(&url).is_ok();
+
+            set_status(if opened {
+                "Opened the unsubscribe page in the browser"
+            } else {
+                "Could not open the browser"
+            });
+        }
+        None => {}
+    }
 }
 
 /// The account a new message is written from: the selected mailbox's, else the
@@ -2705,6 +2759,7 @@ mod tests {
                 references: vec![],
                 message_id: vec![],
                 reply_to: vec![],
+                unsubscribe: None,
             },
         ));
 
@@ -2945,6 +3000,73 @@ mod tests {
         }
 
         assert!(archived(), "the menu's Archive did not run");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_posts_once_or_writes_to_the_list() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Mailbox {
+            account_id: "default".into(),
+            id: "mb-newsletters".into(),
+        });
+        reload_list().await;
+
+        let r = EMAILS
+            .peek()
+            .iter()
+            .find(|e| e.from[0].email == "editor@sundaylongread.example")
+            .expect("a Sunday Long Read issue is listed")
+            .msg_ref();
+
+        click_email(&r.to_string(), Click::Plain);
+        load_body(r.clone()).await;
+
+        // The fixture offers one-click; UI test mode skips the POST itself.
+        dom.in_scope(ScopeId::ROOT, || run(unsubscribe_focused()));
+        for _ in 0..50 {
+            if STATUS.peek().starts_with("Unsubscribed") {
+                break;
+            }
+
+            let _ = tokio::time::timeout(Duration::from_millis(20), dom.wait_for_work()).await;
+            dom.render_immediate_to_vec();
+        }
+
+        assert_eq!(*STATUS.peek(), "Unsubscribed from The Sunday Long Read");
+
+        // Without one-click, a mailto link becomes a draft from that account.
+        if let Some((_, body)) = BODY.write().as_mut() {
+            body.unsubscribe = Some(unsubscribe::Unsubscribe {
+                https: None,
+                mailto: Some("mailto:leave@sundaylongread.example".into()),
+                one_click: false,
+            });
+        }
+
+        dom.in_scope(ScopeId::ROOT, || run(unsubscribe_focused()));
+        for _ in 0..50 {
+            if COMPOSER.peek().is_some() {
+                break;
+            }
+
+            let _ = tokio::time::timeout(Duration::from_millis(20), dom.wait_for_work()).await;
+            dom.render_immediate_to_vec();
+        }
+
+        let draft = COMPOSER.peek().clone().expect("no composer opened");
+
+        assert_eq!(draft.account_id, "default");
+        assert_eq!(draft.to[0].email, "leave@sundaylongread.example");
+        assert_eq!(draft.subject, "unsubscribe");
     }
 
     #[tokio::test(flavor = "current_thread")]

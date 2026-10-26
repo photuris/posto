@@ -10,6 +10,13 @@ use crate::error::{Error, Result};
 use crate::provider::{Change, Delta, DeltaPage, Identity, MaskedEmail, Updated};
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 use crate::sync::get_state;
+use crate::unsubscribe;
+
+/// The `List-Unsubscribe` header, as `Email/get` names it.
+const UNSUBSCRIBE: &str = "header:List-Unsubscribe:asText";
+
+/// The `List-Unsubscribe-Post` header (RFC 8058), as `Email/get` names it.
+const UNSUBSCRIBE_POST: &str = "header:List-Unsubscribe-Post:asText";
 
 /// Capabilities sent in every request's `using`.
 const USING: [&str; 3] = [
@@ -845,6 +852,7 @@ impl Client {
                     "properties": [
                         "textBody", "htmlBody", "bodyValues", "attachments",
                         "inReplyTo", "references", "messageId", "replyTo",
+                        UNSUBSCRIBE, UNSUBSCRIBE_POST,
                     ],
                     "fetchHTMLBodyValues": true,
                     "fetchTextBodyValues": true,
@@ -868,6 +876,9 @@ impl Client {
             references: strings(&email["references"]),
             message_id: strings(&email["messageId"]),
             reply_to: addresses(&email["replyTo"]),
+            unsubscribe: email[UNSUBSCRIBE]
+                .as_str()
+                .and_then(|h| unsubscribe::parse(h, email[UNSUBSCRIBE_POST].as_str())),
         }))
     }
 
@@ -928,19 +939,21 @@ impl Client {
     /// Whether the email has a non-empty `List-Unsubscribe` header; a failed
     /// fetch counts as no.
     pub(crate) async fn has_unsubscribe(&self, id: &str) -> bool {
-        const HEADER: &str = "header:List-Unsubscribe:asText";
-
         self.call_one(
             "Email/get",
             json!({
                 "accountId": self.session().account_id,
                 "ids": [id],
-                "properties": [HEADER],
+                "properties": [UNSUBSCRIBE],
             }),
         )
         .await
         .ok()
-        .and_then(|r| r["list"][0][HEADER].as_str().map(|h| !h.trim().is_empty()))
+        .and_then(|r| {
+            r["list"][0][UNSUBSCRIBE]
+                .as_str()
+                .map(|h| !h.trim().is_empty())
+        })
         .unwrap_or(false)
     }
 

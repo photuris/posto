@@ -369,6 +369,14 @@ pub fn seed(store: &Store) -> Result<()> {
                 } else {
                     vec![]
                 },
+                // The Sunday Long Read offers the one-click unsubscribe.
+                unsubscribe: (fx.from.1 == "editor@sundaylongread.example").then(|| {
+                    crate::unsubscribe::Unsubscribe {
+                        https: Some("https://sundaylongread.example/u/fx".into()),
+                        mailto: None,
+                        one_click: true,
+                    }
+                }),
             },
         )?;
     }

@@ -6,6 +6,9 @@ In-Reply-To: <p@x>
 References: <r1@x>
  <p@x>
 Reply-To: List <list@example.org>
+List-Unsubscribe: <mailto:u@example.org>,
+ <https://example.org/u?t=1>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
 MIME-Version: 1.0
 Content-Type: multipart/mixed; boundary="outer"
 

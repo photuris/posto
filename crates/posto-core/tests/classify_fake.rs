@@ -1991,6 +1991,7 @@ async fn review_html_heading_keeps_jevmail_dividers() -> Result<()> {
         references: vec![],
         message_id: vec![],
         reply_to: vec![],
+        unsubscribe: None,
     };
     let state = classify::state::state_for(&e, &b, false, false, 2000);
     let body = state.split_once("Body:\n").unwrap().1;
