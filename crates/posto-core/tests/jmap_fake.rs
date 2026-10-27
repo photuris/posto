@@ -1242,7 +1242,7 @@ async fn body_reads_reply_to() -> Result<()> {
                 { "name": "R", "email": "ra@passmail.com" },
                 { "name": null, "email": "r2@x.io" },
             ],
-            "header:List-Unsubscribe:asText": " <https://x.io/u>",
+            "header:List-Unsubscribe": " <https://x.io/u>",
             "header:List-Unsubscribe-Post:asText": " List-Unsubscribe=One-Click",
             }),
         ),
@@ -1305,6 +1305,102 @@ async fn body_reads_reply_to() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Answers like Fastmail: the Text form of an RFC 2369 header is
+/// `invalidArguments`.
+async fn reject_text_list_unsubscribe(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(|r: &Request| {
+            let Ok(b) = serde_json::from_slice::<Value>(&r.body) else {
+                return false;
+            };
+
+            b["methodCalls"][0][0] == "Email/get"
+                && b["methodCalls"][0][1]["properties"]
+                    .as_array()
+                    .is_some_and(|p| p.contains(&json!("header:List-Unsubscribe:asText")))
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "methodResponses": [["error", { "type": "invalidArguments" }, "0"]],
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn body_reads_raw_list_unsubscribe() {
+    let server = server().await;
+    let c = client(&server).await;
+
+    reject_text_list_unsubscribe(&server).await;
+    reply(
+        &server,
+        "Email/get",
+        json!({ "ids": ["e1"] }),
+        json!({ "state": "s", "list": [{
+            "id": "e1", "textBody": [], "htmlBody": [], "bodyValues": {},
+            "header:List-Unsubscribe": "\r\n <https://x.io/u?t=1>,\r\n <mailto:u@x.io?subject=unsub>",
+            "header:List-Unsubscribe-Post:asText": " List-Unsubscribe=One-Click",
+        }] }),
+        1,
+    )
+    .await;
+
+    let got = c.body("e1").await;
+
+    assert!(matches!(got, Ok(Some(_))), "body failed: {got:?}");
+
+    let unsubscribe = got.unwrap().unwrap().unsubscribe.unwrap();
+
+    assert_eq!(unsubscribe.https.as_deref(), Some("https://x.io/u?t=1"));
+    assert_eq!(
+        unsubscribe.mailto.as_deref(),
+        Some("mailto:u@x.io?subject=unsub")
+    );
+    assert!(unsubscribe.one_click);
+
+    let requests = server.received_requests().await.unwrap();
+    let properties = requests
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .find(|b| b["methodCalls"][0][0] == "Email/get")
+        .map(|b| b["methodCalls"][0][1]["properties"].clone())
+        .unwrap();
+    let properties = properties.as_array().unwrap();
+
+    assert!(properties.contains(&json!("header:List-Unsubscribe")));
+    assert!(!properties.contains(&json!("header:List-Unsubscribe:asText")));
+}
+
+#[tokio::test]
+async fn has_unsubscribe_reads_raw_list_unsubscribe() {
+    let server = server().await;
+    let c = client(&server).await;
+
+    reject_text_list_unsubscribe(&server).await;
+    for (id, header) in [
+        ("e1", json!("\r\n <mailto:u@x.io>")),
+        ("e2", Value::Null),
+        ("e3", json!("")),
+        ("e4", json!(" \r\n\t ")),
+    ] {
+        reply(
+            &server,
+            "Email/get",
+            json!({ "ids": [id] }),
+            json!({ "state": "s", "list": [{ "id": id, "header:List-Unsubscribe": header }] }),
+            1,
+        )
+        .await;
+    }
+
+    assert!(c.has_unsubscribe("e1").await);
+    for id in ["e2", "e3", "e4"] {
+        assert!(!c.has_unsubscribe(id).await, "{id}");
+    }
 }
 
 #[tokio::test]

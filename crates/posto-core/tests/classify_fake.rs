@@ -174,7 +174,7 @@ impl Respond for FakeJmap {
             }
             "Email/get" => {
                 let id = args["ids"][0].as_str().unwrap();
-                let wants_header = args["properties"][0] == "header:List-Unsubscribe:asText";
+                let wants_header = args["properties"][0] == "header:List-Unsubscribe";
 
                 if wants_header {
                     let header = self
@@ -185,7 +185,7 @@ impl Respond for FakeJmap {
                         .contains(id)
                         .then_some("<mailto:unsub@x.example>");
 
-                    json!({ "list": [{ "id": id, "header:List-Unsubscribe:asText": header }] })
+                    json!({ "list": [{ "id": id, "header:List-Unsubscribe": header }] })
                 } else {
                     json!({ "list": [{
                         "id": id,
@@ -2014,13 +2014,13 @@ async fn review_batch_rechecks_after_the_body_fetches() -> Result<()> {
         .and(|r: &Request| {
             let b: Value = serde_json::from_slice(&r.body).unwrap();
 
-            b["methodCalls"][0][1]["properties"][0] == "header:List-Unsubscribe:asText"
+            b["methodCalls"][0][1]["properties"][0] == "header:List-Unsubscribe"
         })
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"methodResponses": [[
                     "Email/get",
-                    {"list": [{"id": "e1", "header:List-Unsubscribe:asText": null}]},
+                    {"list": [{"id": "e1", "header:List-Unsubscribe": null}]},
                     "0"
                 ]]}))
                 .set_delay(std::time::Duration::from_millis(300)),
@@ -2035,7 +2035,7 @@ async fn review_batch_rechecks_after_the_body_fetches() -> Result<()> {
             while !calls(&env.jmap)
                 .await
                 .iter()
-                .any(|(_, a)| a["properties"][0] == "header:List-Unsubscribe:asText")
+                .any(|(_, a)| a["properties"][0] == "header:List-Unsubscribe")
             {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }

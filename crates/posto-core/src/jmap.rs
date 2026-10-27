@@ -12,8 +12,10 @@ use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store}
 use crate::sync::get_state;
 use crate::unsubscribe;
 
-/// The `List-Unsubscribe` header, as `Email/get` names it.
-const UNSUBSCRIBE: &str = "header:List-Unsubscribe:asText";
+/// The `List-Unsubscribe` header, as `Email/get` names it. The Raw form:
+/// RFC 8621 forbids `asText` for RFC 2369 headers and Fastmail rejects the
+/// whole `Email/get` with `invalidArguments`.
+const UNSUBSCRIBE: &str = "header:List-Unsubscribe";
 
 /// The `List-Unsubscribe-Post` header (RFC 8058), as `Email/get` names it.
 const UNSUBSCRIBE_POST: &str = "header:List-Unsubscribe-Post:asText";
