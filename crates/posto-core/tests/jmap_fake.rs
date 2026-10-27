@@ -1373,6 +1373,7 @@ async fn body_reads_raw_list_unsubscribe() {
 
     assert!(properties.contains(&json!("header:List-Unsubscribe")));
     assert!(!properties.contains(&json!("header:List-Unsubscribe:asText")));
+    assert!(properties.contains(&json!("header:List-Unsubscribe-Post:asText")));
 }
 
 #[tokio::test]
@@ -1400,6 +1401,21 @@ async fn has_unsubscribe_reads_raw_list_unsubscribe() {
     assert!(c.has_unsubscribe("e1").await);
     for id in ["e2", "e3", "e4"] {
         assert!(!c.has_unsubscribe(id).await, "{id}");
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    let gets: Vec<Value> = requests
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .filter(|b| b["methodCalls"][0][0] == "Email/get")
+        .collect();
+
+    assert_eq!(gets.len(), 4);
+    for g in gets {
+        assert_eq!(
+            g["methodCalls"][0][1]["properties"],
+            json!(["header:List-Unsubscribe"])
+        );
     }
 }
 
