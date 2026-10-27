@@ -226,6 +226,13 @@ Read `README.md` first. This file holds what the code does not say.
   errors carry the status number only (the URL holds the subscriber token).
   Tests aim `post` at wiremock; a test never unsubscribes a fixture
   (`sundaylongread.example` is one-click) outside UI test mode.
+- JMAP header properties: RFC 8621 §4.1.2.2 forbids the `asText` form for
+  RFC 5322 and RFC 2369 headers, and Fastmail answers `invalidArguments` to
+  the whole `Email/get`. `List-Unsubscribe` is requested raw
+  (`header:List-Unsubscribe`); `-Post` (RFC 8058) may stay `asText`. The
+  `asText` request broke every uncached Fastmail body and silently zeroed the
+  classifier's `has_unsubscribe`; jmap_fake's
+  `reject_text_list_unsubscribe` answers like Fastmail.
 - Dioxus `value` is volatile: every re-render of the component re-sends it,
   and a value the input has not reported yet (a keystroke in flight) resets
   it and moves the caret to the end. The composer's fields are uncontrolled
