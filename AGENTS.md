@@ -77,6 +77,38 @@ Read `README.md` first. This file holds what the code does not say.
   in `settle_selection`). The list title shows the total, not the loaded
   page. The CLI's `--triage` covers enabled accounts unless `--account`
   names one.
+- GUI actions are optimistic (run 2026-11-10-optimistic). Every
+  `apply_one_account` action except `Destroy` goes through
+  `actions::apply_local`, which validates exactly like `apply` (shared
+  helpers; `apply` stays server first for the CLI and the classifier).
+  It then marks the ids stale (`sync_state` `<account>/stale/<id>`, so no
+  schema change) **before** it mirrors rows and badge counts, and the
+  GUI queues the `Pending`. Every server write in the GUI is a job on
+  one FIFO queue (`JOBS`, `drain_jobs`, `in_turn`): pushes, the sync
+  pass (sync, the reconcile after it, the classifier), send, permanent
+  delete, Empty Trash and the classify picker. A push job runs
+  `actions::push`. When no later push of that account is queued, it
+  then runs `actions::reconcile`, which refetches the stale ids
+  (`Connection::fetch_emails`), writes the server's rows and counts
+  (JMAP: the mailbox cursor is emptied to force a full `Mailbox/get`;
+  Proton and Gmail recount locally; a local `$answered` is kept on
+  Proton and Gmail, which ignore it), and clears the marks. The
+  server's state undoes a refusal, not a local snapshot. `pending(id)`
+  is rechecked after every await; never clear a mark across an await
+  without that check. Rules:
+  - code inside a job never awaits `in_turn` (it would wait for a job
+    behind it);
+  - the worker never waits for `BUSY` (the report after a push is a
+    spawned task);
+  - a server-first job captures its targets when it is queued (Empty
+    Trash destroys the ids listed at confirmation, not the folder);
+  - every job carries `conn_rev` and calls `same_rev` after each
+    `get_client`;
+  - `connect_with` takes the revision captured with its config snapshot;
+  - `reload_list` keeps only the newest load (`LIST_GEN`).
+
+  Not covered: a push that has not run before quit is lost; the next
+  reconcile shows the server's state.
 - Masked emails (Fastmail) are senders, not identities: `MaskedEmail/get`
   goes out only when the session advertises
   `https://www.fastmail.com/dev/maskedemail`, and only that call adds it to
