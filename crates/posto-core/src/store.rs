@@ -905,6 +905,79 @@ impl Store {
         self.set_state(&format!("{account}/{key}"), value)
     }
 
+    /// Marks `ids` of `account` as possibly out of step with the server
+    /// (`sync_state` key `<account>/stale/<id>`, value "1"), in one transaction.
+    /// Marking an id twice leaves one mark; an empty `ids` writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure; nothing is written then.
+    pub fn mark_stale(&self, account: &str, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        for id in ids {
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state(key, value) VALUES (?1, '1')",
+                [format!("{account}/stale/{id}")],
+            )?;
+        }
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    /// The ids of `account` marked stale, sorted ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure.
+    pub fn stale_ids(&self, account: &str) -> Result<Vec<String>> {
+        let prefix = format!("{account}/stale/");
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT key FROM sync_state WHERE substr(key, 1, length(?1)) = ?1")?;
+        let mut ids = stmt
+            .query_map([&prefix], |row| row.get::<_, String>(0))?
+            .map(|key| key.map(|k| k[prefix.len()..].to_string()))
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+
+        ids.sort();
+
+        Ok(ids)
+    }
+
+    /// Clears the marks of `ids` of `account` in one transaction; absent marks
+    /// are a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on database failure; nothing is cleared then.
+    pub fn clear_stale(&self, account: &str, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        for id in ids {
+            tx.execute(
+                "DELETE FROM sync_state WHERE key = ?1",
+                [format!("{account}/stale/{id}")],
+            )?;
+        }
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
     /// Replaces the cached sending identities of `account`.
     ///
     /// # Errors

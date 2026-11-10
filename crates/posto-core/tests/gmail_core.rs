@@ -607,3 +607,64 @@ async fn gmail_fetch_emails_reads_present_and_gone() {
     );
     assert_eq!(server.received_requests().await.unwrap().len(), sent);
 }
+
+#[tokio::test]
+async fn optimistic_gmail_reconcile_recounts_locally() {
+    let server = MockServer::start().await;
+    let conn = connection(&server, "me@gmail.com").await;
+    let store = Store::open_memory().unwrap();
+    let wrong = |id: &str, role: &str| Mailbox {
+        account_id: "g".into(),
+        id: id.into(),
+        name: id.into(),
+        role: Some(role.into()),
+        parent_id: None,
+        sort_order: 1,
+        total: 9,
+        unread: 9,
+    };
+
+    store.set_account_state("g", "provider", "gmail").unwrap();
+    store
+        .upsert_mailboxes(&[wrong("INBOX", "inbox"), wrong("ARCHIVE", "archive")])
+        .unwrap();
+    store
+        .upsert_emails(&[
+            EmailSummary {
+                keywords: vec!["$seen".into()],
+                ..row("g", "m1")
+            },
+            row("g", "m2"),
+        ])
+        .unwrap();
+    store
+        .mark_stale("g", &["m1".to_owned(), "m2".to_owned()])
+        .unwrap();
+    mount(
+        &server,
+        "GET",
+        "/messages/m1",
+        200,
+        metadata("m1", &json!(["INBOX", "UNREAD"])),
+    )
+    .await;
+    mount(&server, "GET", "/messages/m2", 404, json!({})).await;
+
+    let n = actions::reconcile(&store, &conn, "g", |_| false)
+        .await
+        .unwrap();
+    let counts = |id: &str| {
+        let m = mailbox(&store, "g", id);
+
+        (m.total, m.unread)
+    };
+
+    assert_eq!(n, 2);
+    assert!(store.email("g", "m1").unwrap().unwrap().keywords.is_empty());
+    assert_eq!(mailbox_ids(&store, "g", "m1"), ["INBOX"]);
+    assert!(store.email("g", "m2").unwrap().is_none());
+    assert_eq!(counts("INBOX"), (1, 1));
+    assert_eq!(counts("ARCHIVE"), (0, 0));
+    assert!(requests(&server, "/labels").await.is_empty());
+    assert!(store.stale_ids("g").unwrap().is_empty());
+}

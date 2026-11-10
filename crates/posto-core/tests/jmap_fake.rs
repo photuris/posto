@@ -5,11 +5,12 @@ use posto_core::body::{fetch_body, save_attachment};
 use posto_core::compose::{Draft, send};
 use posto_core::config::{Account, Config};
 use posto_core::jmap::Client;
-use posto_core::provider::{Connection, Fetched};
+use posto_core::provider::{Change, Connection, Fetched};
 use posto_core::store::{EmailBody, EmailSummary, Mailbox, Store};
 use posto_core::sync::{sync_account, sync_all_with_lock};
 use posto_core::{Error, Result};
 use serde_json::{Value, json};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -1942,6 +1943,611 @@ async fn fetch_emails_without_ids_sends_nothing() -> Result<()> {
         .await;
 
     assert_eq!(c.fetch_emails("a", &[]).await?, Fetched::default());
+
+    Ok(())
+}
+
+// ---- optimistic actions ----
+
+/// The boxes of the optimistic tests: Inbox (5 total, 3 unread) and Archive.
+fn optimistic_boxes(store: &Store) -> Result<()> {
+    store.upsert_mailboxes(&[
+        Mailbox {
+            total: 5,
+            unread: 3,
+            ..mailbox("mb-inbox", "inbox")
+        },
+        Mailbox {
+            total: 2,
+            unread: 0,
+            ..mailbox("mb-archive", "archive")
+        },
+    ])?;
+
+    Ok(())
+}
+
+/// `(total, unread)` of mailbox `id` of account `a`.
+fn count(store: &Store, id: &str) -> (i64, i64) {
+    let m = store
+        .mailboxes("a")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == id)
+        .unwrap_or_else(|| panic!("mailbox {id}"));
+
+    (m.total, m.unread)
+}
+
+fn mailbox_ids_of(store: &Store, id: &str) -> Vec<String> {
+    store.email("a", id).unwrap().unwrap().mailbox_ids
+}
+
+fn keywords_of(store: &Store, id: &str) -> Vec<String> {
+    store.email("a", id).unwrap().unwrap().keywords
+}
+
+/// `email_json(id)` with `key` set to `value`.
+fn email_with(id: &str, key: &str, value: Value) -> Value {
+    let mut e = email_json(id);
+
+    e[key] = value;
+
+    e
+}
+
+/// Mounts an `Email/get` for exactly `wanted` answering `list` and `not_found`.
+async fn mount_email_get(
+    server: &MockServer,
+    wanted: &[&str],
+    list: Vec<Value>,
+    not_found: &[&str],
+    times: u64,
+) {
+    reply(
+        server,
+        "Email/get",
+        json!({ "ids": wanted }),
+        json!({ "state": "s1", "list": list, "notFound": not_found }),
+        times,
+    )
+    .await;
+}
+
+/// Mounts the full `Mailbox/get` the server answers after a reconcile.
+async fn mount_mailbox_get(server: &MockServer, times: u64) {
+    let box_json = |id: &str, name: &str, role: &str, total: u32, unread: i64| {
+        json!({
+            "id": id, "name": name, "role": role, "parentId": null, "sortOrder": 1,
+            "totalEmails": total, "unreadEmails": unread,
+        })
+    };
+
+    reply(
+        server,
+        "Mailbox/get",
+        json!({ "ids": null }),
+        json!({ "state": "m9", "list": [
+            box_json("mb-inbox", "Inbox", "inbox", 40, 20),
+            box_json("mb-archive", "Archive", "archive", 30, 10),
+        ] }),
+        times,
+    )
+    .await;
+}
+
+/// Mounts an `Email/set` whose body contains `needle`, answering `response`.
+async fn mount_email_set(server: &MockServer, needle: &'static str, response: Value) {
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(Call {
+            name: "Email/set",
+            args: json!({}),
+        })
+        .and(body_string_contains(needle))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "methodResponses": [["Email/set", response, "0"]],
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Mounts a `POST /api` answering `status` to every call.
+async fn mount_status(server: &MockServer, status: u16, times: Option<u64>) {
+    let mock = Mock::given(method("POST"))
+        .and(path("/api"))
+        .respond_with(ResponseTemplate::new(status));
+
+    match times {
+        Some(n) => mock.expect(n).mount(server).await,
+        None => mock.mount(server).await,
+    }
+}
+
+#[tokio::test]
+async fn optimistic_mirrors_and_marks_before_any_request() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    mount_status(&server, 200, Some(0)).await;
+    optimistic_boxes(&store)?;
+    store.upsert_emails(&[email("e1", "mb-inbox")])?;
+    store.set_account_state("a", "account_id", c.server_account_id())?;
+
+    let p = actions::apply_local(&store, "a", &ids(&["e1"]), Action::Archive)?;
+
+    assert_eq!(mailbox_ids_of(&store, "e1"), ["mb-archive"]);
+    assert_eq!(count(&store, "mb-inbox"), (4, 2));
+    assert_eq!(count(&store, "mb-archive"), (3, 1));
+    assert_eq!(p.ids, ["e1"]);
+    assert_eq!(p.change, Change::Mailbox("mb-archive".into()));
+    assert_eq!(p.mirrored, 1);
+    assert_eq!(p.server_account.as_deref(), Some(c.server_account_id()));
+    assert_eq!(store.stale_ids("a")?, ["e1"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_push_sends_the_change() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    optimistic_boxes(&store)?;
+    store.upsert_emails(&[email("e1", "mb-inbox")])?;
+    store.set_account_state("a", "account_id", c.server_account_id())?;
+
+    let p = actions::apply_local(&store, "a", &ids(&["e1"]), Action::Archive)?;
+
+    mount_email_set(
+        &server,
+        r#""e1":{"mailboxIds":{"mb-archive":true}}"#,
+        json!({ "updated": { "e1": null } }),
+    )
+    .await;
+
+    assert!(actions::push(&c, &p).await?.is_empty());
+
+    store.upsert_emails(&[email("e2", "mb-inbox")])?;
+
+    let p2 = actions::apply_local(&store, "a", &ids(&["e2"]), Action::MarkRead)?;
+
+    mount_email_set(
+        &server,
+        r#""e2":{"keywords/$seen":true}"#,
+        json!({ "updated": { "e2": null } }),
+    )
+    .await;
+
+    assert!(actions::push(&c, &p2).await?.is_empty());
+    assert_eq!(store.stale_ids("a")?, ["e1", "e2"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_push_refuses_a_changed_account() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    mount_status(&server, 200, Some(0)).await;
+    store.set_account_state("a", "account_id", "someone-else")?;
+    store.upsert_emails(&[email("e1", "mb-inbox")])?;
+
+    let p = actions::apply_local(&store, "a", &ids(&["e1"]), Action::MarkRead)?;
+    let r = actions::push(&c, &p).await;
+
+    assert!(matches!(r, Err(Error::Other(_))), "{r:?}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_reconcile_restores_server_truth() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    optimistic_boxes(&store)?;
+    store.upsert_emails(&[email("e1", "mb-inbox"), email("e2", "mb-inbox")])?;
+    store.set_account_state("a", "account_id", c.server_account_id())?;
+
+    let p = actions::apply_local(&store, "a", &ids(&["e1", "e2"]), Action::Archive)?;
+
+    assert_eq!(count(&store, "mb-inbox"), (3, 1));
+    assert_eq!(count(&store, "mb-archive"), (4, 2));
+
+    reply(
+        &server,
+        "Email/set",
+        json!({}),
+        json!({
+            "updated": { "e1": null },
+            "notUpdated": { "e2": { "type": "notFound" } },
+        }),
+        1,
+    )
+    .await;
+
+    assert_eq!(actions::push(&c, &p).await?, ["e2"]);
+
+    mount_email_get(
+        &server,
+        &["e1", "e2"],
+        vec![
+            email_with("e1", "mailboxIds", json!({ "mb-archive": true })),
+            email_json("e2"),
+        ],
+        &[],
+        1,
+    )
+    .await;
+    mount_mailbox_get(&server, 1).await;
+    store.set_account_state("a", "mailbox_state", "m1")?;
+    reply(&server, "Mailbox/changes", json!({}), json!({}), 0).await;
+
+    assert_eq!(actions::reconcile(&store, &c, "a", |_| false).await?, 2);
+    assert_eq!(mailbox_ids_of(&store, "e1"), ["mb-archive"]);
+    assert_eq!(mailbox_ids_of(&store, "e2"), ["mb-inbox"]);
+    assert!(keywords_of(&store, "e2").contains(&"$seen".to_string()));
+    assert_eq!(count(&store, "mb-inbox"), (40, 20));
+    assert_eq!(count(&store, "mb-archive"), (30, 10));
+    assert!(store.stale_ids("a")?.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_reconcile_skips_pending_and_drops_gone() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+
+    store.upsert_emails(&[
+        email("e1", "mb-inbox"),
+        email("e2", "mb-inbox"),
+        email("e3", "mb-inbox"),
+    ])?;
+    actions::apply_local(&store, "a", &ids(&["e1", "e2", "e3"]), Action::MarkRead)?;
+    mount_email_get(
+        &server,
+        &["e1", "e2"],
+        vec![email_with("e1", "keywords", json!({}))],
+        &["e2"],
+        1,
+    )
+    .await;
+    mount_mailbox_get(&server, 1).await;
+
+    assert_eq!(
+        actions::reconcile(&store, &c, "a", |id| id == "e3").await?,
+        2
+    );
+    assert!(keywords_of(&store, "e1").is_empty());
+    assert!(store.email("a", "e2")?.is_none());
+    assert_eq!(keywords_of(&store, "e3"), ["$seen"]);
+    assert_eq!(store.stale_ids("a")?, ["e3"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_reconcile_rechecks_pending_after_each_await() -> Result<()> {
+    // The server holds `e1` unread; the local row was marked read.
+    async fn setup(server: &MockServer) -> Result<(Connection, Store)> {
+        let c = client(server).await;
+        let store = Store::open_memory()?;
+
+        store.upsert_emails(&[email("e1", "mb-inbox")])?;
+        actions::apply_local(&store, "a", &ids(&["e1"]), Action::MarkRead)?;
+        mount_email_get(
+            server,
+            &["e1"],
+            vec![email_with("e1", "keywords", json!({}))],
+            &[],
+            1,
+        )
+        .await;
+
+        Ok((c, store))
+    }
+
+    // Case A: pending again after the fetch.
+    let server_a = server().await;
+    let (c, store) = setup(&server_a).await?;
+    let calls = Cell::new(0);
+
+    mount_mailbox_get(&server_a, 0).await;
+
+    let n = actions::reconcile(&store, &c, "a", |_: &str| {
+        calls.set(calls.get() + 1);
+        calls.get() > 1
+    })
+    .await?;
+
+    assert_eq!(n, 0);
+    assert_eq!(keywords_of(&store, "e1"), ["$seen"]);
+    assert_eq!(store.stale_ids("a")?, ["e1"]);
+
+    // Case B: pending again after the counts.
+    let server_b = server().await;
+    let (c, store) = setup(&server_b).await?;
+    let calls = Cell::new(0);
+
+    mount_mailbox_get(&server_b, 1).await;
+
+    let n = actions::reconcile(&store, &c, "a", |_: &str| {
+        calls.set(calls.get() + 1);
+        calls.get() > 2
+    })
+    .await?;
+
+    assert_eq!(n, 0);
+    assert!(keywords_of(&store, "e1").is_empty());
+    assert_eq!(store.stale_ids("a")?, ["e1"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_refuses_like_apply() -> Result<()> {
+    let store = Store::open_memory()?;
+
+    store.set_account_state("a", "provider", "proton")?;
+    store.upsert_mailboxes(&[
+        mailbox("inbox", "inbox"),
+        Mailbox {
+            role: None,
+            ..mailbox("promos", "promos")
+        },
+    ])?;
+    store.upsert_emails(&[email("e1", "inbox")])?;
+
+    let local = |ids: &[&str], action| actions::apply_local(&store, "a", &self::ids(ids), action);
+    let moved = local(
+        &["e1"],
+        Action::Move {
+            mailbox_id: "promos".into(),
+        },
+    );
+
+    assert!(matches!(moved, Err(Error::Unsupported(_))), "{moved:?}");
+
+    let destroyed = local(&["e1"], Action::Destroy);
+
+    assert!(
+        matches!(destroyed, Err(Error::Unsupported(_))),
+        "{destroyed:?}"
+    );
+
+    let junked = local(&["e1"], Action::Junk);
+
+    assert!(matches!(junked, Err(Error::NotFound(_))), "{junked:?}");
+
+    let archived = local(&[], Action::Archive);
+
+    assert!(matches!(archived, Err(Error::NotFound(_))), "{archived:?}");
+    assert_eq!(mailbox_ids_of(&store, "e1"), ["inbox"]);
+    assert!(keywords_of(&store, "e1").is_empty());
+    assert!(store.stale_ids("a")?.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_patch_skips_empties_and_dedupes() -> Result<()> {
+    let store = Store::open_memory()?;
+
+    store.upsert_emails(&[
+        email_in("e1", &["mb-inbox"]),
+        email_in("e2", &["mb-inbox", "mb-promos"]),
+    ])?;
+
+    let p = actions::apply_local(
+        &store,
+        "a",
+        &ids(&["e1", "e2", "e2", "ghost"]),
+        Action::PatchMailboxes {
+            add: vec![],
+            remove: ids(&["mb-inbox"]),
+        },
+    )?;
+
+    assert_eq!(p.ids, ["e2", "ghost"]);
+    assert_eq!(p.mirrored, 1);
+    assert_eq!(mailbox_ids_of(&store, "e1"), ["mb-inbox"]);
+    assert_eq!(mailbox_ids_of(&store, "e2"), ["mb-promos"]);
+    assert_eq!(store.stale_ids("a")?, ["e2", "ghost"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_provider_mirrors_follow_apply() -> Result<()> {
+    let label = |id: &str| Mailbox {
+        role: None,
+        ..mailbox(id, id)
+    };
+
+    // Proton: a move to a folder keeps the labels.
+    let store = Store::open_memory()?;
+
+    store.set_account_state("a", "provider", "proton")?;
+    store.upsert_mailboxes(&[
+        mailbox("inbox", "inbox"),
+        mailbox("archive", "archive"),
+        label("promos"),
+    ])?;
+    store.upsert_emails(&[email_in("e1", &["inbox", "promos"])])?;
+    actions::apply_local(&store, "a", &ids(&["e1"]), Action::Archive)?;
+
+    assert_eq!(mailbox_ids_of(&store, "e1"), ["archive", "promos"]);
+
+    // Gmail: SENT and DRAFT stay, Trash hides folders, no folder is Archive.
+    let store = Store::open_memory()?;
+
+    store.set_account_state("a", "provider", "gmail")?;
+    store.upsert_mailboxes(&[
+        mailbox("INBOX", "inbox"),
+        mailbox("ARCHIVE", "archive"),
+        mailbox("TRASH", "trash"),
+        label("Label_1"),
+    ])?;
+    store.upsert_emails(&[
+        email_in("g1", &["SENT", "Label_1"]),
+        email_in("g2", &["INBOX"]),
+    ])?;
+    actions::apply_local(&store, "a", &ids(&["g1"]), Action::Delete)?;
+
+    assert_eq!(mailbox_ids_of(&store, "g1"), ["TRASH", "Label_1"]);
+
+    let p = actions::apply_local(
+        &store,
+        "a",
+        &ids(&["g2"]),
+        Action::PatchMailboxes {
+            add: vec![],
+            remove: ids(&["INBOX"]),
+        },
+    )?;
+
+    assert_eq!(mailbox_ids_of(&store, "g2"), ["ARCHIVE"]);
+    assert_eq!(p.mirrored, 1);
+
+    let moved = actions::apply_local(
+        &store,
+        "a",
+        &ids(&["g2"]),
+        Action::Move {
+            mailbox_id: "SENT".into(),
+        },
+    );
+
+    assert!(matches!(moved, Err(Error::Unsupported(_))), "{moved:?}");
+    assert_eq!(mailbox_ids_of(&store, "g2"), ["ARCHIVE"]);
+
+    Ok(())
+}
+
+#[test]
+fn optimistic_stale_marks_are_per_account() -> Result<()> {
+    let store = Store::open_memory()?;
+
+    store.mark_stale("a", &ids(&["x", "y", "y"]))?;
+    store.mark_stale("b", &ids(&["x"]))?;
+    store.mark_stale("a", &[])?;
+
+    assert_eq!(store.stale_ids("a")?, ["x", "y"]);
+    assert_eq!(store.stale_ids("b")?, ["x"]);
+
+    store.clear_stale("a", &ids(&["x", "absent"]))?;
+
+    assert_eq!(store.stale_ids("a")?, ["y"]);
+    assert_eq!(store.stale_ids("b")?, ["x"]);
+
+    store.delete_account("a")?;
+
+    assert!(store.stale_ids("a")?.is_empty());
+    assert_eq!(store.stale_ids("b")?, ["x"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_reconcile_keeps_marks_on_failure() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+    let store = Store::open_memory()?;
+    let unread_both = || {
+        vec![
+            email_with("e1", "keywords", json!({})),
+            email_with("e2", "keywords", json!({})),
+        ]
+    };
+
+    optimistic_boxes(&store)?;
+    store.upsert_emails(&[email("e1", "mb-inbox"), email("e2", "mb-inbox")])?;
+    actions::apply_local(&store, "a", &ids(&["e1", "e2"]), Action::MarkRead)?;
+
+    // Round 1: the fetch fails.
+    mount_status(&server, 500, None).await;
+
+    assert!(
+        actions::reconcile(&store, &c, "a", |_| false)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.stale_ids("a")?, ["e1", "e2"]);
+    assert_eq!(keywords_of(&store, "e1"), ["$seen"]);
+    assert_eq!(keywords_of(&store, "e2"), ["$seen"]);
+
+    // Round 2: the rows land, the counts fail.
+    server.reset().await;
+    mount_email_get(&server, &["e1", "e2"], unread_both(), &[], 1).await;
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(Call {
+            name: "Mailbox/get",
+            args: json!({}),
+        })
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    assert!(
+        actions::reconcile(&store, &c, "a", |_| false)
+            .await
+            .is_err()
+    );
+    assert!(keywords_of(&store, "e1").is_empty());
+    assert!(keywords_of(&store, "e2").is_empty());
+    assert_eq!(store.stale_ids("a")?, ["e1", "e2"]);
+
+    // Round 3: everything works.
+    server.reset().await;
+    mount_email_get(&server, &["e1", "e2"], unread_both(), &[], 1).await;
+    mount_mailbox_get(&server, 1).await;
+
+    assert_eq!(actions::reconcile(&store, &c, "a", |_| false).await?, 2);
+    assert!(store.stale_ids("a")?.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn optimistic_reconcile_keeps_answered_where_the_provider_ignores_it() -> Result<()> {
+    // `e1` is read and answered locally, and read only on the server.
+    async fn keywords_after(provider: Option<&str>) -> Result<Vec<String>> {
+        let server = server().await;
+        let c = client(&server).await;
+        let store = Store::open_memory()?;
+
+        if let Some(p) = provider {
+            store.set_account_state("a", "provider", p)?;
+        }
+
+        store.upsert_emails(&[EmailSummary {
+            keywords: ids(&["$seen", "$answered"]),
+            ..email("e1", "mb-inbox")
+        }])?;
+        store.mark_stale("a", &ids(&["e1"]))?;
+        mount_email_get(&server, &["e1"], vec![email_json("e1")], &[], 1).await;
+        mount_mailbox_get(&server, 1).await;
+
+        assert_eq!(actions::reconcile(&store, &c, "a", |_| false).await?, 1);
+
+        Ok(keywords_of(&store, "e1"))
+    }
+
+    let gmail = keywords_after(Some("gmail")).await?;
+
+    assert!(gmail.contains(&"$seen".to_string()), "{gmail:?}");
+    assert!(gmail.contains(&"$answered".to_string()), "{gmail:?}");
+    assert_eq!(keywords_after(None).await?, ["$seen"]);
 
     Ok(())
 }
