@@ -85,6 +85,15 @@ pub struct DeltaPage {
     pub mailboxes_changed: bool,
 }
 
+/// What the server holds now for a set of email ids.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Fetched {
+    /// Summaries the server still has, in the order of the requested ids.
+    pub emails: Vec<EmailSummary>,
+    /// Requested ids the server no longer has, in request order.
+    pub gone: Vec<String>,
+}
+
 /// What one delta call found.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Delta {
@@ -247,6 +256,33 @@ impl Connection {
             Connection::Jmap(c) => c.delta(account, since).await,
             Connection::Proton(s) => s.delta(account, since).await,
             Connection::Gmail(s) => s.delta(account, since).await,
+        }
+    }
+
+    /// Fetches the current summaries of `ids` of `account` by id. Duplicate
+    /// ids are fetched once. No request is made for an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Any network or server error; an id the server no longer has is not
+    /// an error (it is in `gone`).
+    pub async fn fetch_emails(&self, account: &str, ids: &[String]) -> Result<Fetched> {
+        let mut unique: Vec<String> = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            if !unique.contains(id) {
+                unique.push(id.clone());
+            }
+        }
+
+        if unique.is_empty() {
+            return Ok(Fetched::default());
+        }
+
+        match self {
+            Connection::Jmap(c) => c.fetch_emails(account, unique).await,
+            Connection::Proton(s) => s.fetch_emails(account, unique).await,
+            Connection::Gmail(s) => s.fetch_emails(account, unique).await,
         }
     }
 

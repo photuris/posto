@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use crate::compose::Draft;
 use crate::error::{Error, Result};
-use crate::provider::{Change, Delta, DeltaPage, Identity, Updated};
+use crate::provider::{Change, Delta, DeltaPage, Fetched, Identity, Updated};
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 use crate::unsubscribe;
 
@@ -821,6 +821,25 @@ impl Session {
             more: false,
             mailboxes_changed: false,
         }))
+    }
+
+    /// The current summaries of the distinct `ids`; a missing message or a
+    /// chat is `gone`.
+    ///
+    /// # Errors
+    ///
+    /// Any request error other than a 404.
+    pub async fn fetch_emails(&self, account: &str, ids: Vec<String>) -> Result<Fetched> {
+        let mut fetched = Fetched::default();
+
+        for (id, summary) in self.summaries(account, &ids).await? {
+            match summary {
+                Some(summary) => fetched.emails.push(summary),
+                None => fetched.gone.push(id),
+            }
+        }
+
+        Ok(fetched)
     }
 
     /// `GET /profile`.

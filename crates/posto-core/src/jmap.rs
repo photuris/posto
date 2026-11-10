@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::compose::Draft;
 use crate::error::{Error, Result};
-use crate::provider::{Change, Delta, DeltaPage, Identity, MaskedEmail, Updated};
+use crate::provider::{Change, Delta, DeltaPage, Fetched, Identity, MaskedEmail, Updated};
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 use crate::sync::get_state;
 use crate::unsubscribe;
@@ -841,6 +841,22 @@ impl Client {
             more: r["hasMoreChanges"].as_bool() == Some(true),
             mailboxes_changed: false,
         }))
+    }
+
+    /// The current summaries of the distinct `ids`, in request order; ids the
+    /// server did not return are `gone`.
+    pub(crate) async fn fetch_emails(&self, account: &str, ids: Vec<String>) -> Result<Fetched> {
+        let mut found = fetch_summaries(self, account, &ids).await?;
+        let mut fetched = Fetched::default();
+
+        for id in ids {
+            match found.iter().position(|e| e.id == id) {
+                Some(i) => fetched.emails.push(found.swap_remove(i)),
+                None => fetched.gone.push(id),
+            }
+        }
+
+        Ok(fetched)
     }
 
     /// The body of `email_id`; `None` when the server does not know the email.

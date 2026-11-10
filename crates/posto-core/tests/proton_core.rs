@@ -5,7 +5,7 @@
 use posto_core::actions::{self, Action};
 use posto_core::config::{Account, Config, ProtonSecret};
 use posto_core::proton::Session;
-use posto_core::provider::{Connection, Credentials, Identity, connect_with_credentials};
+use posto_core::provider::{Connection, Credentials, Fetched, Identity, connect_with_credentials};
 use posto_core::store::{ListQuery, Store};
 use posto_core::sync::sync_account;
 use posto_core::{Error, Result};
@@ -483,4 +483,52 @@ async fn connect_dispatches_on_the_account_provider() {
 
         assert_eq!(error_of(missing), "not configured: proton.app_version");
     }
+}
+
+#[tokio::test]
+async fn proton_fetch_emails_reads_present_and_gone() {
+    let server = MockServer::start().await;
+    let conn = connection(&server);
+
+    mount_get(
+        &server,
+        "/mail/v4/messages/m1",
+        json!({"Code": 1000, "Message": message("m1", &["0", "5"], 1)}),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/mail/v4/messages/m2"))
+        .respond_with(ResponseTemplate::new(422))
+        .mount(&server)
+        .await;
+
+    let ids = vec!["m1".to_owned(), "m2".to_owned()];
+    let fetched = conn.fetch_emails("a", &ids).await.unwrap();
+
+    assert_eq!(fetched.emails.len(), 1);
+    assert_eq!(fetched.emails[0].id, "m1");
+    assert_eq!(fetched.emails[0].account_id, "a");
+    assert_eq!(fetched.gone, ["m2"]);
+
+    let sent = server.received_requests().await.unwrap().len();
+
+    assert_eq!(
+        conn.fetch_emails("a", &[]).await.unwrap(),
+        Fetched::default()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), sent);
+}
+
+#[tokio::test]
+async fn proton_fetch_emails_fails_on_a_server_error() {
+    let server = MockServer::start().await;
+    let conn = connection(&server);
+
+    Mock::given(method("GET"))
+        .and(path("/mail/v4/messages/m3"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    assert!(conn.fetch_emails("a", &["m3".to_owned()]).await.is_err());
 }

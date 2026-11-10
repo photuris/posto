@@ -5,7 +5,7 @@ use posto_core::body::{fetch_body, save_attachment};
 use posto_core::compose::{Draft, send};
 use posto_core::config::{Account, Config};
 use posto_core::jmap::Client;
-use posto_core::provider::Connection;
+use posto_core::provider::{Connection, Fetched};
 use posto_core::store::{EmailBody, EmailSummary, Mailbox, Store};
 use posto_core::sync::{sync_account, sync_all_with_lock};
 use posto_core::{Error, Result};
@@ -1895,6 +1895,53 @@ async fn in_trash_requires_trash_only() -> Result<()> {
     assert!(!in_trash(&store, "a", "e2")?);
     assert!(!in_trash(&store, "a", "e3")?);
     assert!(!in_trash(&store, "a", "missing")?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_emails_reads_present_and_gone() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .and(body_string_contains(r#""ids":["e3","e1","e2"]"#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "methodResponses": [["Email/get", {
+                "state": "s1",
+                "list": [email_json("e1"), email_json("e3")],
+                "notFound": ["e2"],
+            }, "0"]],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetched = c.fetch_emails("a", &ids(&["e3", "e1", "e2", "e1"])).await?;
+    let got: Vec<&str> = fetched.emails.iter().map(|e| e.id.as_str()).collect();
+
+    assert_eq!(got, ["e3", "e1"]);
+    assert!(fetched.emails.iter().all(|e| e.account_id == "a"));
+    assert!(fetched.emails.iter().all(|e| e.mailbox_ids == ["mb-inbox"]));
+    assert_eq!(fetched.gone, ["e2"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_emails_without_ids_sends_nothing() -> Result<()> {
+    let server = server().await;
+    let c = client(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    assert_eq!(c.fetch_emails("a", &[]).await?, Fetched::default());
 
     Ok(())
 }

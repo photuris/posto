@@ -16,7 +16,7 @@ use proton_mail_api::session::{self as pm, PasswordMode, PersistedSession};
 
 use crate::compose::Draft;
 use crate::error::{Error, Result};
-use crate::provider::{Change, Delta, DeltaPage, Identity, Updated};
+use crate::provider::{Change, Delta, DeltaPage, Fetched, Identity, Updated};
 use crate::store::{Address, Attachment, EmailBody, EmailSummary, Mailbox, Store};
 use crate::unsubscribe;
 
@@ -846,6 +846,28 @@ impl Session {
                 more: batch.more,
                 mailboxes_changed: batch.events.iter().any(|e| !e.labels.is_empty()),
             }))
+        })
+        .await
+    }
+
+    /// The current summaries of the distinct `ids`, one request each.
+    ///
+    /// # Errors
+    ///
+    /// The mapped crate errors; a missing message is in `gone`.
+    pub async fn fetch_emails(&self, account: &str, ids: Vec<String>) -> Result<Fetched> {
+        self.tracked(async {
+            let mut fetched = Fetched::default();
+
+            for id in ids {
+                match self.inner.message(&id).await {
+                    Ok(m) => fetched.emails.push(summary_from(account, &m.meta)),
+                    Err(e) if is_gone(&e) => fetched.gone.push(id),
+                    Err(e) => return Err(map_err(e)),
+                }
+            }
+
+            Ok(fetched)
         })
         .await
     }

@@ -10,7 +10,7 @@ use posto_core::actions::{self, Action};
 use posto_core::compose::Draft;
 use posto_core::config::{Account, Config};
 use posto_core::gmail::{Endpoints, GoogleClient, connect_with};
-use posto_core::provider::{Connection, Identity};
+use posto_core::provider::{Connection, Fetched, Identity};
 use posto_core::store::{EmailSummary, Mailbox, Store};
 use posto_core::sync::{SyncReport, sync_account};
 use posto_core::{Error, Result};
@@ -558,6 +558,7 @@ async fn connection_futures_are_send() {
 
     assert_send(&conn.initial("g", 1));
     assert_send(&conn.delta("g", "1"));
+    assert_send(&conn.fetch_emails("g", &[]));
     assert_send(&conn.sync_mailboxes(&store, "g"));
     assert_send(&conn.body("m1"));
     assert_send(&conn.send(&store, "g", &identity, &draft, "text", "html"));
@@ -573,4 +574,36 @@ async fn connection_futures_are_send() {
 
     assert_eq!(emails.len(), 1);
     assert_eq!(cursor, "500");
+}
+
+#[tokio::test]
+async fn gmail_fetch_emails_reads_present_and_gone() {
+    let server = MockServer::start().await;
+    let conn = connection(&server, "me@gmail.com").await;
+
+    mount(
+        &server,
+        "GET",
+        "/messages/m1",
+        200,
+        metadata("m1", &json!(["INBOX"])),
+    )
+    .await;
+    mount(&server, "GET", "/messages/m2", 404, json!({})).await;
+
+    let ids = vec!["m1".to_owned(), "m2".to_owned()];
+    let fetched = conn.fetch_emails("g", &ids).await.unwrap();
+
+    assert_eq!(fetched.emails.len(), 1);
+    assert_eq!(fetched.emails[0].id, "m1");
+    assert_eq!(fetched.emails[0].mailbox_ids, ["INBOX"]);
+    assert_eq!(fetched.gone, ["m2"]);
+
+    let sent = server.received_requests().await.unwrap().len();
+
+    assert_eq!(
+        conn.fetch_emails("g", &[]).await.unwrap(),
+        Fetched::default()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), sent);
 }
