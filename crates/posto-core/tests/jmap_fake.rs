@@ -2543,11 +2543,44 @@ async fn optimistic_reconcile_keeps_answered_where_the_provider_ignores_it() -> 
         Ok(keywords_of(&store, "e1"))
     }
 
-    let gmail = keywords_after(Some("gmail")).await?;
+    for provider in ["gmail", "proton"] {
+        let kept = keywords_after(Some(provider)).await?;
 
-    assert!(gmail.contains(&"$seen".to_string()), "{gmail:?}");
-    assert!(gmail.contains(&"$answered".to_string()), "{gmail:?}");
+        assert!(kept.contains(&"$seen".to_string()), "{provider}: {kept:?}");
+        assert!(
+            kept.contains(&"$answered".to_string()),
+            "{provider}: {kept:?}"
+        );
+    }
+
     assert_eq!(keywords_after(None).await?, ["$seen"]);
+
+    Ok(())
+}
+
+#[test]
+fn optimistic_marks_stale_before_the_mirror_can_fail() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("posto.db");
+    let store = Store::open(&db)?;
+
+    optimistic_boxes(&store)?;
+    store.upsert_emails(&[email("e1", "mb-inbox")])?;
+
+    // A second connection to the same file makes every email update fail.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER no_mirror BEFORE UPDATE ON emails \
+             BEGIN SELECT RAISE(ABORT, 'x'); END;",
+        )
+        .unwrap();
+
+    let r = actions::apply_local(&store, "a", &ids(&["e1"]), Action::Archive);
+
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(store.stale_ids("a")?, ["e1"]);
+    assert_eq!(mailbox_ids_of(&store, "e1"), ["mb-inbox"]);
 
     Ok(())
 }
