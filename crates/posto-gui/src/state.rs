@@ -338,17 +338,17 @@ pub async fn client(backend: Signal<Backend>, account_id: &str) -> Result<Option
 /// Besides connection errors, fails when the settings or credentials were
 /// saved while connecting: the client would belong to the old endpoint.
 async fn connect(backend: Signal<Backend>, account_id: &str) -> Result<Arc<Connection>> {
-    let (cfg, account) = {
+    let (cfg, account, rev) = {
         let b = backend.read();
         let account = b
             .cfg
             .account(account_id)
             .ok_or_else(|| Error::NotFound(format!("account {account_id}")))?;
 
-        (b.cfg.clone(), account.clone())
+        (b.cfg.clone(), account.clone(), b.conn_rev)
     };
 
-    connect_with(backend, account_id, async {
+    connect_with(backend, account_id, rev, async {
         provider::connect(&cfg, &account)
             .await?
             .ok_or_else(|| provider::credential_error(&account))
@@ -357,12 +357,15 @@ async fn connect(backend: Signal<Backend>, account_id: &str) -> Result<Arc<Conne
 }
 
 /// Awaits `make` and caches its connection, unless the settings changed
-/// (`conn_rev`) in the meantime. One connect at a time: a caller that waited
-/// gets the connection the first one cached, so an account never has two
-/// Proton sessions spending the same single-use refresh token.
+/// (`conn_rev`) since `rev`, the revision `make` was built from: not while
+/// this call waited for the lock, nor while `make` ran. One connect at a time:
+/// a caller that waited gets the connection the first one cached, so an
+/// account never has two Proton sessions spending the same single-use refresh
+/// token.
 async fn connect_with(
     mut backend: Signal<Backend>,
     account_id: &str,
+    rev: u64,
     make: impl Future<Output = Result<Connection>>,
 ) -> Result<Arc<Connection>> {
     // ponytail: one lock for every account; a hung connect delays the others
@@ -374,7 +377,12 @@ async fn connect_with(
         return Ok(client.clone());
     }
 
-    let rev = backend.peek().conn_rev;
+    if backend.peek().conn_rev != rev {
+        return Err(Error::Other(
+            "settings changed while connecting; try again".into(),
+        ));
+    }
+
     let client = Arc::new(make.await?);
     let mut b = backend.write();
 
@@ -493,7 +501,8 @@ mod tests {
             saver.write().reset_client();
             release.store(true, Ordering::SeqCst);
         };
-        let connect = connect_with(backend, "default", async {
+        let rev = backend.peek().conn_rev;
+        let connect = connect_with(backend, "default", rev, async {
             Connection::connect_jmap(&session_url, "fake-token").await
         });
         let (connected, ()) = tokio::join!(connect, save);
@@ -534,13 +543,49 @@ mod tests {
 
         // Two sessions holding one Proton refresh token: the second refresh
         // reuses a spent token and the server signs the account out.
+        let rev = backend.peek().conn_rev;
         let (a, b) = tokio::join!(
-            connect_with(backend, "default", make()),
-            connect_with(backend, "default", make()),
+            connect_with(backend, "default", rev, make()),
+            connect_with(backend, "default", rev, make()),
         );
 
         assert_eq!(made.load(Ordering::SeqCst), 1, "connected twice");
         assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_with_refuses_settings_older_than_the_lock() {
+        let dom = VirtualDom::new(VNode::empty);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let mut backend = Signal::new_in_scope(
+            Backend {
+                store: Arc::new(Store::open_memory().unwrap()),
+                clients: HashMap::new(),
+                cfg: Config::default(),
+                ui_test: false,
+                conn_rev: 0,
+                config_error: None,
+            },
+            ScopeId::ROOT,
+        );
+        let rev = backend.peek().conn_rev;
+        let polled = Arc::new(AtomicBool::new(false));
+
+        backend.write().reset_client();
+
+        let flag = polled.clone();
+        let connected = connect_with(backend, "default", rev, async move {
+            flag.store(true, Ordering::SeqCst);
+            Err(Error::Other("unreachable".into()))
+        })
+        .await;
+
+        assert!(connected.is_err(), "settings older than the lock connected");
+        assert!(backend.peek().clients.is_empty(), "a client was cached");
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "make ran under settings that had already changed"
+        );
     }
 
     #[tokio::test]

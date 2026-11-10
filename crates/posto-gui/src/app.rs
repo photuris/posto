@@ -1,7 +1,8 @@
 //! Root component, global signals, action dispatch and background work.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -147,27 +148,64 @@ pub fn confirm_empty() {
     *CONFIRM.write() = Some(empty_prompt(folder, &name, total));
 }
 
-/// Permanently deletes everything in `folder`, account by account; every
-/// account is attempted even when one fails.
+/// Permanently deletes everything `folder` holds now, account by account;
+/// every account is attempted even when one fails. The ids are captured now
+/// and destroyed in turn, so a message deleted after the question was
+/// confirmed is not taken along.
 async fn empty_folder(folder: Folder) {
     let Some(_busy) = Flag::take(&BUSY) else {
         return;
     };
     let b = backend().peek().clone();
     let (mut deleted, mut failures) = (0, Vec::new());
+    let mut targets = Vec::new();
 
     for (account, mailbox) in folder_members(&folder) {
-        let result = match get_client(&account).await {
-            Ok(client) => {
-                actions::empty_mailbox(&b.store, client.as_deref(), &account, &mailbox).await
-            }
-            Err(e) => Err(e),
-        };
-
-        match result {
-            Ok(n) => deleted += n,
+        match b.store.email_ids_in_mailbox(&account, &mailbox) {
+            Ok(ids) => targets.push((account, ids)),
             Err(e) => failures.push(format!("{account}: {e}")),
         }
+    }
+
+    let accounts: Vec<String> = targets.iter().map(|(a, _)| a.clone()).collect();
+    let store = b.store.clone();
+    let destroyed = in_turn(move |rev| async move {
+        let (mut deleted, mut failures) = (0, Vec::new());
+
+        for (account, ids) in targets {
+            let result = match get_client(&account).await {
+                Ok(client) => match same_rev(rev) {
+                    Ok(()) => {
+                        actions::apply(
+                            &store,
+                            client.as_deref(),
+                            &account,
+                            &ids,
+                            actions::Action::Destroy,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+
+            match result {
+                Ok(n) => deleted += n,
+                Err(e) => failures.push(format!("{account}: {e}")),
+            }
+        }
+
+        (deleted, failures)
+    })
+    .await;
+
+    match destroyed {
+        Ok((n, failed)) => {
+            deleted += n;
+            failures.extend(failed);
+        }
+        Err(e) => failures.extend(accounts.iter().map(|a| format!("{a}: {e}"))),
     }
 
     reload_mailboxes();
@@ -296,6 +334,30 @@ pub static NEEDS_TOKEN: GlobalSignal<bool> = Signal::global(|| false);
 static BUSY: GlobalSignal<bool> = Signal::global(|| false);
 static SYNCING: GlobalSignal<bool> = Signal::global(|| false);
 static LAST_SYNC: GlobalSignal<Option<Instant>> = Signal::global(|| None);
+
+/// A push with the connection revision it was made under.
+#[derive(Clone, Debug)]
+struct Queued {
+    rev: u64,
+    pending: actions::Pending,
+}
+
+/// Server work, done one job at a time in queue order.
+enum Job {
+    /// Send an optimistic change, then settle it from the server.
+    Push(Queued),
+    /// Server-first work, made by `in_turn`; it reports its own outcome.
+    Run(Pin<Box<dyn Future<Output = ()>>>),
+}
+
+/// Jobs waiting their turn, oldest first.
+static JOBS: GlobalSignal<VecDeque<Job>> = Signal::global(VecDeque::new);
+/// The push being sent now (`None` while a `Run` job or nothing runs).
+static IN_FLIGHT: GlobalSignal<Option<Queued>> = Signal::global(|| None);
+/// True while `drain_jobs` runs.
+static DRAINING: GlobalSignal<bool> = Signal::global(|| false);
+/// Bumped by every `reload_list`; an older load never overwrites a newer one.
+static LIST_GEN: GlobalSignal<u64> = Signal::global(|| 0);
 
 thread_local! {
     /// The `Signal<Backend>` provided to the tree, reachable from detached tasks.
@@ -1057,21 +1119,226 @@ async fn apply_local(refs: &[MsgRef], action: actions::Action) -> Result<usize> 
     Ok(applied)
 }
 
-/// Applies `action` to `ids` of one `account` and re-reads the mailbox badges
-/// (the store moves the counts); returns how many emails the core reports as
-/// changed.
+/// Applies `action` to `ids` of one `account` and returns how many emails the
+/// core reports as changed. Everything but [`actions::Action::Destroy`] changes
+/// the store and the badges at once ([`actions::apply_local`]) and queues the
+/// push for the worker: this path makes no connection and awaits nothing.
+/// `Destroy` goes to the server first, as before; its callers put it in turn
+/// with [`in_turn`].
 async fn apply_one_account(
     account: &str,
     ids: &[String],
     action: actions::Action,
 ) -> Result<usize> {
     let b = backend().peek().clone();
-    let client = get_client(account).await?;
-    let applied = actions::apply(&b.store, client.as_deref(), account, ids, action).await;
+
+    if action == actions::Action::Destroy {
+        let client = get_client(account).await?;
+        let applied = actions::apply(&b.store, client.as_deref(), account, ids, action).await;
+
+        reload_mailboxes();
+
+        return applied;
+    }
+
+    let pending = actions::apply_local(&b.store, account, ids, action)?;
 
     reload_mailboxes();
 
-    applied
+    if !pending.ids.is_empty() {
+        enqueue(Job::Push(Queued {
+            rev: backend().peek().conn_rev,
+            pending: pending.clone(),
+        }));
+    }
+
+    Ok(pending.mirrored)
+}
+
+/// True when a push still waiting in the queue holds `id` of `account`.
+fn queued(account: &str, id: &str) -> bool {
+    JOBS.peek().iter().any(|job| {
+        matches!(job, Job::Push(q)
+            if q.pending.account == account && q.pending.ids.iter().any(|i| i == id))
+    })
+}
+
+/// True when `id` of `account` is owed to the server: [`queued`], or being
+/// sent now.
+fn owed(account: &str, id: &str) -> bool {
+    queued(account, id)
+        || IN_FLIGHT
+            .peek()
+            .as_ref()
+            .is_some_and(|q| q.pending.account == account && q.pending.ids.iter().any(|i| i == id))
+}
+
+/// True when a push for `account` is waiting in the queue.
+fn account_queued(account: &str) -> bool {
+    JOBS.peek()
+        .iter()
+        .any(|job| matches!(job, Job::Push(q) if q.pending.account == account))
+}
+
+/// Puts `job` at the back of the queue and starts the worker unless it runs.
+fn enqueue(job: Job) {
+    JOBS.write().push_back(job);
+
+    if !*DRAINING.peek() {
+        *DRAINING.write() = true;
+        run(drain_jobs());
+    }
+}
+
+/// The error of a job that was queued under settings that have since changed.
+fn cancelled() -> Error {
+    Error::Other("not done: the account settings changed".into())
+}
+
+/// `Err` when the settings changed (`conn_rev`) since `rev`. A job holds
+/// targets captured under `rev`, and must never send them through a
+/// connection made for newer settings (an account replaced under the same
+/// slug): call this right after every `get_client(..).await`, before any
+/// server write.
+fn same_rev(rev: u64) -> Result<()> {
+    if backend().peek().conn_rev == rev {
+        Ok(())
+    } else {
+        Err(cancelled())
+    }
+}
+
+/// Queues `work` behind everything queued so far and waits for its result.
+/// The targets it acts on are captured by the caller now, with the
+/// connection revision `rev` that `work` receives; if the settings changed
+/// by the time the job runs, `work` does not run and this returns
+/// [`cancelled`].
+///
+/// Code that runs inside a job never awaits `in_turn`: a job that awaits a job
+/// queued after it waits forever.
+async fn in_turn<T, F, Fut>(work: F) -> Result<T>
+where
+    T: 'static,
+    F: FnOnce(u64) -> Fut + 'static,
+    Fut: Future<Output = T> + 'static,
+{
+    let rev = backend().peek().conn_rev;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    enqueue(Job::Run(Box::pin(async move {
+        let outcome = match same_rev(rev) {
+            Ok(()) => Ok(work(rev).await),
+            Err(e) => Err(e),
+        };
+
+        let _ = tx.send(outcome);
+    })));
+
+    rx.await.unwrap_or_else(|_| Err(cancelled()))
+}
+
+/// Polls until no action holds [`BUSY`]. Only a spawned task calls it, never
+/// the worker.
+async fn busy_settled() {
+    while *BUSY.peek() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Runs the queued jobs one at a time, oldest first, until none is left.
+async fn drain_jobs() {
+    loop {
+        let Some(job) = JOBS.write().pop_front() else {
+            break;
+        };
+
+        match job {
+            Job::Push(q) => {
+                *IN_FLIGHT.write() = Some(q.clone());
+
+                let outcome = send_queued(&q).await;
+
+                *IN_FLIGHT.write() = None;
+
+                if let Some(outcome) = outcome {
+                    // Spawned: the worker moves on at once.
+                    run(report(outcome));
+                }
+            }
+            Job::Run(work) => work.await,
+        }
+    }
+
+    *DRAINING.write() = false;
+}
+
+/// Sends one queued push and, when it is the account's last one queued,
+/// settles the account's stale rows and counts from the server. `None`: nothing
+/// to report.
+async fn send_queued(q: &Queued) -> Option<Result<Vec<String>>> {
+    let p = &q.pending;
+    let stale_rev = || backend().peek().conn_rev != q.rev;
+    let not_sent = || {
+        Some(Err(Error::Other(
+            "not sent: the account settings changed".into(),
+        )))
+    };
+
+    if stale_rev() {
+        return not_sent();
+    }
+
+    let client = match get_client(&p.account).await {
+        Ok(Some(c)) => c,
+        // UI test mode: the local change stays.
+        Ok(None) => return None,
+        // The marks stay; the next sync reconciles.
+        Err(e) => return Some(Err(e)),
+    };
+
+    // The settings changed while connecting.
+    if stale_rev() {
+        return not_sent();
+    }
+
+    let pushed = actions::push(&client, p).await;
+
+    // A burst is settled once, by its last push. `queued` (not `owed`) lets
+    // this push's own ids, already popped, be settled.
+    if !account_queued(&p.account) {
+        let store = backend().peek().store.clone();
+        let left_alone = |id: &str| stale_rev() || queued(&p.account, id);
+
+        if actions::reconcile(&store, &client, &p.account, left_alone)
+            .await
+            .is_err()
+        {
+            tracing::warn!("reconcile after a push failed");
+        }
+    }
+
+    Some(pushed)
+}
+
+/// Shows what a push came to, once the action that queued it has finished its
+/// own reload and toast.
+async fn report(outcome: Result<Vec<String>>) {
+    busy_settled().await;
+    reload_mailboxes();
+    reload_list().await;
+
+    match outcome {
+        Ok(refused) if refused.is_empty() => {}
+        Ok(refused) => {
+            let n = refused.len();
+
+            set_status(format!(
+                "The server refused {n} message{}",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+        Err(e) => fail("Action failed", e),
+    }
 }
 
 /// Replaces the visible row of a message with its current state.
@@ -1341,6 +1608,10 @@ fn reload_classified() {
 
 /// Reloads the active query (search, else the selected folder) from the store.
 pub async fn reload_list() {
+    let generation = *LIST_GEN.peek() + 1;
+
+    *LIST_GEN.write() = generation;
+
     let b = backend().peek().clone();
     let query = SEARCH_QUERY.peek().trim().to_string();
     let folder = SELECTED_MAILBOX.peek().clone();
@@ -1410,8 +1681,12 @@ pub async fn reload_list() {
     .map_err(|e| Error::Other(e.to_string()))
     .and_then(|r| r);
 
-    // A newer query or mailbox choice made this result stale.
-    if SEARCH_QUERY.peek().trim() != query || *SELECTED_MAILBOX.peek() != folder {
+    // A newer query or mailbox choice made this result stale, and so did a
+    // newer load.
+    if SEARCH_QUERY.peek().trim() != query
+        || *SELECTED_MAILBOX.peek() != folder
+        || *LIST_GEN.peek() != generation
+    {
         return;
     }
 
@@ -1478,11 +1753,34 @@ async fn delete_selected() {
         return;
     }
 
+    let b = backend().peek().clone();
     let result = settle_selection(async {
-        apply_local(&destroy, actions::Action::Destroy).await?;
         apply_local(&trash, actions::Action::Delete).await?;
 
-        Ok(())
+        if destroy.is_empty() {
+            return Ok(());
+        }
+
+        in_turn(move |rev| async move {
+            for (account, ids) in group_by_account(&destroy) {
+                let client = get_client(&account).await?;
+
+                same_rev(rev)?;
+                actions::apply(
+                    &b.store,
+                    client.as_deref(),
+                    &account,
+                    &ids,
+                    actions::Action::Destroy,
+                )
+                .await?;
+                reload_mailboxes();
+            }
+
+            Ok::<(), Error>(())
+        })
+        .await
+        .and_then(|r| r)
     })
     .await;
     let done = match (d, t) {
@@ -1915,17 +2213,31 @@ pub fn classify_selected(tray: Tray) {
         }
 
         let b = backend().peek().clone();
-        let mut clients: HashMap<String, Arc<Connection>> = HashMap::new();
-
-        for (account, _) in group_by_account(&refs) {
-            if let Ok(Some(client)) = get_client(&account).await {
-                clients.insert(account, client);
-            }
-        }
-
         let (mut filed, mut first_error) = (0, None);
+        let mut clients: HashMap<String, Arc<Connection>> = HashMap::new();
         let settled = settle_selection(async {
-            (filed, first_error) = correct_refs(&b, &clients, &refs, tray.clone()).await;
+            let (b, refs, tray) = (b.clone(), refs.clone(), tray.clone());
+            let turn = in_turn(move |rev| async move {
+                let mut clients: HashMap<String, Arc<Connection>> = HashMap::new();
+
+                for (account, _) in group_by_account(&refs) {
+                    if let Ok(Some(client)) = get_client(&account).await {
+                        clients.insert(account, client);
+                    }
+                }
+
+                if same_rev(rev).is_err() {
+                    return ((0, Some(cancelled())), clients);
+                }
+
+                (correct_refs(&b, &clients, &refs, tray).await, clients)
+            })
+            .await;
+
+            match turn {
+                Ok((done, made)) => ((filed, first_error), clients) = (done, made),
+                Err(e) => first_error = Some(e),
+            }
 
             Ok(())
         })
@@ -2206,13 +2518,17 @@ async fn send_draft(archive: bool) {
     let b = backend().peek().clone();
 
     if !b.ui_test {
-        let sent = match get_client(&draft.account_id).await {
-            Ok(Some(client)) => {
-                compose::send(&b.cfg, &b.store, &client, &draft.account_id, &draft).await
-            }
-            Ok(None) => Err(Error::Other("no connection".into())),
-            Err(e) => Err(e),
-        };
+        let (cfg, store, sending) = (b.cfg.clone(), b.store.clone(), draft.clone());
+        let sent = in_turn(move |rev| async move {
+            let client = get_client(&sending.account_id)
+                .await?
+                .ok_or_else(|| Error::Other("no connection".into()))?;
+
+            same_rev(rev)?;
+            compose::send(&cfg, &store, &client, &sending.account_id, &sending).await
+        })
+        .await
+        .and_then(|r| r);
 
         if let Err(e) = sent {
             return fail("Send failed", e);
@@ -2372,6 +2688,13 @@ pub async fn run_sync(manual: bool) {
         return;
     };
 
+    // A cancelled pass returns quietly: a settings change calls `sync_soon`.
+    let _ = in_turn(move |_| sync_pass(manual)).await;
+}
+
+/// The sync pass `run_sync` queues: sync, settle the accounts' stale rows from
+/// the server, then classify. Runs as a job.
+async fn sync_pass(manual: bool) {
     // Set up front so a failing server is retried once per interval, not per tick.
     *LAST_SYNC.write() = Some(Instant::now());
 
@@ -2379,6 +2702,8 @@ pub async fn run_sync(manual: bool) {
         set_status("Syncing…");
     }
 
+    // Before the clients are collected: they belong to these settings.
+    let rev = backend().peek().conn_rev;
     let b = backend().peek().clone();
     let mut clients: HashMap<String, Arc<Connection>> = HashMap::new();
     let mut unreachable: HashMap<String, String> = HashMap::new();
@@ -2432,6 +2757,21 @@ pub async fn run_sync(manual: bool) {
         .any(|r| r.error.as_deref() == Some(&Error::Auth.to_string()))
     {
         backend().write().reset_client();
+    }
+
+    for (account, client) in &connected {
+        if account_queued(account) {
+            continue;
+        }
+
+        let left_alone = |id: &str| backend().peek().conn_rev != rev || owed(account, id);
+
+        if actions::reconcile(&b.store, client, account, left_alone)
+            .await
+            .is_err()
+        {
+            tracing::warn!("reconcile after sync failed");
+        }
     }
 
     reload_mailboxes();
@@ -2584,6 +2924,33 @@ mod tests {
 
         dom.rebuild_in_place();
         dom
+    }
+
+    /// Set by a spawned future that finished, for [`drive`].
+    static DONE: GlobalSignal<bool> = Signal::global(|| false);
+    /// What the queue's test jobs saw, in order.
+    static LOG: GlobalSignal<Vec<String>> = Signal::global(Vec::new);
+    /// Holds the queue while it is false.
+    static GATE: GlobalSignal<bool> = Signal::global(|| false);
+
+    /// Runs the dom's tasks (the job worker among them) until `done`.
+    async fn drive(dom: &mut VirtualDom, done: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+
+            let _ = tokio::time::timeout(Duration::from_millis(20), dom.wait_for_work()).await;
+
+            dom.render_immediate_to_vec();
+        }
+
+        assert!(done(), "timed out");
+    }
+
+    /// True when no job is queued and the worker has stopped.
+    fn idle() -> bool {
+        JOBS.peek().is_empty() && !*DRAINING.peek()
     }
 
     #[test]
@@ -2778,7 +3145,7 @@ mod tests {
 
         ui.ui_test = true;
 
-        let dom = rendered(ui);
+        let mut dom = rendered(ui);
         let _guard = RuntimeGuard::new(dom.runtime());
         let b = backend().peek().clone();
 
@@ -2816,7 +3183,13 @@ mod tests {
             "3 messages will be deleted permanently. This cannot be undone."
         );
 
-        empty_folder(folder).await;
+        // `empty_folder` waits for its turn in the job queue, which only the
+        // driven dom runs.
+        run(async move {
+            empty_folder(folder).await;
+            *DONE.write() = true;
+        });
+        drive(&mut dom, || *DONE.peek()).await;
 
         assert!(
             b.store
@@ -4294,6 +4667,366 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, Mutation::CreateTextNode { value, .. } if value == "Work"))
         );
+    }
+
+    /// The `total` of mailbox `id` as the sidebar shows it.
+    fn total(id: &str) -> i64 {
+        MAILBOXES
+            .peek()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("no mailbox {id}"))
+            .total
+    }
+
+    /// A JMAP server that refuses every `Email/set` and, asked afterwards,
+    /// still holds `fx-07` in the inbox with the server's own counts.
+    struct Refusing;
+
+    impl wiremock::Respond for Refusing {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let call = &body["methodCalls"][0];
+            let name = call[0].as_str().unwrap();
+            let result = match name {
+                "Email/set" => {
+                    let refused: serde_json::Map<String, serde_json::Value> = call[1]["update"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(|id| (id.clone(), serde_json::json!({ "type": "forbidden" })))
+                        .collect();
+
+                    serde_json::json!({ "notUpdated": refused })
+                }
+                "Email/get" => serde_json::json!({
+                    "state": "s1",
+                    "list": [{
+                        "id": "fx-07",
+                        "threadId": "t-fx-07",
+                        "receivedAt": "2026-10-05T17:45:00Z",
+                        "mailboxIds": { "mb-inbox": true },
+                        "keywords": { "$seen": true, "$flagged": true },
+                        "from": [{ "name": "Sofie Berg", "email": "sofie@example.net" }],
+                        "to": [{ "name": null, "email": "me@example.com" }],
+                        "cc": null,
+                        "subject": "Weekend plans",
+                        "preview": "Cabin is booked",
+                        "size": 100,
+                        "hasAttachment": false
+                    }]
+                }),
+                "Mailbox/get" => serde_json::json!({
+                    "state": "m1",
+                    "list": [
+                        {
+                            "id": "mb-inbox", "name": "Inbox", "role": "inbox",
+                            "parentId": null, "sortOrder": 1,
+                            "totalEmails": 77, "unreadEmails": 7
+                        },
+                        {
+                            "id": "mb-archive", "name": "Archive", "role": "archive",
+                            "parentId": null, "sortOrder": 2,
+                            "totalEmails": 33, "unreadEmails": 3
+                        }
+                    ]
+                }),
+                other => panic!("unexpected JMAP call {other}"),
+            };
+
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "methodResponses": [[name, result, "0"]] }))
+        }
+    }
+
+    /// A wiremock server that answers like [`Refusing`], and a backend that
+    /// holds a connection to it for `default` (so `get_client` never reads
+    /// `secrets.toml`) and never syncs on its own.
+    async fn refusing_backend() -> (wiremock::MockServer, Backend) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session = include_str!("../../posto-core/tests/fixtures/session.json")
+            .replace("{{base}}", &server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/session"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(session)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(Refusing)
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::default();
+
+        cfg.sync.refresh_minutes = 0;
+
+        let mut backend = backend_with(cfg);
+        let client = Connection::connect_jmap(&format!("{}/session", server.uri()), "tok")
+            .await
+            .unwrap();
+
+        backend.clients.insert("default".into(), Arc::new(client));
+
+        (server, backend)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn optimistic_archive_changes_badges_then_drains() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        let (inbox, archive) = (total("mb-inbox"), total("mb-archive"));
+
+        act_on_emails(&[MsgRef::new("default", "fx-07")], actions::Action::Archive)
+            .await
+            .unwrap();
+
+        assert_eq!(total("mb-inbox"), inbox - 1);
+        assert_eq!(total("mb-archive"), archive + 1);
+        assert_eq!(JOBS.peek().len(), 1);
+        assert!(
+            matches!(&JOBS.peek()[0], Job::Push(q) if q.pending.ids == ["fx-07"]),
+            "the queue holds one push of fx-07"
+        );
+        assert!(*DRAINING.peek());
+        assert_eq!(b.store.stale_ids("default").unwrap(), ["fx-07"]);
+
+        drive(&mut dom, idle).await;
+
+        assert!(IN_FLIGHT.peek().is_none());
+        assert_eq!(
+            b.store
+                .email("default", "fx-07")
+                .unwrap()
+                .unwrap()
+                .mailbox_ids,
+            ["mb-archive"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_push_restores_the_message_from_the_server() {
+        let (server, ui) = refusing_backend().await;
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+        *SELECTED_MAILBOX.write() = Some(Folder::Mailbox {
+            account_id: "default".into(),
+            id: "mb-inbox".into(),
+        });
+        reload_list().await;
+
+        assert!(EMAILS.peek().iter().any(|e| e.id == "fx-07"));
+
+        act_on_emails(&[MsgRef::new("default", "fx-07")], actions::Action::Archive)
+            .await
+            .unwrap();
+
+        assert!(!EMAILS.peek().iter().any(|e| e.id == "fx-07"));
+
+        drive(&mut dom, || {
+            idle() && STATUS.peek().starts_with("The server refused")
+        })
+        .await;
+        drive(&mut dom, || EMAILS.peek().iter().any(|e| e.id == "fx-07")).await;
+
+        assert_eq!(
+            b.store
+                .email("default", "fx-07")
+                .unwrap()
+                .unwrap()
+                .mailbox_ids,
+            ["mb-inbox"]
+        );
+        assert_eq!(total("mb-inbox"), 77);
+        assert_eq!(*STATUS.peek(), "The server refused 1 message");
+        assert!(b.store.stale_ids("default").unwrap().is_empty());
+
+        let methods: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/api")
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+
+                body["methodCalls"][0][0].as_str().unwrap().to_string()
+            })
+            .collect();
+
+        assert_eq!(methods, ["Email/set", "Email/get", "Mailbox/get"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn destroy_is_not_queued() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        act_on_emails(&[MsgRef::new("default", "fx-14")], actions::Action::Destroy)
+            .await
+            .unwrap();
+
+        assert!(JOBS.peek().is_empty());
+        assert!(!*DRAINING.peek());
+        assert!(b.store.email("default", "fx-14").unwrap().is_none());
+        assert!(b.store.stale_ids("default").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jobs_run_in_queue_order() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        enqueue(Job::Run(Box::pin(async {
+            LOG.write().push(format!("a:{}", JOBS.peek().len()));
+        })));
+        act_on_emails(&[MsgRef::new("default", "fx-07")], actions::Action::Archive)
+            .await
+            .unwrap();
+        enqueue(Job::Run(Box::pin(async {
+            LOG.write().push(format!(
+                "b:{}:{}",
+                JOBS.peek().len(),
+                IN_FLIGHT.peek().is_some()
+            ));
+        })));
+
+        drive(&mut dom, idle).await;
+
+        assert_eq!(*LOG.peek(), ["a:2", "b:0:false"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_trash_destroys_only_what_was_confirmed() {
+        let mut ui = backend_with(Config::default());
+
+        ui.ui_test = true;
+
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        let trash = b
+            .store
+            .mailbox_by_role("default", "trash")
+            .unwrap()
+            .unwrap();
+        let folder = Folder::Mailbox {
+            account_id: "default".into(),
+            id: trash.id.clone(),
+        };
+
+        // A job that holds the queue.
+        enqueue(Job::Run(Box::pin(async {
+            LOG.write().push("gate".into());
+
+            while !*GATE.peek() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })));
+        run(async move {
+            empty_folder(folder).await;
+            *DONE.write() = true;
+        });
+        // The gate job is running and the empty job waits behind it.
+        drive(&mut dom, || {
+            !LOG.peek().is_empty() && JOBS.peek().iter().any(|j| matches!(j, Job::Run(_)))
+        })
+        .await;
+
+        assert!(!*DONE.peek());
+        assert!(b.store.email("default", "fx-14").unwrap().is_some());
+
+        // Deleted after the question was confirmed: moves to Trash, and its
+        // push queues after the empty job.
+        act_on_emails(&[MsgRef::new("default", "fx-07")], actions::Action::Delete)
+            .await
+            .unwrap();
+        *GATE.write() = true;
+
+        drive(&mut dom, || *DONE.peek() && idle()).await;
+
+        assert!(b.store.email("default", "fx-14").unwrap().is_none());
+        assert_eq!(
+            b.store
+                .email("default", "fx-07")
+                .unwrap()
+                .map(|e| e.mailbox_ids),
+            Some(vec!["mb-trash".to_string()])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_report_never_blocks_the_queue() {
+        let (_server, ui) = refusing_backend().await;
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let b = backend().peek().clone();
+
+        posto_core::fixtures::seed(&b.store).unwrap();
+        reload_mailboxes();
+
+        // An action in progress: the report of a push waits for it.
+        let busy = Flag::take(&BUSY).unwrap();
+
+        act_on_emails(&[MsgRef::new("default", "fx-07")], actions::Action::Archive)
+            .await
+            .unwrap();
+        enqueue(Job::Run(Box::pin(async {
+            LOG.write().push("ran".into());
+        })));
+
+        // A worker that awaited the report would wait for BUSY forever.
+        drive(&mut dom, || LOG.peek().iter().any(|l| l == "ran")).await;
+
+        assert!(!STATUS.peek().starts_with("The server refused"));
+
+        drop(busy);
+
+        drive(&mut dom, || {
+            *STATUS.peek() == "The server refused 1 message"
+        })
+        .await;
     }
 }
 
