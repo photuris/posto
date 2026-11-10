@@ -2709,7 +2709,15 @@ async fn sync_pass(manual: bool) {
     let mut unreachable: HashMap<String, String> = HashMap::new();
 
     for a in b.cfg.accounts_enabled() {
-        match get_client(&a.id).await {
+        let looked_up = get_client(&a.id).await;
+
+        // Whatever the lookup gave: the settings it ran under are gone, and so
+        // are the clients collected so far. Nothing is sent through them.
+        if same_rev(rev).is_err() {
+            return;
+        }
+
+        match looked_up {
             Ok(Some(client)) => {
                 clients.insert(a.id.clone(), client);
             }
@@ -2785,6 +2793,12 @@ async fn sync_pass(manual: bool) {
 
     if manual || added > 0 || failed {
         set_status(sync_summary(&b.cfg, &reports));
+    }
+
+    // The awaits above may have outlasted a settings change: `connected`
+    // belongs to the old settings, and the classifier writes through it.
+    if same_rev(rev).is_err() {
+        return;
     }
 
     // The sync lock is released: new inbox mail is queued and can be classified.
@@ -5027,6 +5041,286 @@ mod tests {
             *STATUS.peek() == "The server refused 1 message"
         })
         .await;
+    }
+
+    /// Marks the child process of [`rerun_isolated`].
+    const CHILD: &str = "POSTO_GUI_TEST_CHILD";
+    /// The TypeSafe key a child runs with. Not a real key.
+    const DUMMY_KEY: &str = "dummy-key-not-real";
+
+    /// True in the child process of [`rerun_isolated`]. Refuses to go on unless
+    /// the child's data directory is a temp dir and its credentials are the
+    /// dummy ones, so a test body never reads the real `secrets.toml`.
+    fn isolated_child() -> bool {
+        if std::env::var_os(CHILD).is_none() {
+            return false;
+        }
+
+        let dir = std::env::var_os("POSTO_DATA_DIR").map(std::path::PathBuf::from);
+
+        assert!(
+            dir.is_some_and(|d| d.starts_with(std::env::temp_dir())),
+            "an isolated child needs a temp data dir"
+        );
+        assert_eq!(std::env::var("TYPESAFE_API_KEY").as_deref(), Ok(DUMMY_KEY));
+        assert!(std::env::var_os("POSTO_TOKEN").is_none());
+
+        true
+    }
+
+    /// Runs test `name` again in a child process with its own empty data
+    /// directory, no `POSTO_TOKEN` and a dummy TypeSafe key (the process
+    /// environment is never changed in-process), and fails with the child's
+    /// output when it fails.
+    fn rerun_isolated(name: &str) {
+        let dir =
+            std::env::temp_dir().join(format!("posto-gui-test-{}-{name}", std::process::id()));
+
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .env("POSTO_DATA_DIR", &dir)
+            .env("TYPESAFE_API_KEY", DUMMY_KEY)
+            .env_remove("POSTO_TOKEN")
+            .output()
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The method names of the `POST /api` requests `server` received, in order.
+    async fn api_methods(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/api")
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+
+                body["methodCalls"][0][0]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Mounts the JMAP session at `/session` and, delayed, at `/slow-session`.
+    async fn mount_sessions(server: &wiremock::MockServer, delay: Duration) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let session = include_str!("../../posto-core/tests/fixtures/session.json")
+            .replace("{{base}}", &server.uri());
+        let answer = || {
+            ResponseTemplate::new(200)
+                .set_body_string(session.clone())
+                .insert_header("content-type", "application/json")
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/session"))
+            .respond_with(answer())
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/slow-session"))
+            .respond_with(answer().set_delay(delay))
+            .mount(server)
+            .await;
+    }
+
+    /// Waits until `server` has received a request for `path`, then changes
+    /// the settings as Settings Save does: another session URL for `default`,
+    /// and every connection reset.
+    fn change_settings_when_requested(server: Arc<wiremock::MockServer>, path: &'static str) {
+        run(async move {
+            while !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path() == path)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            backend().write().cfg.accounts[0].session_url = "http://127.0.0.1:1/session".into();
+            backend().write().reset_client();
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_stops_after_settings_change_during_connect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const NAME: &str = "app::tests::sync_stops_after_settings_change_during_connect";
+
+        if !isolated_child() {
+            return rerun_isolated(NAME);
+        }
+
+        let server = Arc::new(MockServer::start().await);
+
+        mount_sessions(&server, Duration::from_millis(300)).await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "methodResponses": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        // `default` has a cached client; `work` has a token (in the child's own
+        // data dir) and a slow session, so its lookup is the window.
+        let mut cfg = Config::default();
+
+        cfg.add_account(Account::new("work", "w@x.io")).unwrap();
+        cfg.sync.refresh_minutes = 0;
+        cfg.accounts[0].session_url = format!("{}/session", server.uri());
+        cfg.accounts[1].session_url = format!("{}/slow-session", server.uri());
+        Secrets::set_token("work", "tok").unwrap();
+
+        let mut ui = backend_with(cfg);
+        let client = Connection::connect_jmap(&format!("{}/session", server.uri()), "tok")
+            .await
+            .unwrap();
+
+        ui.clients.insert("default".into(), Arc::new(client));
+
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+
+        posto_core::fixtures::seed(&backend().peek().store).unwrap();
+        change_settings_when_requested(server.clone(), "/slow-session");
+        run(async {
+            run_sync(true).await;
+            *DONE.write() = true;
+        });
+        drive(&mut dom, || *DONE.peek()).await;
+
+        assert_eq!(
+            backend().peek().conn_rev,
+            1,
+            "the settings changed during the lookup"
+        );
+        assert_eq!(
+            api_methods(&server).await,
+            Vec::<String>::new(),
+            "a sync started through a client of the old settings"
+        );
+    }
+
+    /// Answers a sync's requests with a delayed error and accepts `Email/set`.
+    struct DelayedSync;
+
+    impl wiremock::Respond for DelayedSync {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let call = &body["methodCalls"][0];
+
+            if call[0] != "Email/set" {
+                return wiremock::ResponseTemplate::new(500).set_delay(Duration::from_millis(300));
+            }
+
+            let done: serde_json::Map<String, serde_json::Value> = call[1]["update"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|id| (id.clone(), serde_json::Value::Null))
+                .collect();
+
+            wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "methodResponses": [["Email/set", { "updated": done }, "0"]] }),
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_does_not_start_classifier_after_settings_change() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        const NAME: &str = "app::tests::sync_does_not_start_classifier_after_settings_change";
+
+        if !isolated_child() {
+            return rerun_isolated(NAME);
+        }
+
+        let server = Arc::new(MockServer::start().await);
+
+        mount_sessions(&server, Duration::ZERO).await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(DelayedSync)
+            .mount(&server)
+            .await;
+
+        // Classification is on but may ask Jev about nothing (`max_per_run`
+        // 0): only the pending correction below can reach the server.
+        let mut cfg = Config::default();
+
+        cfg.classify.enabled = true;
+        cfg.classify.max_per_run = 0;
+        cfg.sync.refresh_minutes = 0;
+        cfg.accounts[0].session_url = format!("{}/session", server.uri());
+
+        let mut ui = backend_with(cfg.clone());
+        let client = Connection::connect_jmap(&format!("{}/session", server.uri()), "tok")
+            .await
+            .unwrap();
+
+        ui.clients.insert("default".into(), Arc::new(client));
+
+        let mut dom = rendered(ui);
+        let _guard = RuntimeGuard::new(dom.runtime());
+        let store = backend().peek().store.clone();
+
+        posto_core::fixtures::seed(&store).unwrap();
+
+        // A correction made offline: recorded, mirrored, not sent.
+        classify::correct(
+            &cfg,
+            &store,
+            &HashMap::new(),
+            &MsgRef::new("default", "fx-07"),
+            Tray::new("receipts"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(store.pending_classifications().unwrap().len(), 1);
+
+        // The settings change while the sync waits for its first answer.
+        change_settings_when_requested(server.clone(), "/api");
+        run(async {
+            run_sync(true).await;
+            *DONE.write() = true;
+        });
+        drive(&mut dom, || *DONE.peek()).await;
+
+        assert_eq!(
+            backend().peek().conn_rev,
+            1,
+            "the settings changed mid-sync"
+        );
+        assert!(
+            !api_methods(&server).await.iter().any(|m| m == "Email/set"),
+            "the classifier wrote through a client of the old settings"
+        );
     }
 }
 
